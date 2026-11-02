@@ -23,16 +23,16 @@ use crate::syscore::windows::{
     FILE_ALLOCATION_INFO_CLASS, FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT,
     FILE_END_OF_FILE_INFO_CLASS, FILE_MODE_INFORMATION, FILE_NO_INTERMEDIATE_BUFFERING,
     FILE_STANDARD_INFO, FILE_STANDARD_INFO_CLASS, FILE_SYNCHRONOUS_IO_ALERT,
-    FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, FILE_ZERO_DATA_INFORMATION,
-    FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA, GetFileInformationByHandle,
+    FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, FILE_WRITE_THROUGH,
+    FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA, GetFileInformationByHandle,
     GetFileInformationByHandleEx, GetFileSizeEx, GetFileType, GetOverlappedResult, HANDLE, IN_ADDR,
     INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK, NtQueryInformationFile, OVERLAPPED,
     ReadFile, SD_BOTH, SD_RECEIVE, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_TYPE,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
     SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
     SOL_SOCKET, STATUS_SUCCESS, SetFileInformationByHandle, SetFilePointerEx, ULONG,
-    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile,
-    bind, getsockname, getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, wsa_error,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAIoctl, WSASocketW, WriteFile, bind,
+    getsockname, getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, wsa_error,
 };
 
 fn socket_of(raw: Raw) -> SOCKET {
@@ -117,6 +117,9 @@ pub(crate) struct FileMode {
     /// bytes straight between the caller's memory and the device, by its
     /// alignment rules.
     pub(crate) direct: bool,
+    /// Writing through (`FILE_FLAG_WRITE_THROUGH`): a write returns once its
+    /// bytes are on the device.
+    pub(crate) sync: bool,
 }
 
 /// How the file handle `raw` was opened.
@@ -126,6 +129,7 @@ pub(crate) fn file_mode(raw: Raw) -> io::Result<FileMode> {
     Ok(FileMode {
         append: access & FILE_APPEND_DATA != 0 && access & FILE_WRITE_DATA == 0,
         direct: mode & FILE_NO_INTERMEDIATE_BUFFERING != 0,
+        sync: mode & FILE_WRITE_THROUGH != 0,
     })
 }
 
@@ -187,8 +191,8 @@ pub(crate) fn recv_ready(raw: Raw, buf: &mut [u8], peek: bool) -> io::Result<usi
 /// A `recvfrom` (with `peek`, a look that leaves the datagram) on the
 /// datagram socket `raw` into `buf`, made only once a zero-byte look said a
 /// datagram (or an error) came: the socket blocks, and holding one it answers
-/// at once. A datagram longer than `buf` is cut to it, as the port's own
-/// receive cuts one.
+/// at once. A datagram longer than `buf` answers `WSAEMSGSIZE`, `buf` holding the bytes that fit
+/// and the datagram consumed (a peek leaves it), as std's receive does.
 pub(crate) fn recv_from_ready(
     raw: Raw,
     buf: &mut [u8],
@@ -210,15 +214,10 @@ pub(crate) fn recv_from_ready(
             &mut from_len,
         )
     };
-    let n = if n == SOCKET_ERROR {
-        let err = wsa_error();
-        if err.raw_os_error() != Some(WSAEMSGSIZE) {
-            return Err(err);
-        }
-        buf.len()
-    } else {
-        n as usize
-    };
+    if n == SOCKET_ERROR {
+        return Err(wsa_error());
+    }
+    let n = n as usize;
     // SAFETY: the kernel wrote the sender's address and its length.
     let from = unsafe { socket_addr(core::ptr::from_ref(&from).cast(), from_len) }?;
     Ok((n, from))

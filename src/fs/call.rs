@@ -37,6 +37,10 @@ pub(crate) enum FileOutcome {
     /// offset is after it.
     Append(io::Result<u64>),
     AppendLent(io::Result<u64>, OwnedBuf),
+    /// A write from a buffer of the pool that comes back with its end.
+    WriteKept(io::Result<()>, PoolBuf),
+    /// As `Append`, with the buffer of the pool back.
+    AppendKept(io::Result<u64>, PoolBuf),
     /// A sync ends in a slot only on a ring.
     #[cfg(ring)]
     Sync(io::Result<()>),
@@ -153,6 +157,12 @@ pub(crate) type LentWriteEnd = (io::Result<()>, OwnedBuf);
 /// A lent append's end: where the file's offset is after it, and the task's
 /// buffer back.
 pub(crate) type LentAppendEnd = (io::Result<u64>, OwnedBuf);
+/// A kept write's end: its result, and the buffer of the pool back (none
+/// only for an end of another kind than its call's).
+pub(crate) type KeptWriteEnd = (io::Result<()>, Option<PoolBuf>);
+/// A kept append's end: where the file's offset is after it, and the buffer
+/// of the pool back (none as for [`KeptWriteEnd`]).
+pub(crate) type KeptAppendEnd = (io::Result<u64>, Option<PoolBuf>);
 
 /// A file's call in flight, as the task that waits for it sees it: its end
 /// is taken as `T` (see [`End`]).
@@ -209,9 +219,12 @@ impl WriteCall {
         Self(Arc::clone(shard))
     }
 
-    /// Counts a write on the shard this thread runs, if it runs one.
+    /// Counts a write on the shard this thread runs, if it runs one; else on the shard its poll
+    /// lost to the handoff, whose task the rest of the poll is and whose stopped state a
+    /// runtime's drop waits on (`Shared::settled`).
     pub(crate) fn here() -> Option<Self> {
         crate::rt::context::current(|current| current.map(|shard| Self::on(&shard.shared)))
+            .or_else(|| crate::rt::context::lost_shared(|lost| lost.map(Self::on)))
     }
 }
 
@@ -354,6 +367,28 @@ impl End for LentAppendEnd {
         match outcome {
             FileOutcome::AppendLent(result, buf) => (result, buf),
             _ => (Err(mismatched()), OwnedBuf::default()),
+        }
+    }
+}
+
+impl End for KeptWriteEnd {
+    #[inline]
+    fn of(outcome: FileOutcome) -> Self {
+        match outcome {
+            FileOutcome::WriteKept(result, buf) => (result, Some(buf)),
+            // A call given up on has no buffer to bring back.
+            FileOutcome::Write(Err(err)) => (Err(err), None),
+            _ => (Err(mismatched()), None),
+        }
+    }
+}
+
+impl End for KeptAppendEnd {
+    #[inline]
+    fn of(outcome: FileOutcome) -> Self {
+        match outcome {
+            FileOutcome::AppendKept(result, buf) => (result, Some(buf)),
+            _ => (Err(mismatched()), None),
         }
     }
 }

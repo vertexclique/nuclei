@@ -119,6 +119,7 @@ fn a_dropped_step_wakes_what_it_held() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "under Miri `will_wake` misses a waker's clone")]
 fn a_list_of_wakers_is_woken_once_each() {
     let (first, a) = counted();
     let (second, b) = counted();
@@ -161,6 +162,7 @@ fn buffers_and_forgotten_wakers_go_with_no_wake() {
 /// poll's word is back, so the poll is still seen outside and taken if it blocks after, and the
 /// next step marks its call again (proofs/tla/handoff, `M_marked_unwind`).
 #[test]
+#[cfg_attr(miri, ignore = "starts a runtime, whose shards need the kernel poller")]
 fn a_marked_step_that_unwinds_ends_its_call() {
     use crate::rt::context::{self, Marked};
     use crate::rt::handoff::slot::{self, Slot};

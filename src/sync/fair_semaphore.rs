@@ -281,12 +281,13 @@ impl FairWait {
         waker: &Waker,
         give_back: impl FnOnce(usize),
     ) -> Poll<Result<(), Closed>> {
-        self.poll_admitted(sem, n, waker, || crate::coop::spend(waker), give_back)
+        self.poll_admitted(sem, n, waker, crate::coop::try_spend, give_back)
     }
 
     /// [`poll`](Self::poll) with `admit` in place of the budget: asked once
-    /// a first poll would complete, and a `false` hands what it got to
-    /// `give_back` and answers `Pending`.
+    /// a first poll would complete, and it wakes nobody. On `false` what the
+    /// poll got goes to `give_back` first, then the task is woken through the
+    /// budget's refusal, and the poll answers `Pending`.
     pub(super) fn poll_admitted(
         &mut self,
         sem: &FairSemaphore,
@@ -304,12 +305,14 @@ impl FairWait {
                         return Poll::Ready(Ok(()));
                     }
                     give_back(n);
+                    crate::coop::refused(waker);
                     return Poll::Pending;
                 }
                 Err(seen) if observed_closed(seen) => {
                     return if admit() {
                         Poll::Ready(Err(Closed))
                     } else {
+                        crate::coop::refused(waker);
                         Poll::Pending
                     };
                 }
@@ -321,6 +324,7 @@ impl FairWait {
                     if payload != CLOSED_GRANT {
                         give_back(n);
                     }
+                    crate::coop::refused(waker);
                     return Poll::Pending;
                 }
                 granted => granted,
@@ -340,7 +344,7 @@ impl FairWait {
     pub(super) fn cancel(&mut self, sem: &FairSemaphore, n: usize) {
         match self.wait.cancel(&sem.queue) {
             Cancel::Idle => {}
-            Cancel::Withdrawn(_) => sem.withdrawn(false),
+            Cancel::Withdrawn(_, _shelved) => sem.withdrawn(false),
             // A grant made because the semaphore closed carries nothing.
             Cancel::Granted(payload) if payload == CLOSED_GRANT => {}
             Cancel::Granted(_) => {

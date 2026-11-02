@@ -343,6 +343,19 @@ fn udp_socket() -> UdpSocket {
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap()
 }
 
+/// The largest datagram the soak sends: what fits one loopback frame where the loopback's MTU is
+/// 16384 (FreeBSD, macOS), and 60 016 bytes elsewhere. A larger one is cut into IP fragments
+/// there, and the kernel's reassembly can join fragments of two datagrams that share an IP
+/// identifier (FreeBSD numbers them per CPU), with no checksum checked on loopback: a datagram
+/// with another's tail, or an old one's head (byte 16352 of a datagram is the first fragment's
+/// last payload byte plus one: 16384 - 20 - 8 rounded down to 8 bytes). That is the kernel's,
+/// not nuclei's, which hands each datagram to one receive.
+const MAX_DATAGRAM: usize = if cfg!(any(target_os = "freebsd", target_os = "macos")) {
+    16_384 - 20 - 8
+} else {
+    16 + 60_000
+};
+
 /// Datagrams over UDP, each checked whole by the number and length it
 /// carries. A receive given up on loses nothing: the datagram it would have
 /// taken comes to the next one, so a receive may get an earlier datagram,
@@ -356,7 +369,7 @@ async fn datagrams(mut dice: Dice, totals: Arc<Totals>) {
     while totals.going() {
         let seq = next;
         next += 1;
-        let len = 16 + dice.below(60_000) as usize;
+        let len = 16 + dice.below((MAX_DATAGRAM - 16) as u64) as usize;
         let mut bytes = vec![0u8; len];
         bytes[..8].copy_from_slice(&seq.to_le_bytes());
         bytes[8..16].copy_from_slice(&(len as u64).to_le_bytes());

@@ -11,3 +11,11 @@ W_sends_past_cap               MC_Admission         violated:SendsWithinCap
 G_polls_overflow               MC_Admission         pass
 M_no_rearm_after_full          MC_Admission         violated:EndedRearmed
 W_poll_edges_past_queue        MC_Admission         violated:NoOverflow
+G_dropped                      MC_Admission         pass
+G_dropped_ends                 MC_Admission         pass
+M_panic_on_dropped             MC_Admission         violated:ShardLives
+M_drop_uncounted               MC_Admission         violated:DropsCounted
+M_poll_end_dropped             MC_Admission         violated:DroppedRecovered
+G_dropped_recovers             MC_Admission         pass
+M_skip_sweep                   MC_Admission         violated:DroppedRecovered
+M_no_cancel                    MC_Admission         violated:NoFalseSweep

@@ -61,16 +61,23 @@ impl<T> Inner<T> {
 }
 
 /// Replaces the waker in `slot` with `waker` unless it already wakes the
-/// same task; the old one is dropped after the cell is set.
+/// same task; the old one is dropped after the cell is set. Answers whether
+/// it cloned, which ran user code that may have sent or closed: the caller
+/// looks at the state again.
 #[inline]
-fn register(slot: &Cell<Option<Waker>>, waker: &Waker) {
-    match slot.take() {
-        Some(old) if old.will_wake(waker) => slot.set(Some(old)),
-        old => {
-            slot.set(Some(waker.clone()));
-            drop(old);
-        }
+fn register(slot: &Cell<Option<Waker>>, waker: &Waker) -> bool {
+    // SAFETY: `!Sync` (a `BlockRc`), and the borrow ends in the comparison,
+    // which runs no user code and touches no cell.
+    if unsafe { &*slot.as_ptr() }
+        .as_ref()
+        .is_some_and(|old| old.will_wake(waker))
+    {
+        return false;
     }
+    // Cloned before the cell is touched: the clone is user code.
+    let fresh = waker.clone();
+    drop(slot.replace(Some(fresh)));
+    true
 }
 
 #[inline]
@@ -155,7 +162,9 @@ impl<T> Sender<T> {
         if inner.has(RX_CLOSED) {
             return Poll::Ready(());
         }
-        register(&inner.tx_waker, cx.waker());
+        if register(&inner.tx_waker, cx.waker()) && inner.has(RX_CLOSED) {
+            return Poll::Ready(());
+        }
         Poll::Pending
     }
 }
@@ -257,8 +266,8 @@ impl<T> Future for Receiver<T> {
         let Some(inner) = this.inner.as_ref() else {
             panic!("called after complete");
         };
-        if !inner.has(VALUE_SENT | RX_CLOSED | TX_DROPPED) {
-            register(&inner.rx_waker, cx.waker());
+        const DONE: u8 = VALUE_SENT | RX_CLOSED | TX_DROPPED;
+        if !inner.has(DONE) && !(register(&inner.rx_waker, cx.waker()) && inner.has(DONE)) {
             return Poll::Pending;
         }
         if crate::coop::exhausted(cx.waker()) {
@@ -277,5 +286,46 @@ impl<T> fmt::Debug for Receiver<T> {
             .field("is_terminated", &self.is_terminated())
             .field("is_empty", &self.is_empty())
             .finish()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use core::cell::RefCell;
+    use core::task::{Context, Poll};
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::sync::test_support::hooked;
+
+    #[test]
+    fn a_receivers_clone_that_sends_completes_on_that_poll() {
+        let (tx, mut rx) = channel::<u32>();
+        let waker = hooked(
+            Some(Box::new(move || {
+                tx.send(5).unwrap();
+            })),
+            None,
+        );
+        let polled = Pin::new(&mut rx).poll(&mut Context::from_waker(&waker));
+        assert_eq!(polled, Poll::Ready(Ok(5)));
+    }
+
+    #[test]
+    fn a_receivers_clone_that_drops_the_sender_completes_on_that_poll() {
+        let (tx, mut rx) = channel::<u32>();
+        let waker = hooked(Some(Box::new(move || drop(tx))), None);
+        let polled = Pin::new(&mut rx).poll(&mut Context::from_waker(&waker));
+        assert_eq!(polled, Poll::Ready(Err(RecvError(()))));
+    }
+
+    #[test]
+    fn a_closed_wait_whose_clone_closes_the_receiver_completes() {
+        let (mut tx, rx) = channel::<u32>();
+        let rx = Rc::new(RefCell::new(rx));
+        let closer = Rc::clone(&rx);
+        let waker = hooked(Some(Box::new(move || closer.borrow_mut().close())), None);
+        let polled = tx.poll_closed(&mut Context::from_waker(&waker));
+        assert_eq!(polled, Poll::Ready(()));
     }
 }

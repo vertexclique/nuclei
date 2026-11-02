@@ -24,7 +24,9 @@ use std::io;
 use std::sync::Arc;
 
 use super::Allocate;
-use super::call::{End, FileOutcome, LentReadEnd, LentWriteEnd, Slot, SlotJob, WriteCall};
+use super::call::{
+    End, FileOutcome, KeptWriteEnd, LentReadEnd, LentWriteEnd, Slot, SlotJob, WriteCall,
+};
 use super::file::{SyncKind, sync_on};
 use crate::buf::PoolBuf;
 use crate::buf::owned::OwnedBuf;
@@ -41,8 +43,13 @@ pub(crate) enum FileMem {
     Read { buf: PoolBuf, from: u32, len: u32 },
     /// A read into the spare capacity of a task's buffer.
     ReadLent(OwnedBuf),
-    /// A write of a buffer of the pool, `done` of its bytes landed.
-    Write { buf: PoolBuf, done: usize },
+    /// A write of a buffer of the pool, `done` of its bytes landed; with
+    /// `kept` its end brings the buffer back.
+    Write {
+        buf: PoolBuf,
+        done: usize,
+        kept: bool,
+    },
     /// A write of a task's buffer, `done` of its bytes landed.
     WriteLent { buf: OwnedBuf, done: usize },
     /// A call that moves no bytes: a sync, a range's space or write-back.
@@ -246,7 +253,37 @@ pub(crate) fn read_lent(
 /// A write of all of `buf` at `at`.
 #[inline]
 pub(crate) fn write(fd: &Lease, at: u64, buf: PoolBuf) -> Result<SlotJob<io::Result<()>>, PoolBuf> {
-    submit(fd, at, buf, |buf| FileMem::Write { buf, done: 0 }, None)
+    submit(
+        fd,
+        at,
+        buf,
+        |buf| FileMem::Write {
+            buf,
+            done: 0,
+            kept: false,
+        },
+        None,
+    )
+}
+
+/// As [`write`], its end bringing `buf` back.
+#[inline]
+pub(crate) fn write_kept(
+    fd: &Lease,
+    at: u64,
+    buf: PoolBuf,
+) -> Result<SlotJob<KeptWriteEnd>, PoolBuf> {
+    submit(
+        fd,
+        at,
+        buf,
+        |buf| FileMem::Write {
+            buf,
+            done: 0,
+            kept: true,
+        },
+        None,
+    )
 }
 
 /// A shutdown of the socket `fd`'s halves `how` (as `shutdown(2)` names
@@ -289,7 +326,7 @@ impl FileOp {
                 Sqe::read(fd, spare.as_mut_ptr().cast(), len32(spare.len()), self.at)
             }
             FileMem::ReadLent(buf) => other_read_entry(fd, buf, self.at),
-            FileMem::Write { buf, done } => {
+            FileMem::Write { buf, done, .. } => {
                 let bytes = buf.filled().get(*done..).unwrap_or_default();
                 Sqe::write(
                     fd,
@@ -344,7 +381,8 @@ impl FileOp {
             self.finish_on_pool();
             return None;
         }
-        if let (FileMem::Write { buf, done }, Ok(n @ 1..)) = (&mut self.mem, usize::try_from(res))
+        if let (FileMem::Write { buf, done, .. }, Ok(n @ 1..)) =
+            (&mut self.mem, usize::try_from(res))
             && *done + n < buf.filled().len()
         {
             *done += n;
@@ -380,7 +418,8 @@ impl FileOp {
                 }
                 FileOutcome::ReadLent(result, buf)
             }
-            FileMem::Write { .. } => FileOutcome::Write(written(result)),
+            FileMem::Write { kept: false, .. } => FileOutcome::Write(written(result)),
+            FileMem::Write { buf, .. } => FileOutcome::WriteKept(written(result), buf),
             FileMem::WriteLent { buf, .. } => FileOutcome::WriteLent(written(result), buf),
             FileMem::Call(Call::Sync { .. } | Call::SyncRange { .. }) => {
                 FileOutcome::Sync(result.map(drop))
@@ -486,11 +525,17 @@ impl FileOp {
                     let result = crate::fs::file::pread_owned(raw, &mut buf, at);
                     FileOutcome::ReadLent(result, buf)
                 }
-                FileMem::Write { buf, done } => FileOutcome::Write(sys::pwrite_all(
-                    raw,
-                    buf.filled().get(done..).unwrap_or_default(),
-                    at + done as u64,
-                )),
+                FileMem::Write { buf, done, kept } => {
+                    let result = sys::pwrite_all(
+                        raw,
+                        buf.filled().get(done..).unwrap_or_default(),
+                        at + done as u64,
+                    );
+                    match kept {
+                        true => FileOutcome::WriteKept(result, buf),
+                        false => FileOutcome::Write(result),
+                    }
+                }
                 FileMem::WriteLent { mut buf, done } => {
                     let result =
                         crate::fs::file::pwrite_owned(raw, &mut buf, done, at + done as u64);

@@ -30,6 +30,7 @@ LM_no_context     Linger  violated:DropWaits
 LM_count_before_wake Linger violated:DropWaits
 LM_no_call_wait   Linger  violated:DropWaits
 LM_no_inbox_wait  Linger  violated:DropWaits
+LM_pool_delivers  Linger  violated:DropWaits
 LW_task_held      Linger  violated:NoTaskHeld
 LW_late_drain     Linger  violated:NoLateDrain
 L_background      Linger  pass
@@ -44,6 +45,8 @@ PM_no_attach_wait Pending violated:NoLeaseLeft
 PM_take_first     Pending violated:NoLeaseLeft
 PM_gen_reset      Pending violated:NoForeignRelease
 PW_late_release   Pending violated:NoLateRelease
+P_ring_stalls     Pending pass
+PM_wait_unbounded Pending violated:WaitEnds
 B_deaf            Behind  pass
 MB_no_drain_time  Behind  violated:DrainEnds
 W_drain_timeout   Behind  violated:NoDrainTimeout
@@ -71,3 +74,8 @@ VM_no_catch_reapable Locals  violated:NoWriteIntoFreed
 VM_one_catch      Locals  violated:NoAbort
 VM_values_first   Locals  violated:ValuesAfterSettle
 VM_before         Locals  violated:NoWriteIntoFreed
+LL_safe           LingerList pass
+LLM_push_unfenced LingerList violated:NoneLeft
+LLM_end_unfenced  LingerList violated:NoneLeft
+LLM_register_late LingerList violated:NoLostWake
+LLW_alone         LingerList violated:NoAlone

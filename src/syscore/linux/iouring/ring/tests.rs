@@ -342,8 +342,10 @@ fn enter_results_map_to_the_caller_facing_outcome() {
     let os = |code| Err(io::Error::from_raw_os_error(code));
     assert_eq!(enter_outcome(Ok(3)).unwrap(), 3);
     assert_eq!(enter_outcome(os(libc::ETIME)).unwrap(), 0);
-    let lost = enter_outcome(os(libc::EBADR)).unwrap_err();
-    assert!(lost.to_string().contains("lost"), "{lost}");
+    assert_eq!(
+        enter_outcome(os(libc::EBADR)).unwrap_err().raw_os_error(),
+        Some(libc::EBADR)
+    );
     assert_eq!(
         enter_outcome(os(libc::EINTR)).unwrap_err().kind(),
         ErrorKind::Interrupted

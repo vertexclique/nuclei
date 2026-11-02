@@ -1,10 +1,10 @@
-//! Advisory file locks: which handles exclude which, the wait on the pool
-//! and not the worker, the unlock after the writes, and a lock future that is
-//! dropped at every point never leaves the file locked.
+//! Advisory file locks: which handles exclude which, a wait that takes neither
+//! the worker nor a pool thread, the unlock after the writes, and a lock future
+//! that is dropped while it waits never leaves the file locked.
 
 use std::fs::TryLockError;
 
-use super::owned::{hold_the_pool, one_blocking_thread, pends};
+use super::owned::{one_blocking_thread, pends};
 use super::*;
 
 fn open_rw(path: &PathBuf) -> File {
@@ -42,18 +42,6 @@ async fn free(path: &PathBuf) -> bool {
         probe.unlock_file().await.unwrap();
     }
     taken
-}
-
-/// Waits, to a deadline and with a bounded pause, until the lock is `free`
-/// or held.
-async fn becomes(path: &PathBuf, free_now: bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut pause = Duration::from_micros(50);
-    while free(path).await != free_now {
-        assert!(Instant::now() < deadline, "the lock never changed");
-        crate::time::sleep(pause).await;
-        pause = (pause * 2).min(Duration::from_millis(20));
-    }
 }
 
 #[test]
@@ -109,7 +97,7 @@ fn the_locks_answer_as_stds_do() {
 }
 
 #[test]
-fn a_waiting_lock_holds_a_pool_thread_and_not_the_worker() {
+fn a_waiting_lock_holds_no_pool_thread() {
     let rt = one_blocking_thread();
     let (_tmp, path) = path_of("lock-waits");
     rt.block_on(async {
@@ -117,7 +105,13 @@ fn a_waiting_lock_holds_a_pool_thread_and_not_the_worker() {
         within(a.lock_file(false)).await.unwrap();
         let mut waiting = Box::pin(b.lock_file(false));
         pends(&mut waiting).await;
+        assert_eq!(
+            within(crate::runtime::spawn_blocking(|| 11u32)).await,
+            11,
+            "the pool's one thread was taken"
+        );
         assert_eq!(within(spawn(async { 7 })).await, 7);
+        pends(&mut waiting).await;
         within(a.unlock_file()).await.unwrap();
         within(waiting).await.unwrap();
         assert!(!free(&path).await);
@@ -127,7 +121,29 @@ fn a_waiting_lock_holds_a_pool_thread_and_not_the_worker() {
 }
 
 #[test]
-fn a_lock_dropped_while_its_job_waits_never_leaves_the_file_locked() {
+fn a_lock_kept_for_good_keeps_no_pool_thread() {
+    let rt = one_blocking_thread();
+    let (tmp, path) = path_of("lock-kept");
+    let other = tmp.file("other");
+    let data = pattern(70_000);
+    rt.block_on(async {
+        let (a, b) = (handle(&path), handle(&path));
+        within(a.lock_file(false)).await.unwrap();
+        let mut waiting = Box::pin(b.lock_file(false));
+        pends(&mut waiting).await;
+        within(crate::fs::write(&other, data.clone()))
+            .await
+            .unwrap();
+        assert!(within(crate::fs::read(&other)).await.unwrap() == data);
+        pends(&mut waiting).await;
+        drop(waiting);
+        within(a.unlock_file()).await.unwrap();
+        assert!(free(&path).await);
+    });
+}
+
+#[test]
+fn a_lock_dropped_while_it_waits_never_leaves_the_file_locked() {
     let rt = runtime();
     let (_tmp, path) = path_of("lock-dropped-waiting");
     rt.block_on(async {
@@ -137,45 +153,11 @@ fn a_lock_dropped_while_its_job_waits_never_leaves_the_file_locked() {
         pends(&mut waiting).await;
         drop(waiting);
         within(a.unlock_file()).await.unwrap();
-        within(becomes(&path, true)).await;
-    });
-}
-
-#[test]
-fn a_lock_dropped_after_its_job_got_the_lock_gives_it_back() {
-    let rt = one_blocking_thread();
-    let (_tmp, path) = path_of("lock-dropped-held");
-    rt.block_on(async {
-        let b = handle(&path);
-        let (hold, busy) = hold_the_pool();
-        let mut taken = Box::pin(b.lock_file(false));
-        pends(&mut taken).await;
-        hold.send(()).unwrap();
-        within(busy).await;
-        within(becomes(&path, false)).await;
-        // The pool's one thread runs this after the lock's job ended, so the
-        // job has handed the lock to its future, which gives it back as it
-        // drops.
-        within(crate::runtime::spawn_blocking(|| ())).await;
-        drop(taken);
-        assert!(free(&path).await, "the lock stayed held");
-    });
-}
-
-#[test]
-fn a_lock_dropped_before_its_job_started_never_locks() {
-    let rt = one_blocking_thread();
-    let (_tmp, path) = path_of("lock-dropped-queued");
-    rt.block_on(async {
-        let b = handle(&path);
-        let (hold, busy) = hold_the_pool();
-        let mut queued = Box::pin(b.lock_file(false));
-        pends(&mut queued).await;
-        drop(queued);
-        hold.send(()).unwrap();
-        within(busy).await;
         assert!(free(&path).await);
-        within(becomes(&path, true)).await;
+        for _ in 0..3 {
+            crate::time::sleep(Duration::from_millis(25)).await;
+            assert!(free(&path).await, "the dropped lock took the file");
+        }
     });
 }
 

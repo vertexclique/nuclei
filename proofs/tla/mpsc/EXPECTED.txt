@@ -58,3 +58,7 @@ M_close_grant_as_ok            MC_BoundedChannel   violated:PermitsSound
 BC_late_cancel                 MC_BoundedChannel   pass
 BC_live_late_cancel            MC_BoundedChannel   pass
 BC_try_zero                    MC_BoundedChannel   pass
+ST_safe                        MC_Stash             pass
+ST_panics                      MC_Stash             pass
+M_pop_lost                     MC_Stash             violated:NoValueLost
+M_stash_released_again         MC_Stash             violated:SlotsConserved

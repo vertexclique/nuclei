@@ -17,3 +17,7 @@ FM_forget_frees                MC_Forgot            violated:NoScribble
 FM_end_twice                   MC_Forgot            violated:EndsOnce
 FW_given_up                    MC_Forgot            violated:NoGivenUp
 FW_late                        MC_Forgot            violated:NoLate
+F_file                         MC_Forgot            pass
+F_file_stalled                 MC_Forgot            pass
+FM_file_short_wait             MC_Forgot            violated:FileNotGivenUp
+FM_forget_unsaid               MC_Forgot            violated:GivenUpSaid

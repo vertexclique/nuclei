@@ -188,6 +188,12 @@ impl Waiters {
         self.step(|s| s.push(need, waker))
     }
 
+    /// Whether the front waiter's need is at most `available`.
+    #[inline]
+    pub(crate) fn front_fits(&self, available: usize) -> bool {
+        self.step(|s| s.head != NIL && s.entries[s.head].need <= available)
+    }
+
     /// Grants the front waiter when its need is at most `available`: answers
     /// its need and its waker, to wake outside the step.
     pub(crate) fn grant_front_if(&self, available: usize) -> Option<(usize, Option<Waker>)> {
@@ -206,7 +212,9 @@ impl Waiters {
     }
 
     /// The state of `key`, after making `waker` the one a waiting entry
-    /// wakes.
+    /// wakes. The state is read in the step after the clone, which is user
+    /// code: the entry may have been granted or closed meanwhile.
+    #[inline]
     pub(crate) fn refresh(&self, key: Key, waker: &Waker) -> State {
         let (state, same) = self.step(|s| {
             s.live(key).map_or((State::Free, true), |e| {
@@ -217,14 +225,23 @@ impl Waiters {
                 )
             })
         });
-        if !same {
-            let fresh = waker.clone();
-            let old = self.step(|s| match s.live(key) {
-                Some(e) if e.state == State::Waiting => e.waker.replace(fresh),
-                _ => Some(fresh),
-            });
-            drop(old);
+        if same {
+            return state;
         }
+        self.refresh_clone(key, waker)
+    }
+
+    /// The part of [`refresh`](Self::refresh) that clones, out of line.
+    #[cold]
+    #[inline(never)]
+    fn refresh_clone(&self, key: Key, waker: &Waker) -> State {
+        let fresh = waker.clone();
+        let (state, old) = self.step(|s| match s.live(key) {
+            Some(e) if e.state == State::Waiting => (State::Waiting, e.waker.replace(fresh)),
+            Some(e) => (e.state, Some(fresh)),
+            None => (State::Free, Some(fresh)),
+        });
+        drop(old);
         state
     }
 
@@ -254,5 +271,37 @@ impl Waiters {
             s.free_entry(key.index);
             (state, was_front, waker)
         })
+    }
+}
+
+/// Ends every waiting entry without serving it, waking each. A waker that
+/// panics does not leave the rest asleep: they are woken and the panic goes on.
+pub(crate) fn wake_closed(waiters: &Waiters) {
+    let rest = CloseRest::new(waiters);
+    while let Some(waker) = waiters.close_front() {
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+    rest.disarm();
+}
+
+/// While alive, an unwind ends and wakes the entries still waiting.
+pub(crate) struct CloseRest<'a>(&'a Waiters);
+
+impl<'a> CloseRest<'a> {
+    pub(crate) fn new(waiters: &'a Waiters) -> Self {
+        Self(waiters)
+    }
+
+    /// The work ran without a panic: nothing is left to do.
+    pub(crate) fn disarm(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for CloseRest<'_> {
+    fn drop(&mut self) {
+        crate::sync::internal::during_unwind(|| wake_closed(self.0));
     }
 }

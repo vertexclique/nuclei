@@ -1,0 +1,35 @@
+TLC run of every configuration in proofs/tla/localchan, 2026-11-02 23:25 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+LC_safe                           1737        711      1  pass                                  pass                                  yes
+LC_close                           756        303      1  pass                                  pass                                  yes
+LC_drop                           1233        580      1  pass                                  pass                                  yes
+MLC_push_no_wake                    45         31      1  violated:AllEnd                       violated:AllEnd                       yes
+MLC_last_drop_no_wake               62         38      1  violated:AllEnd                       violated:AllEnd                       yes
+MLC_give_back_no_wake               84         49      1  violated:AllEnd                       violated:AllEnd                       yes
+MLC_finish_ignores_reserved          96         57      1  violated:EndAfterAll                  violated:EndAfterAll                  yes
+MLC_close_no_wake                   41         27      1  violated:AllEnd                       violated:AllEnd                       yes
+LO_send_recv                        10          7      2  pass                                  pass                                  yes
+LO_close                            29         18      1  pass                                  pass                                  yes
+LO_drop                             17         12      1  pass                                  pass                                  yes
+LO_rx_drop                          21         14      1  pass                                  pass                                  yes
+MLO_send_ignores_close               5          5      1  violated:NoSendPastClose              violated:NoSendPastClose              yes
+MLO_drop_no_wake                     9          7      1  violated:Termination                  violated:Termination                  yes
+MLO_close_no_wake                   18         13      1  violated:Termination                  violated:Termination                  yes
+MLO_poll_ignores_dropped             9          7      2  violated:Termination                  violated:Termination                  yes
+LC_reentrant                        81         53      2  pass                                  pass                                  yes
+LC_reentrant_closed                 69         41      2  pass                                  pass                                  yes
+LC_close_panic                     526        229      2  pass                                  pass                                  yes
+LC_recv_panic                      134         78      1  pass                                  pass                                  yes
+MLC_no_relook                       61         40      1  violated:AllEnd                       violated:AllEnd                       yes
+MLC_closed_no_relook                71         44      1  violated:AllEnd                       violated:AllEnd                       yes
+MLC_close_stops_at_panic           528        232      1  violated:OthersEnd                    violated:OthersEnd                    yes
+MLC_pop_lost                        25         18      1  violated:NoValueLost                  violated:NoValueLost                  yes
+LO_reentrant                        15         11      1  pass                                  pass                                  yes
+LO_reentrant_park                   33         22      1  pass                                  pass                                  yes
+MLO_no_relook                       13         10      1  violated:Termination                  violated:Termination                  yes
+MLO_closed_no_relook                26         18      1  violated:Termination                  violated:Termination                  yes
+
+results matching EXPECTED.txt: 28 of 28

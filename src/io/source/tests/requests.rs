@@ -409,9 +409,9 @@ fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
         })
     };
     let (home, token) = token_rx.recv().unwrap();
-    // Past the ring's wait for its operations as a shard goes (one second),
-    // which a shard that did not wait for the eviction would end by.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Long enough for a shard that did not wait for the eviction to have
+    // stopped, short of the bound of its wait (one second).
+    let deadline = Instant::now() + Duration::from_millis(500);
     while !left.load(Ordering::SeqCst) && Instant::now() < deadline {
         std::thread::yield_now();
     }
@@ -943,7 +943,6 @@ fn a_registration_made_after_a_retire_fails_no_read_after_it() {
 }
 
 /// A connected TCP pair over the loopback.
-#[cfg(unix)]
 fn tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let a = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1076,14 +1075,6 @@ fn the_wait_for_acks_ends_at_its_deadline() {
 }
 
 #[cfg(unix)]
-const COUNTS_UNACKED: bool = cfg!(any(
-    target_os = "linux",
-    target_os = "android",
-    target_vendor = "apple",
-    target_os = "freebsd"
-));
-
-#[cfg(unix)]
 #[test]
 fn a_zero_linger_mark_follows_the_linger_set() {
     let rt = runtime(None);
@@ -1137,32 +1128,26 @@ fn a_socket_set_to_zero_linger_passes_it_to_its_streams() {
     });
 }
 
-#[cfg(unix)]
 #[test]
-fn waits_for_acks_asks_the_kernel_only_for_a_marked_stream() {
+fn only_a_tcp_stream_set_to_zero_linger_resets_at_close() {
     let rt = runtime(None);
-    let (writer, peer, _) = tcp_pair_with_a_closed_window();
-    let fd = writer.as_raw_fd();
+    let (writer, peer) = tcp_pair();
     rt.block_on(async {
         let handle = Handle::new(writer).unwrap();
-        assert!(!handle.source().waits_for_acks(fd));
+        assert!(!handle.source().resets_at_close());
         handle.set_zero_linger().unwrap();
-        assert_eq!(handle.source().waits_for_acks(fd), COUNTS_UNACKED);
+        assert!(handle.source().resets_at_close());
         handle.set_linger(None).unwrap();
-        assert!(!handle.source().waits_for_acks(fd));
+        assert!(!handle.source().resets_at_close());
     });
     drop(peer);
 }
 
-#[cfg(unix)]
+#[cfg(target_vendor = "apple")]
 #[test]
 fn a_zero_linger_stream_dropped_with_nothing_behind_delivers_what_its_kernel_holds_then_resets() {
     let rt = runtime(None);
     let (writer, mut peer, written) = tcp_pair_with_a_closed_window();
-    if !COUNTS_UNACKED {
-        assert!(sys::unacked(writer.as_raw_fd()).is_none());
-        return;
-    }
     rt.block_on(async {
         let handle = Handle::new(writer).unwrap();
         handle.set_zero_linger().unwrap();
@@ -1181,5 +1166,82 @@ fn a_zero_linger_stream_dropped_with_nothing_behind_delivers_what_its_kernel_hol
         }
     }
     assert_eq!(sum, written, "every byte the kernel held, then the reset");
+    drop(rt);
+}
+
+/// A zero-linger stream dropped with bytes its peer has not acknowledged resets at once: it does
+/// not wait for the acknowledgements, though the runtime would let it wait 30 s. The premise holds
+/// by construction: the peer's receive buffer is 16 KiB, set on the listener so the accepted
+/// socket inherits it, the writer's send buffer 128 KiB, and 96 KiB is written, more than the
+/// peer's window and less than the writer's send queue, so after the flush the kernel holds
+/// bytes the peer has not acknowledged (asserted before the drop).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_zero_linger_stream_dropped_with_bytes_unacknowledged_resets_at_once() {
+    use crate::net::opt::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, set_size};
+    let rt = Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .write_behind_linger(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    set_size(listener.as_raw_fd(), SOL_SOCKET, SO_RCVBUF, 16 * 1024).unwrap();
+    // The kernel accepts the backlog only once listening has begun; `bind` listens already, and
+    // the buffer is set before the connection is made.
+    let writer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    set_size(writer.as_raw_fd(), SOL_SOCKET, SO_SNDBUF, 128 * 1024).unwrap();
+    let fd = writer.as_raw_fd();
+    let bytes = (0..96 * 1024).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+    let sent = bytes.clone();
+    // On a worker, whose linger task outlives the call: a drop on the `block_on` thread would be
+    // given up as that call ends.
+    rt.block_on(rt.spawn(async move {
+        let handle = Handle::new(writer).unwrap();
+        handle.set_zero_linger().unwrap();
+        within(write_all(handle.source(), &sent)).await.unwrap();
+        within(flush(handle.source())).await.unwrap();
+        assert!(!handle.source().has_unsent(), "bytes still behind");
+        assert!(
+            sys::unacked(fd).is_some_and(|n| n > 0),
+            "the premise: bytes the peer has not acknowledged"
+        );
+        drop(handle);
+    }));
+    // The peer reads nothing until the reset is seen through `SO_ERROR`, so nothing is
+    // acknowledged meanwhile: a drop that waited for acknowledgements would not reset by the
+    // deadline.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pause = Duration::from_micros(200);
+    let err = loop {
+        match peer.take_error().unwrap() {
+            Some(err) => break err,
+            None if Instant::now() >= deadline => panic!("the reset never came"),
+            None => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
+        }
+    };
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err:?}");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match (&peer).read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::ConnectionReset, "{e:?}");
+                break;
+            }
+        }
+    }
+    assert!(
+        got[..] == bytes[..got.len()],
+        "the bytes that arrived are a prefix of the stream"
+    );
     drop(rt);
 }

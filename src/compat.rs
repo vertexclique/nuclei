@@ -139,14 +139,20 @@ pub fn stop_thread() -> Task<bool> {
 
 /// Stops the worker this task runs on, as [`stop_thread`] stops one: false
 /// on a thread that is not a worker of its runtime, or when only the
-/// minimum runs.
+/// minimum runs. The worker is the one the calling code runs for, the rest
+/// of a poll the handoff took included.
 pub fn stop_current_thread() -> Task<bool> {
-    crate::runtime::spawn_local(async {
-        let inner = runtime::current();
-        crate::rt::context::current(|current| {
-            current
-                .filter(|shard| shard.worker_index(inner.id()).is_some())
-                .is_some_and(|shard| inner.workers.stop(&shard.shared))
-        })
-    })
+    let inner = runtime::current();
+    let of_runtime = |shared: &std::sync::Arc<crate::rt::shard::Shared>| {
+        shared.counters.worker_of(inner.id()).is_some()
+    };
+    let shared =
+        crate::rt::context::current(|current| current.map(|s| std::sync::Arc::clone(&s.shared)))
+            .filter(of_runtime)
+            .or_else(|| {
+                crate::rt::context::lost_shared(|lost| {
+                    lost.filter(|s| of_runtime(s)).map(std::sync::Arc::clone)
+                })
+            });
+    crate::runtime::spawn_local(async move { shared.is_some_and(|s| inner.workers.stop(&s)) })
 }

@@ -476,6 +476,9 @@ fn a_shard_that_goes_leaves_its_notifications_to_a_keeper() {
     if !zc_available(&shard) {
         return;
     }
+    // Every part of the write goes zero-copy, whatever the first send takes: the buffer is then
+    // held while any part waits behind the peer's window, until the peer reads.
+    shard.ring().expect("a ring shard").set_zero_copy_min(4096);
     let (_mine, src, peer) = held_back_source();
     let data = pattern(SEND_ZC_MIN);
     let sent = data.clone();

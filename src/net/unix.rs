@@ -346,7 +346,7 @@ impl Handle<UnixDatagram> {
     }
 
     /// Receives a datagram from the connected peer; what does not fit `buf`
-    /// is cut.
+    /// is cut, as std's receive cuts it: the caller sizes the buffer.
     ///
     /// # Errors
     ///
@@ -387,7 +387,8 @@ impl Handle<UnixDatagram> {
     /// Receives a datagram from the connected peer into the spare capacity
     /// of `buf`, after the bytes it holds, and gives `buf` back with the
     /// datagram's length. The driver receives into `buf` itself, so the bytes
-    /// are never copied; what does not fit is cut.
+    /// are never copied; what does not fit is cut, as std's receive cuts it: the caller sizes the
+    /// buffer.
     ///
     /// If the future is dropped before it completes, a datagram the driver
     /// received into `buf` stays with the socket for its next receive, so
@@ -530,7 +531,7 @@ impl Handle<UnixDatagram> {
     }
 
     /// Receives a datagram from the connected peer without waiting; what
-    /// does not fit `buf` is cut.
+    /// does not fit `buf` is cut, as std's receive cuts it: the caller sizes the buffer.
     ///
     /// # Errors
     ///

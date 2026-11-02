@@ -475,7 +475,7 @@ pub(crate) struct Source {
     retired_epoch: AtomicU32,
     kind: Kind,
     /// Set to zero linger through nuclei (`set_zero_linger`, or `set_linger` under a second), so a
-    /// drop with nothing behind asks the kernel whether bytes are still unacknowledged
+    /// drop on an Apple target asks the kernel whether bytes are still unacknowledged
     /// (`waits_for_acks`).
     zero_linger: AtomicBool,
     read: Side<ReadState>,
@@ -691,13 +691,30 @@ impl Source {
         self.zero_linger.load(Ordering::Relaxed)
     }
 
-    /// Whether a drop with nothing behind still hands the stream to a linger task: it was set to
-    /// zero linger through nuclei and its kernel holds bytes the peer has not acknowledged, which
-    /// the reset could overtake (proofs/tla/close/AbortAcks.tla, `L_drop`).
+    /// Whether a drop of the stream resets it: a TCP stream set to zero linger through nuclei.
+    #[cfg(any(test, target_vendor = "apple"))]
+    pub(crate) fn resets_at_close(&self) -> bool {
+        self.kind == Kind::Tcp && self.zero_linger.load(Ordering::Relaxed)
+    }
+
+    /// Whether a zero-linger stream's reset first waits for the peer's acknowledgements, both in
+    /// the drop (a stream with nothing behind still goes to a linger task) and in the linger. Only
+    /// on Apple targets: the stream was set to zero linger through nuclei, its peer is a loopback
+    /// address, and its kernel holds bytes the peer has not acknowledged, which that loopback's
+    /// reset could overtake (proofs/tla/close/AbortAcks.tla, `L_drop`). Elsewhere the reset
+    /// follows the drain at once.
     pub(crate) fn waits_for_acks(&self, fd: Raw) -> bool {
-        self.kind == Kind::Tcp
-            && self.zero_linger.load(Ordering::Relaxed)
-            && crate::io::sys::unacked(fd).is_some_and(|n| n > 0)
+        #[cfg(target_vendor = "apple")]
+        {
+            self.resets_at_close()
+                && crate::io::sys::peer_is_loopback(fd)
+                && crate::io::sys::unacked(fd).is_some_and(|n| n > 0)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = fd;
+            false
+        }
     }
 
     /// Whether a connection this TCP listener accepts now starts with its kernel counting what

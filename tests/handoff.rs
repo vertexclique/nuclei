@@ -448,3 +448,183 @@ fn a_poll_blocked_past_the_threshold_hands_its_shard_over_before_it_ends() {
     );
     rt.block_on(quick);
 }
+
+/// Runs `before`, then holds the thread at a gate, then runs `rest`, all in the first poll of a
+/// task of `rt`'s worker 0. Returns once a task of worker 0 ran (the shard moved to another
+/// thread) and the gate is open, so `rest` is the rest of a poll the monitor took. The channel
+/// gives `rest`'s result.
+fn after_take<B, R>(
+    rt: &Runtime,
+    before: impl FnOnce() -> B + Send + 'static,
+    rest: impl FnOnce(B) -> R + Send + 'static,
+) -> std::sync::mpsc::Receiver<R>
+where
+    R: Send + 'static,
+{
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let started = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&started);
+    let (out, answer) = std::sync::mpsc::channel();
+    let handle = rt.handle();
+    handle
+        .spawn_on_worker(0, async move {
+            seen.store(true, Ordering::SeqCst);
+            let kept = before();
+            held.hold(false);
+            let _ = out.send(rest(kept));
+        })
+        .unwrap()
+        .detach();
+    let deadline = Instant::now() + SAFETY;
+    while !started.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the blocking task never ran");
+        std::thread::yield_now();
+    }
+    rt.block_on(handle.spawn_on_worker(0, async {}).unwrap());
+    gate.release_after("a task of the worker's shard");
+    answer
+}
+
+/// What `rest` of an [`after_take`] answered, failing with `what` if it hung.
+fn answered<R>(answer: &std::sync::mpsc::Receiver<R>, what: &str) -> R {
+    answer
+        .recv_timeout(SAFETY)
+        .unwrap_or_else(|_| panic!("{what} hung in the rest of a poll the monitor took"))
+}
+
+#[test]
+fn the_rest_of_a_taken_poll_answers_its_workers_index_and_backend() {
+    let rt = on();
+    let answer = after_take(
+        &rt,
+        || (nuclei::runtime::worker_index(), nuclei::Proactor::backend()),
+        |before| {
+            (
+                before,
+                (nuclei::runtime::worker_index(), nuclei::Proactor::backend()),
+            )
+        },
+    );
+    let (before, after) = answered(&answer, "worker_index or backend");
+    assert_eq!(before.0, Some(0), "the poll ran on worker 0");
+    assert_eq!(after, before, "the rest of the poll answers what it did");
+}
+
+#[test]
+fn stop_current_thread_in_the_rest_of_a_taken_poll_stops_that_worker() {
+    let rt = Builder::new()
+        .worker_threads(1)
+        .max_worker_threads(2)
+        .pin_workers(false)
+        .handoff_after(Some(Duration::from_millis(10)))
+        .build()
+        .expect("the runtime starts");
+    assert_eq!(rt.block_on(nuclei::spawn_more_threads(1)).unwrap(), 1);
+    let answer = after_take(
+        &rt,
+        || (),
+        |()| nuclei::block_on(nuclei::stop_current_thread()),
+    );
+    assert!(
+        answered(&answer, "stop_current_thread"),
+        "no worker was stopped"
+    );
+    let refused = rt.handle().spawn_on_worker(0, async {}).err();
+    assert_eq!(
+        refused.map(|err| err.kind()),
+        Some(std::io::ErrorKind::InvalidInput),
+        "worker 0 still takes tasks"
+    );
+}
+
+#[test]
+fn blocking_recv_in_the_rest_of_a_taken_poll_runs_a_local_task_woken_from_afar() {
+    let rt = on();
+    let answer = after_take(
+        &rt,
+        || (),
+        |()| {
+            let (tx, mut rx) = mpsc::channel::<u32>(1);
+            let (wake, woken) = nuclei::sync::oneshot::channel::<()>();
+            nuclei::spawn_local(async move {
+                let _ = woken.await;
+                tx.send(9).await.unwrap();
+            })
+            .detach();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = wake.send(());
+            });
+            rx.blocking_recv()
+        },
+    );
+    assert_eq!(answered(&answer, "blocking_recv"), Some(9));
+}
+
+#[test]
+fn blocking_recv_in_the_rest_of_a_taken_poll_runs_a_local_task_spawned_before_the_take() {
+    let rt = on();
+    let answer = after_take(
+        &rt,
+        || {
+            let (tx, rx) = mpsc::channel::<u32>(1);
+            let (wake, woken) = nuclei::sync::oneshot::channel::<()>();
+            nuclei::spawn_local(async move {
+                let _ = woken.await;
+                tx.send(9).await.unwrap();
+            })
+            .detach();
+            (rx, wake)
+        },
+        |(mut rx, wake)| {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = wake.send(());
+            });
+            rx.blocking_recv()
+        },
+    );
+    assert_eq!(answered(&answer, "blocking_recv"), Some(9));
+}
+
+#[test]
+fn a_nested_block_on_in_the_rest_of_a_taken_poll_gets_the_wake_of_a_local_task() {
+    let rt = on();
+    let answer = after_take(
+        &rt,
+        || (),
+        |()| {
+            let (wake, woken) = nuclei::sync::oneshot::channel::<()>();
+            let local = nuclei::spawn_local(async move {
+                let _ = woken.await;
+                5u32
+            });
+            // Long enough for the thread's own shard to sleep before the wake.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = wake.send(());
+            });
+            nuclei::block_on(local)
+        },
+    );
+    assert_eq!(answered(&answer, "the nested block_on"), 5);
+}
+
+#[test]
+fn many_blocking_receives_in_the_rest_of_a_taken_poll_outlast_the_poll_budget() {
+    let rt = on();
+    let answer = after_take(
+        &rt,
+        || (),
+        |()| {
+            let (tx, mut rx) = mpsc::channel::<u32>(1);
+            for n in 0..300 {
+                tx.try_send(n).unwrap();
+                assert_eq!(rx.blocking_recv(), Some(n));
+            }
+            300
+        },
+    );
+    assert_eq!(answered(&answer, "the blocking receives"), 300);
+}

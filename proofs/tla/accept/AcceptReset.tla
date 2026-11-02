@@ -28,8 +28,12 @@
 (* ENOTCONN when the task asks a multishot accept's connection for its     *)
 (* peer), or the kernel hands the connection over as it is (Linux), its    *)
 (* first read telling the reset. The side tells such an error from the     *)
-(* listener's own (`lost_before_accept` in src/rt/counters.rs) and skips   *)
-(* it: a readiness side's loop takes the next connection at once           *)
+(* listener's own (`lost_before_accept` in src/rt/counters.rs, which on    *)
+(* Linux also knows the network errors accept(2) says to retry: EPROTO,    *)
+(* ENETDOWN, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH, EOPNOTSUPP and   *)
+(* ENETUNREACH, a connection's error pending as it is accepted: `NetErr`)  *)
+(* and skips it, counting each connection it skips (`Stats`): a           *)
+(* readiness side's loop takes the next connection at once                 *)
 (* (`ReadState::accept_ahead`); a completion side keeps nothing and wakes  *)
 (* its task, whose poll sends the next accept (`ReadState::op_done` and    *)
 (* `submit_ops` in src/io/source/read/ops.rs); a task that found a         *)
@@ -59,6 +63,8 @@ CONSTANTS                                                                    \* 
     Kept,         \* connections the peers make and keep
     Doomed,       \* connections the peers make and reset, before, during or after an accept takes them
     ListenerErr,  \* TRUE: the listener fails once with its own error
+    NetErr,       \* TRUE: a connection lost before it is accepted answers one of Linux's network errors (EPROTO...),
+                  \* where FALSE it answers a reset's
     Backend,      \* "readiness" (epoll, kqueue), "completion" (IOCP, io_uring's single accept), "multishot"
     Form,         \* "accept" (`accept`, `incoming`) or "multi" (`accept_multi`)
     Mutation      \* "none", or the name of the one rule this run takes away
@@ -89,12 +95,23 @@ variables                                                                    \* 
     handed = 0,           \* reset connections handed over as they are (their first read tells the reset)
     skippedAt = {},       \* (record) where the side skipped a reset connection's error
     lostToCaller = FALSE, \* (record) the task saw a reset connection's error, or its stream ended for one
+    skips = 0,            \* (record) connections the side skipped
+    counted = 0,          \* the skipped connections the side's stats count
     surfaced = FALSE,     \* the listener's error reached the task
     ended = FALSE;        \* the stream ended (`accept_multi`)
 
 define                                                                       \* names the steps and properties use:
-    \* `lost_before_accept`: the error is a reset connection's, which the side skips (mutated: the listener's too).
-    Lost(answer) == answer = "lost" \/ (answer = "listener" /\ Mutation = "skip_listener")
+    \* What a connection lost before it is accepted answers: a reset's error, or a network error (Linux).
+    LostAnswer == IF NetErr THEN "neterr" ELSE "lost"
+    \* `lost_before_accept`: the error is a connection's, which the side skips (mutated: the listener's too).
+    \* MUTATION resets_only: it knows only a reset's errors (the code before), so a connection's network error
+    \* is taken for the listener's.
+    Lost(answer) == \/ answer = "lost"
+                    \/ answer = "neterr" /\ Mutation # "resets_only"
+                    \/ answer = "listener" /\ Mutation = "skip_listener"
+    \* Whether a skip at `at` is counted in the side's stats.
+    \* MUTATION uncounted_ahead, uncounted_op: a skip there is not counted.
+    Counts(at) == ~(Mutation = "uncounted_ahead" /\ at = "ahead") /\ ~(Mutation = "uncounted_op" /\ at = "op")
     Held == heldKept + heldDoomed + heldReset                                \* connections the side holds
     HasResult == Held > 0 \/ error # "none"                                  \* the side has something for its task
     \* The kinds of connection that may be at the head of the backlog: one of each kind it holds.
@@ -123,6 +140,8 @@ macro op_done(answer, at) begin                                              \* 
     elsif answer = "reset" then heldReset := heldReset + 1;                  \* one handed over though reset
     elsif Lost(answer) then                                                  \* a reset connection's error:
         skippedAt := skippedAt \union {at};                                  \* (record) skipped here
+        skips := skips + 1;                                                  \* (record) one more
+        if Counts(at) then counted := counted + 1; end if;                   \* and counted
         \* MUTATION keep_lost_op, keep_lost_end: the side keeps the reset connection's error for its task, as before.
         if KeepAt = at then error := answer; end if;                         \* (mutated) kept for the task
     else                                                                     \* the listener's own error:
@@ -154,6 +173,8 @@ AA_loop:                                                                     \* 
                     listenerErr := FALSE;                                    \* answered once
                     if Lost("listener") then                                 \* (mutated) taken for a reset one's:
                         skippedAt := skippedAt \union {"ahead"};             \* skipped, and lost
+                        skips := skips + 1;
+                        if Counts("ahead") then counted := counted + 1; end if;
                     else                                                     \* as it is:
                         error := "listener";                                 \* kept for the task
                         stop := TRUE;                                        \* and the loop ends
@@ -162,16 +183,24 @@ AA_loop:                                                                     \* 
                     resetQ := resetQ - 1;                                    \* off the backlog
                     either                                                   \* Linux hands it over as it is:
                         heldReset := heldReset + 1;                          \* held for the task
-                    or                                                       \* macOS, the BSDs: ECONNABORTED
-                        skippedAt := skippedAt \union {"ahead"};             \* (record) skipped here
-                        \* MUTATION keep_lost_ahead: the loop keeps the reset connection's error, as before.
-                        if KeepAt = "ahead" then                             \* (mutated) kept for the task:
-                            error := "lost";                                 \* the reset one's error
-                            stop := TRUE;                                    \* ends the loop
-                        \* MUTATION stall_ahead: the skip ends the loop with nothing held, no error, and not blocked.
-                        elsif StallAt = "ahead" then                         \* (mutated) the loop gives up:
-                            stop := TRUE;                                    \* until an edge that may never come
-                        end if;                                              \* else the next accept at once
+                    or                                                       \* macOS, the BSDs: ECONNABORTED (Linux:
+                        \* a network error, with `NetErr`)
+                        if ~Lost(LostAnswer) then                            \* (mutated) taken for the listener's:
+                            error := LostAnswer;                             \* kept for the task
+                            stop := TRUE;                                    \* and the loop ends
+                        else                                                 \* the connection's: skipped
+                            skippedAt := skippedAt \union {"ahead"};         \* (record) skipped here
+                            skips := skips + 1;                              \* (record) one more
+                            if Counts("ahead") then counted := counted + 1; end if; \* and counted
+                            \* MUTATION keep_lost_ahead: the loop keeps the reset connection's error, as before.
+                            if KeepAt = "ahead" then                         \* (mutated) kept for the task:
+                                error := LostAnswer;                         \* the reset one's error
+                                stop := TRUE;                                \* ends the loop
+                            \* MUTATION stall_ahead: the skip ends the loop with nothing held, no error, and not blocked.
+                            elsif StallAt = "ahead" then                     \* (mutated) the loop gives up:
+                                stop := TRUE;                                \* until an edge that may never come
+                            end if;                                          \* else the next accept at once
+                        end if;
                     end either;                                              \* the reset one is dealt with
                 end if;                                                      \* one answer taken
             end with;                                                        \* whichever came
@@ -252,7 +281,7 @@ K_answer:                                                                    \* 
         or                                                                   \* it completes with a reset one:
             await out /\ ~multi /\ bound = "reset" /\ ~held;                 \* the side's guard free
             either                                                           \* with the reset's error
-                op_done("lost", "op");                                       \* (WSAECONNRESET, ERROR_NETNAME_DELETED)
+                op_done(LostAnswer, "op");                                   \* (WSAECONNRESET, ERROR_NETNAME_DELETED; EPROTO...)
             or                                                               \* or as it is
                 op_done("reset", "op");                                      \* (its first read tells it)
             end either;                                                      \* one completion
@@ -279,7 +308,7 @@ K_answer:                                                                    \* 
         or                                                                   \* it ends with a reset one's error:
             await out /\ multi /\ resetQ > 0 /\ ~held;                       \* the side's guard free
             resetQ := resetQ - 1;                                            \* that connection gone
-            op_done("lost", "multiEnd");                                     \* `Outcome::AcceptMultiEnd(Done(Err))`
+            op_done(LostAnswer, "multiEnd");                                 \* `Outcome::AcceptMultiEnd(Done(Err))`
         or                                                                   \* it ends with the listener's error:
             await out /\ multi /\ listenerErr /\ ~held;                      \* the side's guard free
             listenerErr := FALSE;                                            \* answered once
@@ -346,6 +375,8 @@ T_take:                                                                      \* 
             await heldReset > 0 /\ Ask /\ Form = "accept";                   \* `peer_of` says ENOTCONN
             heldReset := heldReset - 1;                                      \* it is closed
             skippedAt := skippedAt \union {"peer"};                          \* (record) skipped here (`peer_gone`)
+            skips := skips + 1;                                              \* (record) one more
+            if KeepAt # "peer" then counted := counted + 1; end if;          \* and counted
             \* MUTATION keep_lost_peer: the look returns the reset connection's error to the task, as before.
             if KeepAt = "peer" then                                          \* (mutated) the error to the task:
                 lostToCaller := TRUE;                                        \* as before
@@ -358,7 +389,7 @@ T_take:                                                                      \* 
             end if;                                                          \* the reset one is dealt with
         or                                                                   \* an error, and nothing held:
             await Held = 0 /\ error # "none";                                \* the side kept one
-            if error = "lost" then lostToCaller := TRUE; end if;             \* (mutated) a reset one's, to the task
+            if error \in {"lost", "neterr"} then lostToCaller := TRUE; end if; \* (mutated) a connection's, to the task
             if error = "listener" then surfaced := TRUE; end if;             \* the listener's, to the task
             if Form = "multi" then ended := TRUE; end if;                    \* a stream ends (`take_error` says why)
             error := "none";                                                 \* handed over once
@@ -389,6 +420,9 @@ NoLostToCaller == ~lostToCaller                                              \* 
 
 \* The listener's own error reaches the task in the end: `accept` returns it, the stream ends with it.
 ErrSurfaces == errCame ~> surfaced                                           \* the error is never swallowed
+
+\* Every connection the side skipped is counted in its stats.
+SkipsCounted == counted = skips                                              \* none uncounted
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)

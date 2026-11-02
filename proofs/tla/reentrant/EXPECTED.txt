@@ -11,7 +11,10 @@ M_reenter_skips_depth          MC_ReentrantMutex    violated:DepthMatches
 M_queued_skips_reenter         MC_ReentrantMutex    violated:AllOwnersEnd
 MW_reenter                     MC_ReentrantMutex    violated:OneLevel
 MW_contend                     MC_ReentrantMutex    violated:NoWaitBehind
-W_join_young_first             MC_ReentrantMutex    violated:AllOwnersEnd
+L_thread_owner                 MC_ReentrantMutex    pass
+W_thread_owner_shared          MC_ReentrantMutex    violated:Exclusion
+L_join_young_first             MC_ReentrantMutex    pass
+M_no_sibling_wake              MC_ReentrantMutex    violated:AllOwnersEnd
 RW_downgrade                   MC_ReentrantRwLock   pass
 RW_refused                     MC_ReentrantRwLock   pass
 RW_claims                      MC_ReentrantRwLock   pass

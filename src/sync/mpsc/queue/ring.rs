@@ -32,6 +32,7 @@ use core::ptr;
 
 use kovan::CachePadded;
 
+use super::{Popped, Stash};
 use crate::sync::internal::{AtomicPtr, AtomicU64, Ordering};
 
 /// The most cells a segment holds.
@@ -39,6 +40,11 @@ const MAX_SEGMENT: u64 = 32;
 /// The most cells a ring holds: past it, a bounded channel's queue is a
 /// radix directory instead (the ring's segment table is made whole at once).
 pub(super) const MAX_CELLS: u64 = 1 << 16;
+/// The cached segment number before a segment is loaded: no segment has it.
+const NONE_LOADED: u64 = u64::MAX;
+/// The cached segment number while a put-back value waits: no segment has it
+/// either, so the next pop leaves the cached path and finds the stash.
+const DIVERTED: u64 = u64::MAX - 1;
 
 struct Cell<T> {
     /// One past the position whose value it holds; 0 before its first.
@@ -62,6 +68,8 @@ struct Head<T> {
     /// The segment of the last take and its number: the receiver's alone, so
     /// a take within the same segment loads nothing but its cell.
     last: UnsafeCell<(u64, *mut Cell<T>)>,
+    /// The value the receiver put back, taken by the next pop.
+    stash: Stash<T>,
 }
 
 /// The queue.
@@ -100,7 +108,8 @@ impl<T> Ring<T> {
             tail: CachePadded::new(AtomicU64::new(0)),
             head: CachePadded::new(Head {
                 pos: AtomicU64::new(0),
-                last: UnsafeCell::new((u64::MAX, ptr::null_mut())),
+                last: UnsafeCell::new((NONE_LOADED, ptr::null_mut())),
+                stash: Stash::new(),
             }),
             segments: (0..segments.div_ceil(CHUNK))
                 .map(|_| Chunk(core::array::from_fn(|_| AtomicPtr::new(ptr::null_mut()))))
@@ -187,25 +196,34 @@ impl<T> Ring<T> {
         cell.stamp.store(pos + 1, Ordering::SeqCst);
     }
 
-    /// Takes the oldest value, without waiting: `None` when there is none
-    /// yet, or when the next one is still being written.
+    /// Takes the oldest value, without waiting: the put-back value first,
+    /// then [`Popped::Nothing`] when there is none yet, or when the next one
+    /// is still being written.
     ///
     /// # Safety
     ///
     /// The caller is the queue's one receiver: no two calls of this function
     /// on one queue run at once.
     #[inline(always)]
-    pub(in crate::sync::mpsc) unsafe fn try_pop(&self) -> Option<T> {
+    pub(in crate::sync::mpsc) unsafe fn try_pop(&self) -> Popped<T> {
         let pos = self.head.pos.load(Ordering::Relaxed);
         let number = (pos >> self.cell_bits) & self.segment_mask;
         // SAFETY: the caller's contract: the cache is the receiver's.
         let last = unsafe { &mut *self.head.last.get() };
         if last.0 != number {
+            if last.0 == DIVERTED {
+                // SAFETY: the caller's contract.
+                if let Some(value) = unsafe { self.head.stash.take() } {
+                    last.0 = NONE_LOADED;
+                    return Popped::Stashed(value);
+                }
+                last.0 = NONE_LOADED;
+            }
             // SeqCst: a segment not made yet is part of the receiver's look in
             // the wake handshake, as the stamp's load below.
             let segment = self.slot(number).load(Ordering::SeqCst);
             if segment.is_null() {
-                return None;
+                return Popped::Nothing;
             }
             *last = (number, segment);
         }
@@ -213,13 +231,27 @@ impl<T> Ring<T> {
         let cell = unsafe { &*last.1.add((pos & self.cell_mask) as usize) };
         // SeqCst: the receiver's look in the channel's wake handshake.
         if cell.stamp.load(Ordering::SeqCst) != pos + 1 {
-            return None;
+            return Popped::Nothing;
         }
         // SAFETY: stamped for this position: its send wrote the value first;
         // the position is passed below, so it is moved out once.
         let value = unsafe { cell.value.get().read().assume_init() };
         self.head.pos.store(pos + 1, Ordering::Relaxed);
-        Some(value)
+        Popped::Value(value)
+    }
+
+    /// Keeps `value`, which [`try_pop`](Self::try_pop) answered, for the next
+    /// pop: the segment cache is diverted, so that pop leaves the cached
+    /// path and answers the stash.
+    ///
+    /// # Safety
+    ///
+    /// As for [`try_pop`](Self::try_pop).
+    pub(in crate::sync::mpsc) unsafe fn put_back(&self, value: T) {
+        // SAFETY: the caller's contract.
+        unsafe { self.head.stash.put(value) };
+        // SAFETY: as above: the cache is the receiver's.
+        unsafe { (*self.head.last.get()).0 = DIVERTED };
     }
 
     /// How many values are queued, as a snapshot: a push in progress counts,
@@ -227,7 +259,9 @@ impl<T> Ring<T> {
     pub(in crate::sync::mpsc) fn len(&self) -> usize {
         let front = self.head.pos.load(Ordering::Acquire);
         let back = self.tail.load(Ordering::Acquire);
-        usize::try_from(back.saturating_sub(front)).unwrap_or(usize::MAX)
+        usize::try_from(back.saturating_sub(front))
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::from(self.head.stash.is_held()))
     }
 }
 
@@ -273,7 +307,10 @@ mod tests {
 
     fn pop<T>(ring: &Ring<T>) -> Option<T> {
         // SAFETY: each test pops from one thread only.
-        unsafe { ring.try_pop() }
+        match unsafe { ring.try_pop() } {
+            Popped::Value(value) | Popped::Stashed(value) => Some(value),
+            Popped::Nothing => None,
+        }
     }
 
     #[test]
@@ -405,5 +442,52 @@ mod tests {
             p.join().unwrap();
         }
         assert_eq!(pop(&ring), None);
+    }
+
+    #[test]
+    fn a_put_back_value_comes_out_first_and_counts_in_len() {
+        let ring = Ring::new(4);
+        for i in 0..40u32 {
+            ring.push(i);
+            assert!(matches!(
+                // SAFETY: one thread pops.
+                unsafe { ring.try_pop() },
+                Popped::Value(v) if v == i
+            ));
+            // SAFETY: as above.
+            unsafe { ring.put_back(i) };
+            assert_eq!(ring.len(), 1, "the stashed value counts");
+            ring.push(i + 100);
+            assert!(matches!(
+                // SAFETY: as above.
+                unsafe { ring.try_pop() },
+                Popped::Stashed(v) if v == i
+            ));
+            assert_eq!(pop(&ring), Some(i + 100));
+            assert_eq!(ring.len(), 0);
+            assert_eq!(pop(&ring), None);
+        }
+    }
+
+    #[test]
+    fn a_ring_dropped_with_a_put_back_value_drops_it_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let ring = Ring::new(4);
+        ring.push(Counted(Arc::clone(&drops)));
+        ring.push(Counted(Arc::clone(&drops)));
+        // SAFETY: one thread pops.
+        let Popped::Value(first) = (unsafe { ring.try_pop() }) else {
+            panic!("a value was pushed");
+        };
+        // SAFETY: as above.
+        unsafe { ring.put_back(first) };
+        drop(ring);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

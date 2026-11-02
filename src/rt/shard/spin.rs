@@ -15,6 +15,17 @@ const SHORT_PARK: Duration = Duration::from_micros(50);
 /// lines the waker writes, so looking seldom leaves it to run at full speed.
 const SPIN_GAP_MAX: u32 = 64;
 
+/// What a spin came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Spun {
+    /// Work was found.
+    Hit,
+    /// The budget ran out, every look having failed (each asked the poller).
+    Missed,
+    /// The shard expected no work soon: no look was made.
+    Cold,
+}
+
 /// How long a shard spins before it parks, adapted to what spins see.
 ///
 /// Work that arrives within a spin costs neither a park nor the waker's
@@ -46,8 +57,15 @@ impl Spin {
         }
     }
 
-    /// With `expecting` work, spins until `found` says it is there (true) or
-    /// the budget is spent (false). `expecting` is asked only of a shard that
+    /// Spends the budget, so the next spin does not run.
+    #[cfg(test)]
+    pub(super) fn spend(&self) {
+        self.budget.set(0);
+        self.hot.set(false);
+    }
+
+    /// With `expecting` work, spins until `found` says it is there or the
+    /// budget is spent; without, makes no look. `expecting` is asked only of a shard that
     /// is not hot, the one that needs it. Inlined into the run loop, whichever
     /// codegen unit holds it.
     #[inline(always)]
@@ -55,10 +73,10 @@ impl Spin {
         &self,
         expecting: impl FnOnce() -> bool,
         mut found: impl FnMut() -> bool,
-    ) -> bool {
+    ) -> Spun {
         let budget = self.budget.get();
         if budget == 0 || !(self.hot.get() || expecting()) {
-            return false;
+            return Spun::Cold;
         }
         // The first look comes before the clock and the first pause: work already there costs
         // neither, and the budget runs from a failed look.
@@ -81,11 +99,11 @@ impl Spin {
         if hit {
             self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
             self.hot.set(true);
-            return true;
+            return Spun::Hit;
         }
         self.budget.set(budget / 2);
         self.hot.set(false);
-        false
+        Spun::Missed
     }
 
     /// Whether work came soon after a spin or a park, so the next spin runs
@@ -109,15 +127,15 @@ impl Spin {
 mod tests {
     use std::time::Duration;
 
-    use super::{SPIN_MAX, SPIN_RESTART, SPIN_START, Spin};
+    use super::{SPIN_MAX, SPIN_RESTART, SPIN_START, Spin, Spun};
 
     #[test]
     fn a_spin_that_finds_work_doubles_the_budget_and_one_that_runs_out_halves_it() {
         let spin = Spin::new();
         assert_eq!(spin.budget.get(), SPIN_START);
-        assert!(spin.run(|| true, || true));
+        assert_eq!(spin.run(|| true, || true), Spun::Hit);
         assert_eq!(spin.budget.get(), SPIN_START * 2);
-        assert!(!spin.run(|| true, || false));
+        assert_ne!(spin.run(|| true, || false), Spun::Hit);
         assert_eq!(spin.budget.get(), SPIN_START);
         for _ in 0..20 {
             spin.run(|| true, || true);
@@ -127,7 +145,11 @@ mod tests {
             spin.run(|| true, || false);
         }
         assert_eq!(spin.budget.get(), 0, "an idle shard stops spinning");
-        assert!(!spin.run(|| true, || true), "a spent budget does not spin");
+        assert_eq!(
+            spin.run(|| true, || true),
+            Spun::Cold,
+            "a spent budget does not spin"
+        );
     }
 
     #[test]
@@ -135,28 +157,35 @@ mod tests {
         let spin = Spin::new();
         assert!(!spin.hot.get());
         let mut looks = 0;
-        assert!(!spin.run(
-            || false,
-            || {
-                looks += 1;
-                true
-            }
-        ));
+        assert_eq!(
+            spin.run(
+                || false,
+                || {
+                    looks += 1;
+                    true
+                }
+            ),
+            Spun::Cold
+        );
         assert_eq!(looks, 0, "it never looked");
         assert_eq!(spin.budget.get(), SPIN_START);
         spin.parked_for(Duration::from_micros(3));
         assert!(spin.hot.get(), "a short park: work comes soon after one");
-        assert!(spin.run(|| false, || true), "so it spins unasked");
-        assert!(!spin.run(|| false, || false));
+        assert_eq!(
+            spin.run(|| false, || true),
+            Spun::Hit,
+            "so it spins unasked"
+        );
+        assert_ne!(spin.run(|| false, || false), Spun::Hit);
         assert!(!spin.hot.get(), "a spin that ran out ends it");
-        assert!(!spin.run(|| false, || true));
+        assert_ne!(spin.run(|| false, || true), Spun::Hit);
     }
 
     #[test]
     fn a_spin_ends_by_time_not_by_looks() {
         let spin = Spin::new();
         let start = std::time::Instant::now();
-        assert!(!spin.run(|| true, || false));
+        assert_ne!(spin.run(|| true, || false), Spun::Hit);
         let spent = start.elapsed();
         assert!(
             spent >= Duration::from_nanos(u64::from(SPIN_START)),

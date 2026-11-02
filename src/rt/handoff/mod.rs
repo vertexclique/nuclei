@@ -32,6 +32,8 @@ pub(crate) mod loan;
 mod monitor;
 pub(crate) mod slot;
 pub(crate) mod target;
+#[cfg(all(test, not(loom)))]
+mod tests_detached;
 
 pub(crate) use monitor::{Gift, Monitor, Owned, Runner, Spare, run};
 

@@ -14,12 +14,14 @@
 //! [`Shard::block_on`] polls one future and, between its polls, runs the
 //! shard's tasks: the LIFO slot first (a task woken by the task that just
 //! ran, at most [`LIFO_MAX`] times in a row), then the local queue, then the
-//! inbox (first every [`INBOX_INTERVAL`] runs, so remote work is not
-//! starved), then the home, the tasks bound to the thread that runs it
+//! inbox, then the home (the tasks bound to the thread that runs it). Every
+//! [`INBOX_INTERVAL`] runs the remote work comes first, every other time the
+//! home's before the inbox's, so neither starves the other or is starved
 //! (`order`). Every [`DRIVER_INTERVAL`] runs, and every [`DRIVER_INTERVAL`]
-//! turns in which only the future ran (it keeps waking itself), it fires
-//! due timers and polls the poller without waiting, as does every
-//! [`QUARTZ_EVERY`](super::tuning::QUARTZ_EVERY)th run once the coarse clock says
+//! turns in which only the future ran (it keeps waking itself) or in which
+//! the loop was about to park but found work without having asked the
+//! poller, it fires due timers and polls the poller without waiting, as does
+//! every [`QUARTZ_EVERY`](super::tuning::QUARTZ_EVERY)th run once the coarse clock says
 //! [`DRIVE_BOUND`](super::tuning::DRIVE_BOUND) has passed since the last look, so a
 //! few long runs hold the driver off no longer than many short ones; a runner
 //! that takes the shard over looks before it runs a task. The look completes
@@ -65,8 +67,11 @@ use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
 use spin::Spin;
 
+pub(crate) mod backoff;
 mod children;
 mod detached;
+mod ending;
+mod foreign;
 mod going;
 pub(crate) mod locals;
 mod made;
@@ -80,6 +85,8 @@ mod stats;
 mod timers;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 pub(crate) use run::Worked;
+#[cfg(test)]
+pub(crate) use timers::fire_panic_set;
 pub(crate) mod counted;
 #[cfg(ring)]
 pub(crate) mod recv;
@@ -106,6 +113,9 @@ pub(crate) struct Shared {
     notifier: Notifier,
     /// Live tasks placed on the shard: what placement compares.
     pub(crate) load: AtomicUsize,
+    /// The tasks placed on the shard whose poll returned pending: touched only by the shard's
+    /// runner, or its last holder as it goes.
+    pub(crate) tasks: crate::rt::task::list::TaskList,
     /// Threads whose poll lost the shard and that still run what they ran of it (the poll,
     /// then their bound tasks): a stopped worker stays up for them, to lend them the shard
     /// back (`handoff::loan`).
@@ -613,6 +623,8 @@ pub(crate) struct Shard {
     lifo_streak: Cell<u32>,
     /// Runs left before the inbox is looked at first (`tuning.inbox_interval` at the start).
     until_inbox: Cell<u32>,
+    /// The last of those turns looked at the home first (`order`).
+    homes_first: Cell<bool>,
     /// The runs since timers and the poller were last looked at, as a count
     /// down to the next run that weighs a look (`drive_at`, the next multiple
     /// of `QUARTZ_EVERY` or `tuning.driver_interval`): `drive_at - drive_left`
@@ -654,6 +666,15 @@ pub(crate) struct Shard {
     epoch: Instant,
     /// Wakers of fired timers, woken once the wheel is let go; reused.
     fired: RefCell<Vec<Waker>>,
+    /// The wheels of the other runtimes whose `block_on` nests here, kept
+    /// aside between the polls of their futures (`foreign`).
+    side: RefCell<Vec<foreign::Side>>,
+    /// A nested future of another runtime is being polled: the wheels in
+    /// `wheel` and `precise` are its runtime's.
+    foreign_poll: Cell<bool>,
+    /// Counts the sets of side wheels made, for their tags.
+    side_seq: Cell<u64>,
+
     /// The waker the last `block_on` here left, for the next one's future.
     signal: Cell<Option<Arc<signal::Signal>>>,
     /// The IO sources the poller watches, by token.
@@ -841,14 +862,17 @@ impl Shard {
     }
 
     /// Whether other threads handed the shard work it has not taken yet, as
-    /// the taker of its inbox (and of its runner's home) sees it: the look of
-    /// its spin and the one a park makes once more.
+    /// the taker of its inbox (and of its runner's home) sees it: the look a
+    /// park makes once more, after its store of the parked flag, so its look
+    /// of the posted counts is sequentially consistent (a plain load may pass
+    /// that store on aarch64; the park held only because the inbox's look
+    /// came first).
     /// [`Shared::has_remote_work`], a look from any thread, misses the tasks
     /// this shard's last pop left behind its end as it put an inbox's stub
     /// back ([`Inbox::is_drained`]).
     #[inline]
     fn has_remote_work(&self) -> bool {
-        self.has_remote_tasks() || self.has_posted_ops()
+        self.has_remote_tasks() || self.has_posted_ops_seqcst()
     }
 
     /// The tasks of [`has_remote_work`](Self::has_remote_work): runnables in the inbox or a home.
@@ -864,10 +888,18 @@ impl Shard {
     }
 
     /// The rest of [`has_remote_work`](Self::has_remote_work): work on the timer wheel and
-    /// registration changes other threads posted.
+    /// registration changes other threads posted, as the spin looks at them: plain loads.
     #[inline]
     fn has_posted_ops(&self) -> bool {
         !self.shared.timer_ops.is_empty() || !self.shared.io_ops.is_empty()
+    }
+
+    /// [`has_posted_ops`](Self::has_posted_ops) for the last look before a park: the counts are
+    /// read sequentially consistent, so the look does not pass the store of the parked flag that
+    /// precedes it (proofs/tla/handshake/ParkLook.tla).
+    #[inline]
+    fn has_posted_ops_seqcst(&self) -> bool {
+        !self.shared.timer_ops.is_empty_seqcst() || !self.shared.io_ops.is_empty_seqcst()
     }
 
     /// Runnables queued on this thread now, the LIFO slot's included.
@@ -1015,6 +1047,8 @@ impl Shard {
 
 #[cfg(all(test, not(loom)))]
 mod tests;
+#[cfg(all(test, not(loom)))]
+mod tests_foreign;
 #[cfg(all(test, not(loom)))]
 mod tests_made;
 #[cfg(all(test, not(loom)))]

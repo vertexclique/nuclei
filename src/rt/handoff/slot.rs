@@ -115,16 +115,22 @@ impl Slot {
     }
 
     /// The runner polls the task `id` (0: none) from now on; answers the one
-    /// it polled before, which encloses this poll.
+    /// it polled before, which encloses this poll. The load is relaxed, only
+    /// the runner writes the word. Release: the monitor reads the word, then
+    /// the task, then the word again, and a later poll's task must not be seen
+    /// before the word that ended the earlier poll, so the hook is never told
+    /// the next poll's task under the word of the one before
+    /// (proofs/tla/longpoll).
     pub(crate) fn note_task(&self, id: u64) -> u64 {
         let previous = self.task.load(Ordering::Relaxed);
-        self.task.store(id, Ordering::Relaxed);
+        self.task.store(id, Ordering::Release);
         previous
     }
 
-    /// The task polled innermost, as the monitor reads it.
+    /// The task polled innermost, as the monitor reads it. Acquire: it keeps
+    /// the monitor's second read of the word after this read.
     pub(crate) fn task(&self) -> u64 {
-        self.task.load(Ordering::Relaxed)
+        self.task.load(Ordering::Acquire)
     }
 
     /// The runner leaves the shard for a task's code, in the poll of

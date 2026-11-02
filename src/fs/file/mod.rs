@@ -48,11 +48,14 @@
 //!
 //! A file opened for direct IO (`O_DIRECT` on Linux, `FILE_FLAG_NO_BUFFERING`
 //! on Windows, as the descriptor says when the state is made) has no
-//! read-ahead and no write-behind: each read or write goes to the kernel with
-//! exactly the caller's length and offset, from or into memory placed in its
-//! page as the caller's (see `work`), so the kernel's alignment rules give
-//! the answer they would give the caller's own call. A write at the cursor
-//! then waits for the one in flight instead of joining it.
+//! read-ahead: each read goes to the kernel with exactly the caller's length
+//! and offset, into memory placed in its page as the caller's (see `work`),
+//! so the kernel's alignment rules give the answer they would give the
+//! caller's own call. A file opened for direct IO, or to sync each write
+//! (`O_DSYNC`, `O_SYNC`, `FILE_FLAG_WRITE_THROUGH`), has no write-behind
+//! either: each write at the cursor is one kernel write (direct: of exactly
+//! the caller's bytes, placed as the caller's), made once nothing is in
+//! flight, and Ready only once it landed, with its own result (see `landed`).
 //!
 //! `proofs/tla/lent/LentFile.tla` checks these rules.
 
@@ -60,6 +63,7 @@
 mod cached;
 mod copy;
 mod durable;
+mod landed;
 mod many;
 mod orphans;
 mod owned;
@@ -131,21 +135,23 @@ pub(crate) struct FileIo {
     generation: AtomicU64,
     /// Positional writes left by their tasks, for the state to take.
     orphans: Orphans,
-    /// The handle's record of a byte it accepted that may not be on the
-    /// device, which every sync answers.
+    /// The record of a byte the handle or its clones accepted that may not
+    /// be on the device, which every sync answers, and their sync calls.
     lost: Arc<Lost>,
     /// The file was opened to append.
     append: bool,
     /// The file was opened for direct IO.
     direct: bool,
+    /// Each cursor write lands before it answers (`landed`): the file was
+    /// opened for direct IO or to sync each write.
+    lands: bool,
     /// The calls go to the blocking pool even on a ring, for a test that
     /// holds the pool to keep a call in flight.
     #[cfg(test)]
     on_pool: AtomicBool,
-    /// How many of the next sync calls on the blocking pool fail without a
-    /// call, for a test of a write-back the device lost.
+    /// How many of the next kept writes on the pool fail without a call.
     #[cfg(test)]
-    fail_syncs: core::sync::atomic::AtomicU32,
+    fail_writes: core::sync::atomic::AtomicU32,
 }
 
 /// What the file state's holder does for the work others left it.
@@ -176,9 +182,14 @@ impl Hooks<FileState> for FileHooks<'_> {
     }
 
     fn releasing(&self, st: &mut FileState) {
-        // Release: read without the guard, on any thread.
+        // Release: read without the guard, on any thread. A write that failed
+        // and no call reported yet counts as bytes that never reached the
+        // file: the handle's drop then says the loss and counts it.
         self.io.unsent.store(
-            st.writing.is_some() || st.behind.is_some() || !st.orphans.is_empty(),
+            st.writing.is_some()
+                || st.behind.is_some()
+                || !st.orphans.is_empty()
+                || st.failed.is_some(),
             Ordering::Release,
         );
         self.io.cursor.store(st.cursor, Ordering::Release);
@@ -205,13 +216,14 @@ struct FileState {
     /// Bytes accepted after the write in flight, starting at `behind_at`.
     behind: Option<PoolBuf>,
     behind_at: u64,
+    /// The cursor write in flight on a file that lands its writes, and the
+    /// ends of those that landed (see `landed`).
+    landing: Option<landed::Landing>,
+    answers: landed::Answers,
     failed: Option<Failure>,
     sizing: Option<crate::rt::task::Task<io::Result<u64>>>,
     /// Positional writes left by their tasks, out until they land.
     orphans: Vec<Orphan>,
-    /// The handle's sync calls: one at a time, kept here rather than by
-    /// their tasks, with the first that failed.
-    syncs: durable::Syncs,
     /// Whether a lent read at the cursor tries the page cache first.
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     cache: cached::Cache,
@@ -239,11 +251,25 @@ impl FileIo {
             lost,
             append: mode.append,
             direct: mode.direct,
+            lands: mode.direct || mode.sync,
             #[cfg(test)]
             on_pool: AtomicBool::new(false),
             #[cfg(test)]
-            fail_syncs: core::sync::atomic::AtomicU32::new(0),
+            fail_writes: core::sync::atomic::AtomicU32::new(0),
         }))
+    }
+
+    /// Whether each cursor write of this file lands before it answers.
+    #[cfg(all(test, unix))]
+    pub(crate) fn lands_first(&self) -> bool {
+        self.lands
+    }
+
+    /// Fails the next `n` kept writes made on the blocking pool, as a device
+    /// that refused them would, without a call.
+    #[cfg(all(test, unix))]
+    pub(crate) fn fail_next_writes(&self, n: u32) {
+        self.fail_writes.store(n, Ordering::Relaxed);
     }
 
     /// Sends this file's calls to the blocking pool even on a ring.
@@ -281,19 +307,17 @@ impl FileIo {
         cached::has_call() && held.is_some_and(|cache| cache != cached::Cache::Never)
     }
 
-    /// Fails the next `n` sync calls made on the blocking pool, as a device
-    /// that lost a write-back would, without a call.
-    #[cfg(test)]
-    pub(crate) fn fail_next_syncs(&self, n: u32) {
-        self.fail_syncs.store(n, Ordering::Relaxed);
-    }
-
-    /// Whether the sync call made now is one [`fail_next_syncs`] fails.
-    #[cfg(test)]
-    fn sync_fails(&self) -> bool {
-        self.fail_syncs
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
+    /// Makes the state hold `err` as its failure, as a failed write nobody
+    /// has taken leaves it.
+    #[cfg(all(test, unix))]
+    pub(crate) fn fail_for_test(self: &Arc<Self>, err: io::Error) {
+        let mut after = After::default();
+        let hooks = FileHooks { io: self };
+        if let Some(mut held) = self.state.try_hold() {
+            held.get().fail(self, Failure::of(&err));
+            held.release(&mut after, &hooks);
+        }
+        after.run();
     }
 
     /// Sends this file's calls to the shard's ring again, where it runs one.
@@ -460,7 +484,12 @@ impl FileIo {
         self.with_state(cx, |st, io, waker, after| {
             match st.poll_writes(io, waker, after) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(()) => Poll::Ready(st.failed.take().map_or(Ok(()), |f| Err(f.error()))),
+                Poll::Ready(()) => {
+                    if io.lands {
+                        st.fail_answers(io, after);
+                    }
+                    Poll::Ready(st.failed.take().map_or(Ok(()), |f| Err(f.error())))
+                }
             }
         })
     }
@@ -581,6 +610,20 @@ impl FileState {
                         Poll::Ready((result, buf)) => {
                             tally_write(*bytes, result.is_ok());
                             (self.lent_back(result, buf), None)
+                        }
+                    },
+                    Writing::Kept(task, bytes) => match task.poll(waker) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready((result, buf)) => {
+                            tally_write(*bytes, result.is_ok());
+                            self.landed(io, result.map(|()| None), buf, after)
+                        }
+                    },
+                    Writing::AppendKept(task, bytes) => match task.poll(waker) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready((result, buf)) => {
+                            tally_write(*bytes, result.is_ok());
+                            self.landed(io, result.map(Some), buf, after)
                         }
                     },
                     Writing::AppendLent(task, bytes) => match task.poll(waker) {
@@ -814,11 +857,13 @@ impl FileState {
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
         let _ = self.poll_writes(io, waker, after);
+        // A file that lands each write answers a write from its own answer
+        // before it reports the state's failure.
+        if io.lands {
+            return self.write_landed(io, bufs, waker, after);
+        }
         if let Some(failure) = self.failed {
             return Poll::Ready(Err(failure.error()));
-        }
-        if io.direct {
-            return self.write_direct(io, bufs, waker, after);
         }
         let len: usize = bufs.iter().map(|b| b.len()).sum();
         if len == 0 {
@@ -854,34 +899,6 @@ impl FileState {
         // whether or not the task polls the file again, so a task that
         // parks holding the file is not kept by its own registration.
         let _ = self.poll_writes(io, waker, after);
-        Poll::Ready(Ok(n))
-    }
-
-    /// A write at the cursor of a file opened for direct IO: the bytes of
-    /// the first buffer that has any, as one call of exactly them, once the
-    /// write in flight landed. Accepted as it is submitted; its error, as
-    /// any write's, fails the next write or the flush.
-    fn write_direct(
-        &mut self,
-        io: &FileIo,
-        bufs: &[io::IoSlice<'_>],
-        waker: &Waker,
-        after: &mut After,
-    ) -> Poll<io::Result<usize>> {
-        let Some(bytes) = bufs.iter().find(|b| !b.is_empty()) else {
-            return Poll::Ready(Ok(0));
-        };
-        if self.writing.is_some() || !self.orphans.is_empty() {
-            return Poll::Pending;
-        }
-        let Some((mut buf, from, n)) = bounce(bytes.len(), bytes.as_ptr() as usize, true, waker)
-        else {
-            return Poll::Pending;
-        };
-        buf.fill_at(from, &bytes[..n]);
-        self.invalidate(after);
-        self.writing = Some(io.submit_write(buf, self.cursor, waker));
-        self.cursor += n as u64;
         Poll::Ready(Ok(n))
     }
 

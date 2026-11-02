@@ -13,10 +13,12 @@
 use core::future::poll_fn;
 use core::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(ring)]
 use super::Driver;
 use super::Shard;
+use super::backoff::Backoff;
 use crate::io::Source;
 
 impl Shard {
@@ -148,6 +150,9 @@ async fn drain(source: Arc<Source>) {
     .await;
 }
 
+/// How long a stopping shard waits for the holders of its sources' sides to let go: far past the
+/// driver call after which a holder that lets go has done it.
+const EVICTION_WAIT: Duration = Duration::from_secs(1);
 /// Waits until no source of `gone` is registered under its token with the
 /// shard at `home`, nor has an attach to it still asked (a holder performs
 /// it as it lets go, and posts here what it leaves: a ring's install of the
@@ -158,7 +163,19 @@ async fn drain(source: Arc<Source>) {
 /// of the same number: that registration is not waited for, or this shard
 /// would wait for as long as it lasts, with the eviction's cancel of the
 /// source's operations still in its mailbox.
+///
+/// The wait is bounded by [`EVICTION_WAIT`], from the first look that has to
+/// wait. Past it the shard stops waiting for every source left, says so and
+/// counts it: the registration of such a source ends when the holder that
+/// did not let go does (`Pending.tla`, `AGiveUp`, `WaitEnds`).
 fn wait_for_evictions(gone: &[(u64, Arc<Source>)], home: usize) {
+    wait_for_evictions_within(gone, home, EVICTION_WAIT);
+}
+
+/// [`wait_for_evictions`] with its bound given.
+fn wait_for_evictions_within(gone: &[(u64, Arc<Source>)], home: usize, within: Duration) {
+    // Made at the first look that has to wait: a path that finds nothing to wait for reads no clock.
+    let mut waited: Option<(Instant, Backoff)> = None;
     for (token, source) in gone {
         loop {
             let asked = source.attach_asked_of(home);
@@ -169,7 +186,17 @@ fn wait_for_evictions(gone: &[(u64, Arc<Source>)], home: usize) {
             if asked {
                 crate::io::source::ATTACH_WAITS.fetch_add(1, Ordering::SeqCst);
             }
-            std::thread::yield_now();
+            let (deadline, backoff) =
+                waited.get_or_insert_with(|| (Instant::now() + within, Backoff::new()));
+            if !backoff.yielding() && Instant::now() >= *deadline {
+                crate::rt::counters::eviction_given_up();
+                log::warn!(
+                    "a worker stopped before another thread let go of one of its sockets or files; its registration ends when that thread does"
+                );
+                return;
+            } else {
+                backoff.pause();
+            }
         }
     }
 }
@@ -230,6 +257,58 @@ mod tests {
         });
         drop(handle);
     }
+
+    /// A shard that goes stops waiting for a holder that does not let go,
+    /// past the bound, and counts it (proofs/tla/going/Pending.tla,
+    /// `AGiveUp`).
+    #[test]
+    fn a_shard_that_goes_gives_up_waiting_for_a_holder_that_does_not_let_go() {
+        let (mine, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let handle = crate::io::Handle::new(mine).unwrap();
+        let src = Arc::clone(handle.source());
+        crate::block_on(async {
+            let mut buf = [0u8; 1];
+            {
+                let mut read = Box::pin(handle.recv(&mut buf));
+                let polled = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+                assert!(polled.is_pending());
+            }
+            let (home, token) = src.registration();
+            assert_ne!(home, 0, "the receive did not register the source");
+            // Nobody evicts the source: the wait ends at its bound, on a thread with a shard of
+            // its own to count on.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let waiter = {
+                let src = Arc::clone(&src);
+                std::thread::spawn(move || {
+                    crate::block_on(async move {
+                        let given_up = || {
+                            crate::rt::context::current(|s| {
+                                s.expect("a block_on runs a shard")
+                                    .shared
+                                    .stats()
+                                    .errors
+                                    .evictions_given_up
+                            })
+                        };
+                        let before = given_up();
+                        super::wait_for_evictions_within(
+                            &[(token, src)],
+                            home,
+                            Duration::from_millis(50),
+                        );
+                        let _ = done_tx.send((before, given_up()));
+                    });
+                })
+            };
+            let (before, after) = done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the wait did not end at its bound");
+            waiter.join().unwrap();
+            assert_eq!(after, before + 1, "the give-up was not counted");
+        });
+        drop(handle);
+    }
 }
 
 impl Drop for Shard {
@@ -244,6 +323,8 @@ impl Drop for Shard {
 impl Shard {
     /// [`Drop`]'s work: the shard goes for good.
     fn go(&mut self) {
+        #[cfg(ring)]
+        let started = std::time::Instant::now();
         self.shared.counters.went();
         // Every task still queued here is dropped on this thread, the one its
         // future may be dropped on.
@@ -271,7 +352,8 @@ impl Shard {
                 ring.cancel_all();
             } else {
                 ring.settle(|| self.apply_io_ops());
-                self.pool.unreserve(ring.shut_down());
+                self.pool
+                    .unreserve(ring.shut_down_from(started, || self.apply_io_ops()));
             }
         }
         // The port's operations to a keeper, unless one has them already.
@@ -309,10 +391,36 @@ impl Shard {
                 drop(runnable);
                 quiet = false;
             }
+            // SAFETY: this thread is the shard's last holder, the owner of its list, and of its
+            // home's when the shard is a thread's own.
+            quiet &= unsafe { self.shared.tasks.cancel_all() } == 0;
+            if let Some(home) = self.home.get() {
+                // SAFETY: as above.
+                quiet &= unsafe { home.cancel_listed() } == 0;
+            }
             if quiet {
                 break;
             }
         }
+        // Bound tasks of this thread whose wake is still on its way are waited for, to a bound.
+        if let Some(home) = self.home.get()
+            // SAFETY: this thread is the home's.
+            && !unsafe { home.is_idle() }
+        {
+            // SAFETY: as above.
+            unsafe {
+                home.cancel_all(
+                    Some(self),
+                    Instant::now() + crate::rt::workers::TEARDOWN_WAIT,
+                );
+            }
+        }
+        // Every task is off the list before the inbox's role goes: `release_inbox` lets a pusher
+        // drain and drop on its own thread, and the runnables still on their way then find their
+        // tasks on no list. One still in the inbox is dropped by the drain `release_inbox` does,
+        // on this thread, its task already off the list.
+        // SAFETY: as above.
+        unsafe { self.shared.tasks.forget_all() };
         // The inbox's taker's role goes, looking at the inbox once more: a
         // pusher that saw the flag while the role was held left its
         // runnable to this drain.

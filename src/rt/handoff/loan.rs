@@ -109,7 +109,7 @@ pub(crate) fn borrow(shard: &Shard) -> Option<Arc<Loan>> {
     // The runtime's own task: not one of its user's, with no hooks. A stopped worker stays up
     // for it, as for this thread (`Shared::detached_began`).
     let (runnable, task) =
-        crate::rt::task::spawn(lend, Sched::uncounted(Arc::clone(&shard.shared)));
+        crate::rt::task::spawn(lend, Sched::<false>::uncounted(Arc::clone(&shard.shared)));
     task.detach();
     shard.shared.push_remote(runnable);
     let lent = crate::sync::internal::block_on(poll_fn(|cx| {

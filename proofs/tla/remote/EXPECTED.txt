@@ -10,3 +10,6 @@ MRF_no_bound                   MC_RemoteFree        violated:BoundedList
 WRF_closed                     MC_RemoteFree        violated:NoRefusedClosed
 WRF_full                       MC_RemoteFree        violated:NoRefusedFull
 WRF_reclaimed                  MC_RemoteFree        violated:NoReclaimed
+RF_late                        MC_RemoteFree        pass
+RF_live_late                   MC_RemoteFree        pass
+WRF_late_refused               MC_RemoteFree        violated:NoLateRefused

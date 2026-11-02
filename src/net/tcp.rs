@@ -306,11 +306,10 @@ impl Handle<TcpStream> {
 
     /// Sets `SO_LINGER` to zero: the close drops unsent data and resets the connection.
     ///
-    /// A handle dropped while its kernel holds bytes the peer has not acknowledged, or with bytes
-    /// still written behind (delivered first), waits until the peer acknowledged them, within the
-    /// runtime's `write_behind_linger`, and only then resets, so the reset never overtakes data
-    /// still on its way. A peer that stopped reading holds the reset back until that time runs
-    /// out. Not on Windows, which has no count of those bytes: there it closes at once.
+    /// A handle dropped with bytes still written behind writes them first (within the runtime's
+    /// `write_behind_linger`), then resets at once, its kernel dropping what it has not sent, as a
+    /// zero linger asks. On macOS, to a loopback peer, the reset first waits at most 10 ms for the
+    /// peer to acknowledge what is on its way, since that loopback can let a reset overtake data.
     pub fn set_zero_linger(&self) -> io::Result<()> {
         self.set_linger(Some(Duration::ZERO))
     }

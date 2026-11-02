@@ -42,7 +42,9 @@
 (* delivery (its dequeue, the source's count and the flag's look as one   *)
 (* step, as one thread makes them), the hand-off, the take-back's two     *)
 (* compare-exchanges, the keeper's start, loop and end, and every access  *)
-(* of the registration's wait. What is abstract: one source, one shard,    *)
+(* of the registration's wait; the registration holds both of the        *)
+(* source's sides, so no read of the task's starts while it runs. What is *)
+(* abstract: one source, one shard,                                        *)
 (* one keeper, and the other port the task registers with.                 *)
 (***************************************************************************)
 EXTENDS Integers, TLC
@@ -85,6 +87,9 @@ define
     Kept == Out > 0 \/ (pending /\ Mutation # "keeper_leaves")
     \* The reads the task makes.
     Reads == IF Duplex THEN 2 ELSE 1
+    \* The task's registration holds both of the source's sides (`attach_port` runs with both held): no read of
+    \* its starts meanwhile, so the count it looks at and its last bind see the same operations out.
+    Registering == pc["task"] \in {"T_here", "T_pend", "T_idle", "T_flag", "T_recheck", "T_take", "T_retry"}
 end define;
 
 \* One packet of an operation is dequeued and delivered: the source's count
@@ -314,7 +319,7 @@ variables n = 0;                                                             \* 
 begin
 R_read:
     while n < Reads do
-        await registered \/ pending;                                         \* the source is reachable
+        await (registered \/ pending) /\ ~Registering;                       \* the source is reachable, its sides free
         n := n + 1;
         if registered then
             readsDone := readsDone + 1;                                      \* the new port serves it

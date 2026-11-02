@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::{next, read_exact, read_some, runtime, within};
 use crate::io::Handle;
+use crate::runtime::spawn;
 
 /// The bytes a kept peer sends, more than one read takes.
 const SENT: usize = 256 * 1024;
@@ -82,10 +83,23 @@ async fn check_kept(mut conn: Handle<TcpStream>, seed: u8, sender: JoinHandle<()
     sender.join().unwrap();
 }
 
+/// The connections the listeners of `rt`'s workers skipped.
+#[cfg(target_os = "linux")]
+fn skipped_by(rt: &crate::runtime::Runtime) -> u64 {
+    crate::stats()
+        .shards
+        .iter()
+        .filter(|shard| shard.runtime == Some(rt.id()))
+        .map(|shard| shard.errors.accepts_skipped)
+        .sum()
+}
+
 #[test]
 fn accept_skips_a_connection_reset_in_the_backlog() {
     let rt = runtime();
-    rt.block_on(async {
+    // On a worker of this runtime alone, so the skips counted are its own.
+    let handed_over = rt.block_on(spawn(async {
+        let mut handed_over = 0;
         let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let at = listener.local_addr().unwrap();
         for seed in 0..3 {
@@ -110,9 +124,18 @@ fn accept_skips_a_connection_reset_in_the_backlog() {
                 }
                 let_by(Some(peer), reset, &mut handed);
             };
+            handed_over += handed;
             check_kept(conn, seed, sender).await;
         }
-    });
+        handed_over
+    }));
+    // Linux names no peer for a connection reset before it was taken and answers `ECONNABORTED`
+    // (the listener skips it), unless it hands the connection over as it is: each reset
+    // connection is one or the other. Elsewhere the system may drop it from the backlog unseen.
+    #[cfg(target_os = "linux")]
+    assert_eq!(skipped_by(&rt), 3 - handed_over as u64, "skips counted");
+    #[cfg(not(target_os = "linux"))]
+    let _ = handed_over;
 }
 
 #[test]

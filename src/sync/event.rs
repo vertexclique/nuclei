@@ -162,7 +162,7 @@ impl Future for EventWait<'_> {
 
 impl Drop for EventWait<'_> {
     fn drop(&mut self) {
-        if let Cancel::Withdrawn(_) = self.wait.cancel(&self.event.queue) {
+        if let Cancel::Withdrawn(_, _shelved) = self.wait.cancel(&self.event.queue) {
             self.event.withdrawn(false);
         }
     }

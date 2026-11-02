@@ -24,4 +24,5 @@ TwoOnes == <<"one", "one">>
 OneOne == <<"one">>
 LastThenOne == <<"last", "one">>
 BroadcastThenOne == <<"waiters", "one">>
+TwoBroadcastsThenOne == <<"waiters", "waiters", "one">>
 =============================================================================

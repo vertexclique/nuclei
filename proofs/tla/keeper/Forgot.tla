@@ -31,15 +31,28 @@
 (* it was freed (NoScribble), and the operation ending twice (EndsOnce);   *)
 (* and everything must end (Ends): the task's wait and the retire.         *)
 (*                                                                          *)
-(* What is abstract: the length of the bounded wait (its end is a step     *)
-(* that may come at any moment while the operation is out), and what the  *)
-(* operation is: a receive, a send, a file's call.                         *)
+(* A file's call (with `File`: a write, a sync, a read of a file) cannot   *)
+(* be held up by a peer: it ignores the cancel but ends in its own time,   *)
+(* which a slow device may stretch past the short wait. So the shard waits *)
+(* for the files' calls until they all ended, bounded by the runtime's     *)
+(* linger time (`Builder::write_behind_linger`), not by the short wait     *)
+(* that bounds a source's (`settle_files` beside `settle`). A file's call  *)
+(* the kernel ends within the linger time (`Within`) is never given up;   *)
+(* one a device holds past it is. Whatever is given up is said at warn and *)
+(* counted (`Stats::operations_given_up`): never silently (`GivenUpSaid`). *)
+(*                                                                          *)
+(* What is abstract: the length of the bounded waits (the shard's clock    *)
+(* moves from the short wait to the linger time and past it at any moment, *)
+(* and past the linger time only once a file's call that ends within it    *)
+(* ended), and what the operation is beyond a file's call or a source's.   *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 
 CONSTANTS
     Stuck,     \* the operation ignores the cancel: the kernel ends it only after the shard gave up, if ever
     Held,      \* the operation ended for its side already, and only holds its memory (a zero-copy send)
+    File,      \* the operation is a file's call: it ignores the cancel but ends in its own time
+    Within,    \* a file's call ends within the linger time
     Mutation   \* "none", or the name of the one rule this run takes away
 
 VARIABLES
@@ -50,9 +63,12 @@ VARIABLES
     freed,     \* the operation's memory was freed
     scribbled, \* (record) the kernel wrote that memory after it was freed
     rpc,       \* the retire on another thread: "ask" "wait" "done"
-    tpc        \* the task waiting for the operation's end: "wait" "done"
+    tpc,       \* the task waiting for the operation's end: "wait" "done"
+    clock,     \* the going shard's wait: "short" (the short wait), "linger" (past it), "past" (past the linger time)
+    given,     \* the operation was given up on
+    said       \* the give-up was said at warn and counted
 
-vars == <<op, spc, out, ends, freed, scribbled, rpc, tpc>>   \* every variable
+vars == <<op, spc, out, ends, freed, scribbled, rpc, tpc, clock, given, said>>   \* every variable
 
 Init ==
     /\ op = "kernel"           \* the operation is in the kernel
@@ -63,6 +79,9 @@ Init ==
     /\ scribbled = FALSE       \* nothing wrote freed memory
     /\ rpc = "ask"             \* the retire is about to be asked
     /\ tpc = "wait"            \* the task waits
+    /\ clock = "short"         \* the short wait has begun
+    /\ given = FALSE           \* nothing given up
+    /\ said = FALSE            \* nothing said
 
 (***************************************************************************)
 (* The going shard.                                                        *)
@@ -72,7 +91,7 @@ Init ==
 SCancel ==
     /\ spc = "cancel"                                       \* the shard is going
     /\ spc' = "settle"                                      \* it waits next
-    /\ UNCHANGED <<op, out, ends, freed, scribbled, rpc, tpc>>
+    /\ UNCHANGED <<op, out, ends, freed, scribbled, rpc, tpc, clock, given, said>>
 
 \* The wait applies the operation's completion: its side gets the end, the count falls, and its
 \* memory goes back (a held send's notification only lets go of its memory). Nothing is out
@@ -85,7 +104,7 @@ SApply ==
     /\ ends' = IF Held THEN ends ELSE ends + 1              \* the end reaches its side
     /\ freed' = TRUE                                        \* the memory goes back
     /\ spc' = "gone"                                        \* the ring goes
-    /\ UNCHANGED <<scribbled, rpc, tpc>>
+    /\ UNCHANGED <<scribbled, rpc, tpc, clock, given, said>>
 
 \* The bounded wait ends with the operation still in the kernel (`forget_stuck`): its memory is
 \* kept for good, and its end is an error, which counts it out.
@@ -93,17 +112,36 @@ SApply ==
 \* before): its task and the retire wait for good.
 \* MUTATION forget_frees: its end lets go of its memory too, which the kernel may still write.
 \* MUTATION end_twice: a held send given up on ends for its side again (and counts out again).
+\* A source's operation is given up on once the short wait ran out; a file's call only once the
+\* linger time ran out. The give-up is said at warn and counted.
+\* MUTATION file_short_wait: a file's call is given up on once the short wait ran out (the code before).
+\* MUTATION forget_unsaid: the give-up is neither said nor counted where anyone sees (the code before).
 SGiveUp ==
     /\ spc = "settle"                                       \* the shard waits
     /\ op = "kernel"                                        \* and the operation is still out
+    /\ IF File /\ Mutation # "file_short_wait"              \* a file's call
+       THEN clock = "past"                                  \* waits out the linger time
+       ELSE clock # "short"                                 \* a source's the short wait
     /\ spc' = "gone"                                        \* the wait ran out: the ring goes
+    /\ given' = TRUE                                        \* the operation is given up on
+    /\ said' = (Mutation # "forget_unsaid")                 \* said and counted
     /\ LET again == ~Held \/ Mutation = "end_twice"         \* its end is still to come (or the bug)
        IN IF Mutation = "forget_silent"                     \* the planted bug
           THEN UNCHANGED <<out, ends, freed>>               \* nothing ends, nothing counts it out
           ELSE /\ out' = IF again THEN out - 1 ELSE out     \* not counted out any more
                /\ ends' = IF again THEN ends + 1 ELSE ends  \* the error reaches its side or slot
                /\ freed' = (Mutation = "forget_frees")      \* the memory stays, but in the bug
-    /\ UNCHANGED <<op, scribbled, rpc, tpc>>
+    /\ UNCHANGED <<op, scribbled, rpc, tpc, clock>>
+
+\* The shard's clock: the short wait runs out at some moment, and later the linger time; a file's
+\* call that ends within the linger time ends before it runs out.
+Tick ==
+    /\ spc = "settle"                                       \* while the shard waits
+    /\ \/ clock = "short" /\ clock' = "linger"              \* the short wait runs out
+       \/ /\ clock = "linger"                               \* the linger time runs out,
+          /\ ~(File /\ Within /\ op = "kernel")             \* never before a file's call ends within it
+          /\ clock' = "past"
+    /\ UNCHANGED <<op, spc, out, ends, freed, scribbled, rpc, tpc, given, said>>
 
 (***************************************************************************)
 (* The kernel.                                                             *)
@@ -117,7 +155,7 @@ KernelEnd ==
     /\ ~Stuck \/ spc = "gone"                               \* not held back by the shard
     /\ op' = IF spc = "gone" THEN "late" ELSE "posted"      \* completed: for nobody, or for the wait
     /\ scribbled' = (scribbled \/ freed)                    \* (record) its memory had been freed
-    /\ UNCHANGED <<spc, out, ends, freed, rpc, tpc>>
+    /\ UNCHANGED <<spc, out, ends, freed, rpc, tpc, clock, given, said>>
 
 (***************************************************************************)
 (* The retire and the task.                                                *)
@@ -127,35 +165,35 @@ KernelEnd ==
 RAsk ==
     /\ rpc = "ask"                                          \* about to retire
     /\ rpc' = "wait"                                        \* it waits for the operations
-    /\ UNCHANGED <<op, spc, out, ends, freed, scribbled, tpc>>
+    /\ UNCHANGED <<op, spc, out, ends, freed, scribbled, tpc, clock, given, said>>
 
 \* The retire returns once none of the source's operations is counted out.
 RWait ==
     /\ rpc = "wait"                                         \* the retire waits
     /\ out = 0                                              \* until nothing is out
     /\ rpc' = "done"                                        \* and returns
-    /\ UNCHANGED <<op, spc, out, ends, freed, scribbled, tpc>>
+    /\ UNCHANGED <<op, spc, out, ends, freed, scribbled, tpc, clock, given, said>>
 
 \* The task waiting for the operation's end gets it.
 TWait ==
     /\ tpc = "wait"                                         \* the task waits
     /\ ends > 0                                             \* until the end came
     /\ tpc' = "done"                                        \* and goes on
-    /\ UNCHANGED <<op, spc, out, ends, freed, scribbled, rpc>>
+    /\ UNCHANGED <<op, spc, out, ends, freed, scribbled, rpc, clock, given, said>>
 
 (***************************************************************************)
 (* The whole system.                                                       *)
 (***************************************************************************)
 
 Next ==
-    \/ SCancel \/ SApply \/ SGiveUp                          \* the going shard
+    \/ SCancel \/ SApply \/ SGiveUp \/ Tick                  \* the going shard and its clock
     \/ KernelEnd                                             \* the kernel
     \/ RAsk \/ RWait \/ TWait                                \* the retire and the task
 
 \* Every step that must happen does, if it stays possible. A kernel that ignores the cancel may
 \* never end the operation.
 Fairness ==
-    /\ WF_vars(SCancel) /\ WF_vars(SApply) /\ WF_vars(SGiveUp)
+    /\ WF_vars(SCancel) /\ WF_vars(SApply) /\ WF_vars(SGiveUp) /\ WF_vars(Tick)
     /\ WF_vars(RAsk) /\ WF_vars(RWait) /\ WF_vars(TWait)
     /\ (~Stuck => WF_vars(KernelEnd))
 
@@ -173,6 +211,12 @@ EndsOnce == ends <= 1 /\ out >= 0
 
 \* The task gets the operation's end, and the retire returns.
 Ends == <>(tpc = "done" /\ rpc = "done")
+
+\* A file's call the kernel ends within the linger time is never given up on.
+FileNotGivenUp == (File /\ Within) => ~given
+
+\* Whatever is given up on is said at warn and counted.
+GivenUpSaid == given => said
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)

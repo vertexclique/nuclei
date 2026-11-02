@@ -5,3 +5,6 @@ A_two_wakers_displacing        MC_AtomicWaker       pass
 M_no_self_wake                 MC_AtomicWaker       violated:SelfWoken
 M_no_wake_taken                MC_AtomicWaker       violated:SelfWoken
 M_failure_path_drops_displaced MC_AtomicWaker       violated:AllEnd
+A_clone_panics                 MC_AtomicWaker       pass
+A_clone_panics_displacing      MC_AtomicWaker       pass
+M_clone_unguarded              MC_AtomicWaker       violated:Recovers

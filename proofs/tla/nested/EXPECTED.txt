@@ -1,0 +1,13 @@
+# configuration          spec     expected
+N_safe                   Nested   pass
+M_no_switch              Nested   violated:LoopSeesOwn
+M_previous_decides       Nested   violated:LoopSeesOwn
+M_no_restore             Nested   violated:LoopSeesOwn
+M_future_under_loop      Nested   violated:FutureSeesOwn
+M_no_aside               Nested   violated:LoopWheelsOwn
+M_no_reuse               Nested   violated:NoTimerLost
+M_visitor_unwrapped      Nested   violated:TaskSeesOwn
+W_foreign_in_foreign     Nested   violated:NoForeignInForeign
+W_unwound_foreign        Nested   violated:NoUnwoundForeign
+W_reuse                  Nested   violated:NoReuse
+W_visitor_wheels         Nested   violated:VisitorWheelsOwn

@@ -64,7 +64,7 @@ where
         Some(shard) => Ok(spawn_on(inner, shard, future)),
         None => {
             ensure_shard()?;
-            Ok(spawn_here(future, false))
+            Ok(spawn_here::<_, false>(future))
         }
     }
 }
@@ -89,7 +89,7 @@ where
         ));
     }
     ensure_shard()?;
-    Ok(spawn_here(future, true))
+    Ok(spawn_here::<_, true>(future))
 }
 
 /// [`spawn_blocking`](super::spawn_blocking); a worker named for it is

@@ -30,7 +30,7 @@ use core::cell::Cell;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{JoinHandle, ThreadId};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::context;
 use super::handoff::home::Home;
@@ -54,6 +54,10 @@ thread_local! {
     pub(crate) static THREAD_FAILS: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { core::cell::RefCell::new(None) };
 }
+
+/// The bound a shutdown with no timeout gives: the wait for a thread still in a task's poll its
+/// shard was taken in, and for the wakes of tasks bound to an exiting thread that are on their way.
+pub(crate) const TEARDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// How a worker is started.
 pub(crate) struct Start {
@@ -90,6 +94,8 @@ pub(crate) struct Workers {
     /// The watch over the workers, with the handoff on.
     monitor: Option<Arc<Monitor>>,
     monitor_started: OnceLock<()>,
+    /// When the shutdown that began gives up waiting; unset until one begins.
+    teardown_by: OnceLock<Instant>,
 }
 
 /// The threads a shutdown joins.
@@ -152,7 +158,21 @@ impl Workers {
             exits,
             monitor,
             monitor_started: OnceLock::new(),
+            teardown_by: OnceLock::new(),
         }
+    }
+
+    /// A shutdown began: it gives up waiting at `at`. The first call wins.
+    pub(crate) fn set_teardown_by(&self, at: Instant) {
+        let _ = self.teardown_by.set(at);
+    }
+
+    /// When the shutdown gives up waiting: the one set, else [`TEARDOWN_WAIT`] from now.
+    pub(crate) fn teardown_by(&self) -> Instant {
+        self.teardown_by
+            .get()
+            .copied()
+            .unwrap_or_else(|| Instant::now() + TEARDOWN_WAIT)
     }
 
     /// Polls the handoff took from their thread that run there still, on no
@@ -530,24 +550,38 @@ impl Workers {
 
     /// The runtime's threads started so far, taken for joining once
     /// [`stop_all`](Self::stop_all) ran: every one but a thread still blocked
-    /// in the poll its shard was taken in, which is left to exit on its own,
-    /// and a monitor started since [`take_monitor`](Self::take_monitor),
-    /// which ends at its first look at the close. No thread starts from then
-    /// on, and a worker started since the stop is stopped here: its shard was
-    /// in its slot before the take (proofs/tla/teardown/Grow.tla).
-    pub(crate) fn take_threads(&self) -> Vec<JoinHandle<()>> {
+    /// in the poll its shard was taken in, which is returned apart, with its
+    /// life, for a wait that ends at the shutdown deadline
+    /// ([`TEARDOWN_WAIT`] without a timeout), and a monitor started since
+    /// [`take_monitor`](Self::take_monitor), which ends at its first look at
+    /// the close. No thread starts from then on, and a worker started since
+    /// the stop is stopped here: its shard was in its slot before the take
+    /// (proofs/tla/teardown/Grow.tla).
+    pub(crate) fn take_threads(&self) -> Taken {
         let (list, monitor) = {
             let mut threads = lock(&self.threads);
             threads.closed = true;
             (core::mem::take(&mut threads.list), threads.monitor.take())
         };
         self.stop_all();
-        list.into_iter()
-            .filter(|(_, life)| !life.is_detached())
-            .map(|(thread, _)| thread)
-            .chain(monitor)
-            .collect()
+        let (detached, joined): (Vec<_>, Vec<_>) =
+            list.into_iter().partition(|(_, life)| life.is_detached());
+        Taken {
+            joined: joined
+                .into_iter()
+                .map(|(thread, _)| thread)
+                .chain(monitor)
+                .collect(),
+            detached,
+        }
     }
+}
+
+/// The threads a shutdown took: the ones it joins, and the ones still in the poll their shard was
+/// taken in.
+pub(crate) struct Taken {
+    pub(crate) joined: Vec<JoinHandle<()>>,
+    pub(crate) detached: Vec<(JoinHandle<()>, Arc<Life>)>,
 }
 
 /// Reports a runtime thread's exit, naming it, once what it held is dropped,
@@ -636,6 +670,12 @@ fn run_shard(inner: &Arc<Inner>, run: Run, life: &Life) {
         }
         shard.run_worker()
     };
+    if worked == Worked::Stopped {
+        // The queued runnables and listed tasks end on this thread, never on the shard's last
+        // holder (proofs/tla/teardown/Teardown.tla, `EndShard`).
+        let _current = context::enter(&shard);
+        shard.end_tasks();
+    }
     if worked == Worked::Detached {
         life.back();
         if let Some(monitor) = &workers.monitor {
@@ -648,6 +688,11 @@ fn run_shard(inner: &Arc<Inner>, run: Run, life: &Life) {
     // holder lets go.
     drop(lost);
     drop(shard);
+    // SAFETY: this thread is the home's.
+    if unsafe { !home.is_idle() } {
+        // SAFETY: as above.
+        unsafe { home.cancel_all(None, workers.teardown_by()) };
+    }
 }
 
 /// The end of a thread whose shard was taken, out of the worker's loop: its
@@ -664,7 +709,7 @@ fn finish_taken(
     lost: context::ForgetLost,
     shard: Arc<Shard>,
 ) {
-    finish_home(monitor, home);
+    finish_home(inner, monitor, home);
     drop(lost);
     drop(shard);
     monitor.count_out();
@@ -679,10 +724,11 @@ fn finish_taken(
     clippy::panic,
     reason = "a thread whose shard cannot start cannot run its bound tasks, which would wait forever"
 )]
-fn finish_home(monitor: &Monitor, home: &Home) {
+fn finish_home(runtime: &Arc<Inner>, monitor: &Monitor, home: &Home) {
     // No bound task, nothing to finish: no own shard is made for it. None
     // can begin meanwhile: only this thread spawns onto its home.
-    if home.is_idle() {
+    // SAFETY: this thread is the home's.
+    if unsafe { home.is_idle() } {
         return;
     }
     let own = match context::own_shard() {
@@ -700,6 +746,12 @@ fn finish_home(monitor: &Monitor, home: &Home) {
     #[cfg(port)]
     own.take_port_back();
     own.block_on_then_leave(monitor.home_done(home));
+    // The close came first: the bound tasks left end here, on this thread.
+    // SAFETY: this thread is the home's.
+    if unsafe { !home.is_idle() } {
+        // SAFETY: as above.
+        unsafe { home.cancel_all(Some(&own), runtime.workers.teardown_by()) };
+    }
 }
 
 /// The list of threads; a panic while it was held (pushing a handle) left

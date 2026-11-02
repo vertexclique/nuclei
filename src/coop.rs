@@ -2,7 +2,9 @@
 //! future) gets a budget of [`BUDGET`] operations. IO that completes spends
 //! one, and so does a receive, acquire or lock of `nuclei::sync` that
 //! completes in the poll that began it (a wait granted in a later poll, after
-//! it queued, spends nothing); a task whose budget is spent is answered
+//! it queued, spends nothing), and so does a sleep that completes (a timer's
+//! `Ready` is charged in the poll that answers it, however long it waited);
+//! a task whose budget is spent is answered
 //! `Pending` and woken at
 //! once, so it goes behind the other tasks of its shard instead of starving
 //! them on IO or a channel that is always ready. An IO operation that does
@@ -98,7 +100,13 @@ pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
 /// spent, and the operation completes nothing and yields.
 #[inline(always)]
 pub(crate) fn try_spend() -> bool {
-    let left = left();
+    try_spend_in(left())
+}
+
+/// [`try_spend`] on the budget `left`, for a caller that holds the thread's
+/// context already.
+#[inline(always)]
+pub(crate) fn try_spend_in(left: &Cell<u64>) -> bool {
     // Stored before the branch, so the step is one decrement of the counter
     // in memory; a spent budget has its zero put back.
     let (rest, spent) = left.get().overflowing_sub(1);
@@ -123,9 +131,18 @@ pub(crate) fn spend(waker: &Waker) -> bool {
     try_spend() || refused(waker)
 }
 
+/// [`spend`] on the budget `left`; see [`try_spend_in`].
+#[inline(always)]
+pub(crate) fn spend_in(left: &Cell<u64>, waker: &Waker) -> bool {
+    try_spend_in(left) || refused(waker)
+}
+
+/// The refusal of a spent budget: counts the yield and wakes the task, and
+/// answers `false` for the caller to pass on. For a caller that took
+/// something, to run after it gave that back, as the wake is user code.
 #[cold]
 #[inline(never)]
-fn refused(waker: &Waker) -> bool {
+pub(crate) fn refused(waker: &Waker) -> bool {
     crate::rt::counters::budget_yield();
     waker.wake_by_ref();
     false

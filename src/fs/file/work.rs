@@ -16,7 +16,7 @@ use std::io;
 use super::FileIo;
 use crate::buf::owned::OwnedBuf;
 use crate::buf::{LARGEST, PoolBuf, with_pool};
-use crate::fs::call::{self, FileOutcome, SlotJob};
+use crate::fs::call::{self, FileOutcome, KeptAppendEnd, KeptWriteEnd, SlotJob};
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::sys;
@@ -138,6 +138,12 @@ impl<T> Ended for (io::Result<T>, OwnedBuf) {
     }
 }
 
+impl<T> Ended for (io::Result<T>, Option<PoolBuf>) {
+    fn error(&self) -> Option<&io::Error> {
+        self.0.as_ref().err()
+    }
+}
+
 /// A read job at the cursor, into a buffer of the pool.
 pub(super) struct Job<T> {
     pub(super) task: Work<io::Result<T>>,
@@ -172,6 +178,11 @@ pub(super) enum Writing {
     Append(Work<io::Result<u64>>, Counted),
     /// As `Append`, from a task's own buffer.
     AppendLent(Work<(io::Result<u64>, OwnedBuf)>, Counted),
+    /// From a buffer of the pool, which comes back with the result (see
+    /// `landed`).
+    Kept(Work<KeptWriteEnd>, Counted),
+    /// As `Append`, from a buffer of the pool that comes back.
+    AppendKept(Work<KeptAppendEnd>, Counted),
 }
 
 /// A write from a task's own buffer, from its submission until its task
@@ -421,6 +432,54 @@ impl FileIo {
         }
         let (work, bytes) = self.submit_pwrite(buf, at, waker);
         Writing::Pool(work, bytes)
+    }
+
+    /// As [`submit_write`](Self::submit_write), the buffer coming back with
+    /// the write's end.
+    pub(super) fn submit_write_kept(&self, buf: PoolBuf, at: u64, waker: &Waker) -> Writing {
+        if self.append {
+            let fd = self.fd.clone();
+            let bytes = counted(buf.filled().len());
+            let work = Work::Slot(call::write_on_pool(
+                move || {
+                    let result = sys::append_all(fd.raw(), buf.filled());
+                    FileOutcome::AppendKept(result, buf)
+                },
+                waker,
+            ));
+            return Writing::AppendKept(work, bytes);
+        }
+        #[cfg(ring)]
+        let buf = match self.on_ring() {
+            true => match crate::fs::ring::write_kept(&self.fd, at, buf) {
+                Ok(job) => return Writing::Kept(Work::Slot(job), counted(0)),
+                Err(buf) => buf,
+            },
+            false => buf,
+        };
+        let fd = self.fd.clone();
+        let bytes = counted(buf.filled().len());
+        #[cfg(test)]
+        let fails = self
+            .fail_writes
+            .try_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok();
+        let work = Work::Slot(call::write_on_pool(
+            move || {
+                #[cfg(test)]
+                if fails {
+                    return FileOutcome::WriteKept(Err(io::Error::other("write refused")), buf);
+                }
+                let result = sys::pwrite_all(fd.raw(), buf.filled(), at);
+                FileOutcome::WriteKept(result, buf)
+            },
+            waker,
+        ));
+        Writing::Kept(work, bytes)
     }
 
     /// A read at `at` into the spare capacity of the task's buffer in `held`,

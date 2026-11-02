@@ -1,19 +1,41 @@
-TLC run of every configuration in proofs/tla/clock, 2026-10-30 19:43 UTC.
+TLC run of every configuration in proofs/tla/clock, 2026-11-02 23:44 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-C_safe                         9286866    3049926    123  pass                                  pass                                  yes
-C_safe_live                     206628      71338     27  pass                                  pass                                  yes
-C_three                        1650509     434056     30  pass                                  pass                                  yes
-C_pair                         4602673    1547948     69  pass                                  pass                                  yes
-M_publish_late                  488019     165251     37  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
-M_busy_no_wait                  750330     253678     39  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
-M_no_recheck                     69150      24356      7  violated:NoBadJump                    violated:NoBadJump                    yes
-M_no_wait_advance               755981     254051     31  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
-M_no_job_check                  138352      46384     12  violated:NoBadJump                    violated:NoBadJump                    yes
-M_no_attempt                      7207       3192      8  violated:TimersFire                   violated:TimersFire                   yes
-W_jump                           86331      29330      9  violated:NoJumpW                      violated:NoJumpW                      yes
-C_rearm                         294201     102392     36  pass                                  pass                                  yes
+C_safe                          785614     222566      8  pass                                  pass                                  yes
+C_safe_other                   3327044     950282     24  pass                                  pass                                  yes
+C_safe_live                     183213      54700     13  pass                                  pass                                  yes
+C_three                        1473213     356232     27  pass                                  pass                                  yes
+C_pair                         2220129     634068     28  pass                                  pass                                  yes
+M_publish_late                  465611     136481      8  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_busy_no_wait                  665803     193552      9  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_no_recheck                     88814      28153      3  violated:NoBadJump                    violated:NoBadJump                    yes
+M_no_wait_advance               716238     207032      9  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_no_job_check                  147691      43894      3  violated:NoBadJump                    violated:NoBadJump                    yes
+M_no_attempt                      7133       2576      2  violated:TimersFire                   violated:TimersFire                   yes
+W_jump                           96739      29353      2  violated:NoJumpW                      violated:NoJumpW                      yes
+C_rearm                         278361      82636     19  pass                                  pass                                  yes
+C_post_wakes                    714939     203124     54  pass                                  pass                                  yes
+C_post_own                       17707       6208      4  pass                                  pass                                  yes
+M_post_no_wake                   17083       6120      3  violated:TimersFire                   violated:TimersFire                   yes
+M_uncounted_shard                35869      10624      4  violated:TimersFire                   violated:TimersFire                   yes
+M_detached_uncounted            516260     153259      7  violated:NoBadJump                    violated:NoBadJump                    yes
+C_read                         2670226     810848      9  pass                                  pass                                  yes
+M_check_then_read                 4519       2117      2  violated:ReaderMonotonic              violated:ReaderMonotonic              yes
+M_pause_reads_first               6787       3195      1  violated:ReaderMonotonic              violated:ReaderMonotonic              yes
+OW_wheels                          209        123      1  pass                                  pass                                  yes
+M_one_wheel                         29         25      1  violated:NeverEarly                   violated:NeverEarly                   yes
+FA_protocol                         56         39      1  pass                                  pass                                  yes
+M_no_in_flight                      53         39      1  violated:ForeignNeverPassed           violated:ForeignNeverPassed           yes
+M_no_wait_advance_foreign           66         44      1  violated:ForeignNeverPassed           violated:ForeignNeverPassed           yes
+CJ_join                             30         22      1  pass                                  pass                                  yes
+MCJ_no_members_recheck              23         21      1  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+LJ_join                            430        245      2  pass                                  pass                                  yes
+LJ_leave                          1093        620      1  pass                                  pass                                  yes
+M_no_late_join                     165         92      1  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_no_visit_mark                    165         92      1  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_no_join_recheck                 1034        588      1  violated:NoStaleGuest                 violated:NoStaleGuest                 yes
+M_pause_unclaimed                  204        115      1  violated:NoBadJump                    violated:NoBadJump                    yes
 
-results matching EXPECTED.txt: 12 of 12
+results matching EXPECTED.txt: 34 of 34

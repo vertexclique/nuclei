@@ -140,7 +140,7 @@ where
     let hooks = inner.task_hooks.as_ref();
     let (runnable, task) = task::spawn(
         future,
-        Sched::counted(Arc::clone(shard), None, hooks.cloned()),
+        Sched::<false>::counted(Arc::clone(shard), None, hooks.cloned()),
     );
     spawned(hooks.map(|hooks| &**hooks), &task);
     // Pairs with the fence of `Shared::drain`: either the stop sees the

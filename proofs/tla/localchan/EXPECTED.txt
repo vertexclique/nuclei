@@ -15,3 +15,15 @@ MLO_send_ignores_close         MC_LocalOneshot      violated:NoSendPastClose
 MLO_drop_no_wake               MC_LocalOneshot      violated:Termination
 MLO_close_no_wake              MC_LocalOneshot      violated:Termination
 MLO_poll_ignores_dropped       MC_LocalOneshot      violated:Termination
+LC_reentrant                   MC_LocalChan         pass
+LC_reentrant_closed            MC_LocalChan         pass
+LC_close_panic                 MC_LocalChan         pass
+LC_recv_panic                  MC_LocalChan         pass
+MLC_no_relook                  MC_LocalChan         violated:AllEnd
+MLC_closed_no_relook           MC_LocalChan         violated:AllEnd
+MLC_close_stops_at_panic       MC_LocalChan         violated:OthersEnd
+MLC_pop_lost                   MC_LocalChan         violated:NoValueLost
+LO_reentrant                   MC_LocalOneshot      pass
+LO_reentrant_park              MC_LocalOneshot      pass
+MLO_no_relook                  MC_LocalOneshot      violated:Termination
+MLO_closed_no_relook           MC_LocalOneshot      violated:Termination

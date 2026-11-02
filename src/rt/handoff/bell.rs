@@ -309,7 +309,7 @@ mod tests {
             // A spurious early end is allowed; the loop that waits looks at
             // the clock, as the monitor's tick does.
             while start.elapsed() < left {
-                bell.wait_for(left - start.elapsed());
+                bell.wait_for(left.saturating_sub(start.elapsed()));
             }
             assert!(start.elapsed() >= left);
         }

@@ -33,7 +33,7 @@
 
 use core::task::{Poll, Waker};
 
-use super::internal::Ordering;
+use super::internal::{OnUnwind, Ordering};
 use super::queue::{HANDOFF, Policy, stops_spin};
 use super::spin::Gaps;
 use super::waiter::{Cancel, Park, Wait};
@@ -96,7 +96,11 @@ pub(super) trait Lock: Policy {
     /// takes `need` as [`try_take`](Self::try_take) would, or in the same
     /// compare-and-swap is owed a handoff (see `Policy::owe_or_take`).
     fn take_or_owe(&self, wait: &Wait, need: usize) -> Result<(), usize> {
-        self.owe_or_take(wait, |state| self.admit(state, need))
+        self.owe_or_take(
+            wait,
+            |state| self.admit(state, need),
+            || self.give_back(need),
+        )
     }
 }
 
@@ -194,7 +198,12 @@ pub(super) fn taken_at_once<L: Lock + ?Sized>(
     need: usize,
     waker: &Waker,
 ) -> Poll<Result<(), Closed>> {
-    admitted(lock, need, crate::coop::spend(waker))
+    let admit = crate::coop::try_spend();
+    let polled = admitted(lock, need, admit);
+    if !admit {
+        crate::coop::refused(waker);
+    }
+    polled
 }
 
 /// What a first attempt that took `need` comes to once the budget answered:
@@ -345,7 +354,11 @@ impl Contend {
                             if L::SPINS && queue.spin.rounds() == 0 {
                                 queue.spin.won(0);
                             }
+                            // The cancel runs other tasks' wakes and drops a
+                            // waker: a panic there must not lose the take.
+                            let undo = OnUnwind::new(|| lock.give_back(need));
                             self.cancel(lock, need);
+                            undo.disarm();
                             if queued_now {
                                 return taken_at_once(lock, need, waker);
                             }
@@ -378,7 +391,7 @@ impl Contend {
     pub(super) fn cancel<L: Lock>(&mut self, lock: &L, need: usize) {
         match self.wait.cancel(lock.queue()) {
             Cancel::Idle => {}
-            Cancel::Withdrawn(woken) => lock.withdrawn(woken),
+            Cancel::Withdrawn(woken, _shelved) => lock.withdrawn(woken),
             Cancel::Granted(payload) => {
                 lock.queue().consume_nudge();
                 // A grant made because the primitive closed took nothing.

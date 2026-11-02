@@ -169,7 +169,11 @@ impl Lock for Counted<'_> {
     /// own.
     fn take_or_owe(&self, wait: &Wait, need: usize) -> Result<(), usize> {
         self.next_drain();
-        let attempt = self.owe_or_take(wait, |state| self.admit(state, need));
+        let attempt = self.owe_or_take(
+            wait,
+            |state| self.admit(state, need),
+            || self.give_back(need),
+        );
         self.next_drain();
         attempt
     }

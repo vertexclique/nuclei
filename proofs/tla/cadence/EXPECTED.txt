@@ -5,3 +5,4 @@ M_no_time_rule                 MC_Cadence           violated:Bounded
 W_first_drive                  MC_Cadence           violated:NoFirstDrive
 W_time_drive                   MC_Cadence           violated:NoTimeDrive
 W_wait_reaches_worst           MC_Cadence           violated:WaitBelowWorst
+M_no_count_rule                MC_Cadence           violated:RunsBounded

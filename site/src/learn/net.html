@@ -16,7 +16,7 @@
 <!--example net_names-->
 
 <h2 id="udp">UDP</h2>
-<p>A bound socket sends datagrams to any address and receives them with their sender's; a connected one talks to one peer. A datagram larger than the buffer is cut to fit.</p>
+<p>A bound socket sends datagrams to any address and receives them with their sender's; a connected one talks to one peer. On Unix a datagram larger than the buffer is cut to fit, as std cuts it, so size the buffer for the largest datagram you expect; on Windows the receive answers <code>WSAEMSGSIZE</code>, as std's does.</p>
 <!--example net_udp-->
 <p><code>peek</code> and <code>peek_from</code> look at the next datagram without taking it, <code>peek_sender</code> names its sender without copying a byte, and <code>recv_buf</code> and <code>recv_buf_from</code> receive into a <a href="api:nuclei::io::ReadBuf"><code>ReadBuf</code></a> that need not be initialized.</p>
 
@@ -63,7 +63,7 @@ nuclei::io::Handle::set_quickack
 <li><a href="api:nuclei::io::Handle::abort"><code>abort()</code></a> closes a TCP stream now: <code>SO_LINGER</code> goes to zero, the bytes written behind are dropped, and the peer's reads fail with <code>ConnectionReset</code>.</li>
 </ul>
 <!--example net_shut-->
-<p>After <code>shut(Read)</code> or <code>shut(Both)</code>, reads answer as std's do on each system: Linux hands out what came before, then the end; macOS and Windows end at once, so there the handle drops what it read ahead too. The call is not named <code>shutdown</code>, so <code>stream.shutdown(how)</code> still reaches std's own through the handle, which shuts the halves at once: bytes still behind then never reach the peer.</p>
+<p>After <code>shut(Read)</code> or <code>shut(Both)</code>, Linux hands out what came before, then the end, as std's reads do. On macOS, the BSDs and Windows every read answers the end at once (on Windows too, where std's read answers an error): the handle drops what it read ahead, and any bytes a receive made before the shut brings later. The call is not named <code>shutdown</code>, so <code>stream.shutdown(how)</code> still reaches std's own through the handle, which shuts the halves at once: bytes still behind then never reach the peer.</p>
 <p>A stream that is only dropped still delivers its bytes behind and ends cleanly. One whose time for that runs out resets the connection, as <code>abort</code> does (<a href="proactive.html#buffers">How it works</a>).</p>
 
 <h2 id="send-file">Files and large writes</h2>

@@ -37,6 +37,15 @@
 (* whose cut came back as a success); datagrams received out               *)
 (* of order; a call that waits forever.                                    *)
 (*                                                                          *)
+(* With `Buf` below the largest datagram the task's buffer is shorter than *)
+(* one of them. A datagram longer than the buffer then answers as std's    *)
+(* receive does on the same system (`AsStd`): on unix the bytes that fit,  *)
+(* cut, as a success (the caller sizes the buffer); on Windows the bytes   *)
+(* that fit and the error `WSAEMSGSIZE` (src/io/sys/windows.rs             *)
+(* `recv_from_ready`, the lent receive's cut in port.rs, and the copy of a *)
+(* datagram received ahead whole). Before, the port answered the cut as a  *)
+(* success (`port_cut_ok`).                                                *)
+(*                                                                          *)
 (* What is abstract: the guard (a step runs whole under it; RingOp.tla      *)
 (* checks the hand-off to the ring's thread), and sizes, counted in units: *)
 (* the pool's largest buffer holds Largest units, its smallest Small.      *)
@@ -48,6 +57,7 @@ CONSTANTS
     Unix,      \* TRUE: a Unix datagram socket, whose datagrams may outgrow the pool; FALSE: UDP
     Ahead,     \* TRUE: UDP is received ahead: a ring whose group holds any UDP datagram whole, a port
                \* the pool has a buffer for; FALSE on a port: the pool has none, so the port looks
+    Buf,       \* the units the task's own buffer holds
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The backend the run is of.
@@ -70,6 +80,11 @@ Direct == Backend = "poller" \/ Unix \/ ~Ahead
 Bound == IF Mutation = "bound_small" THEN Largest - 1 ELSE Largest
 \* The smaller of two sizes.
 Min(a, b) == IF a < b THEN a ELSE b
+\* What a receive of datagram `n`, `kept` of its units at hand, answers into the task's buffer: the
+\* units that fit, and whether it is an error: on a port, a datagram longer than the buffer
+\* (`WSAEMSGSIZE`), as std's receive answers it there; on unix a cut, as a success.
+\* MUTATION port_cut_ok: the port answers the cut as a success (the code before).
+Answer(n, kept) == <<n, Min(kept, Buf), Port /\ Sizes[n] > Buf /\ Mutation # "port_cut_ok">>
 
 (* --algorithm RingRecv
 variables
@@ -83,7 +98,7 @@ variables
     cap = Largest,         \* the units the buffer of the receive out holds
     readable = FALSE,      \* a port's zero-byte look said a datagram came, and none was taken since
     woken = FALSE,         \* the waiting task was woken
-    got = <<>>,            \* what the task received, as <<number, units>>
+    got = <<>>,            \* what the task received, as <<number, units, an error>>
     waited = FALSE;        \* (record) a call waited for an edge or a poll
 
 \* The peer sends its datagrams, one after another.
@@ -203,7 +218,7 @@ T_peek_wait:
 T_recv:
         if ahead # <<>> then
             \* What came ahead comes first.
-            got := Append(got, Head(ahead));
+            got := Append(got, Answer(Head(ahead)[1], Head(ahead)[2]));
             ahead := Tail(ahead);
             at := at + 1;
         elsif Direct /\ socket # <<>> /\ ~(Mutation = "armed_waits" /\ out = "poll")
@@ -212,7 +227,7 @@ T_recv:
             \* a port once its look said one came, `receive_starved`; the next waits for another).
             \* MUTATION armed_waits: the armed poll counts as an operation out, which the call
             \* waits behind, so it never asks the kernel again.
-            got := Append(got, <<Head(socket), Sizes[Head(socket)]>>);
+            got := Append(got, Answer(Head(socket), Sizes[Head(socket)]));
             socket := Tail(socket);
             readable := FALSE;
             at := at + 1;
@@ -244,6 +259,13 @@ NoCut == \A j \in 1..Len(got) : got[j][2] = Sizes[got[j][1]]
 
 \* The datagrams are received in the order they were sent.
 InOrder == \A j \in 1..Len(got) : got[j][1] = j
+
+\* Every receive answers as std's does on the same system: a datagram that fits the task's buffer
+\* whole and as a success; a longer one cut to it, as a success on unix, with `WSAEMSGSIZE` on Windows.
+AsStd == \A j \in 1..Len(got) :
+    LET n == got[j][1] IN
+    IF Sizes[n] <= Buf THEN got[j][2] = Sizes[n] /\ ~got[j][3]
+    ELSE got[j][2] = Buf /\ got[j][3] = Port
 
 \* Every call ends: the task receives every datagram.
 Termination == <>(pc["task"] = "Done")

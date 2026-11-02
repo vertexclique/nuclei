@@ -1,20 +1,35 @@
-TLC run of every configuration in proofs/tla/coop, as CI ran them: TLA+ run 41461594872 on 608d5671, 2026-11-02.
-Rows written by proofs/tla/run_tlc.sh in the share jobs of .github/workflows/tla.yml, gathered from the run's log.
-Version 2.19 of 08 August 2024. Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3480 s each.
+TLC run of every configuration in proofs/tla/coop, 2026-11-03 08:59 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
 C_recv                              45         30      1  pass                                  pass                                  yes
-C_acq                              380        269      1  pass                                  pass                                  yes
-C_mixed                            162        105      2  pass                                  pass                                  yes
+C_acq                              528        400      1  pass                                  pass                                  yes
+C_mixed                            189        130      1  pass                                  pass                                  yes
 C_live_recv                         45         30      1  pass                                  pass                                  yes
-C_live_acq                         380        269      2  pass                                  pass                                  yes
+C_live_acq                         528        400      2  pass                                  pass                                  yes
 M_take_then_check                   19         14      1  violated:NoValueLost                  violated:NoValueLost                  yes
 M_no_spend                          19         14      1  violated:BoundedPoll                  violated:BoundedPoll                  yes
 M_no_wake                           29         20      1  violated:Termination                  violated:Termination                  yes
-M_keep_on_refuse                   123         91      1  violated:Conservation                 violated:Conservation                 yes
-M_give_back_no_serve               166        121      1  violated:NoIdleWhileQueued            violated:NoIdleWhileQueued            yes
+M_keep_on_refuse                   137        106      1  violated:Conservation                 violated:Conservation                 yes
+M_give_back_no_serve               186        143      2  violated:NoIdleWhileQueued            violated:NoIdleWhileQueued            yes
+M_enqueue_grant_free               189        146      1  violated:BoundedPoll                  violated:BoundedPoll                  yes
 W_refusal                           19         14      1  violated:NoRefusal                    violated:NoRefusal                    yes
-W_other_between                     37         28      1  violated:NoOtherBetween               violated:NoOtherBetween               yes
-W_serve_by_give_back               166        121      1  violated:NoServeByGiveBack            violated:NoServeByGiveBack            yes
+W_other_between                     46         36      1  violated:NoOtherBetween               violated:NoOtherBetween               yes
+W_serve_by_give_back               186        143      1  violated:NoServeByGiveBack            violated:NoServeByGiveBack            yes
+W_grant_at_enqueue                  29         24      1  violated:NoGrantAtEnqueue             violated:NoGrantAtEnqueue             yes
+C_nest                              57         38      1  pass                                  pass                                  yes
+C_pend                              36         24      1  pass                                  pass                                  yes
+C_join                              45         30      1  pass                                  pass                                  yes
+C_live_join                         45         30      2  pass                                  pass                                  yes
+M_stale_budget                      40         26      1  violated:Termination                  violated:Termination                  yes
+M_nest_no_restore                   25         18      1  violated:BoundedPoll                  violated:BoundedPoll                  yes
+M_no_refund                          7          6      1  violated:SpentIsProgress              violated:SpentIsProgress              yes
+M_join_free                         19         14      1  violated:BoundedPoll                  violated:BoundedPoll                  yes
+M_join_take_then_check              19         14      2  violated:NoValueLost                  violated:NoValueLost                  yes
+W_refund                             7          6      1  violated:NoRefund                     violated:NoRefund                     yes
+W_join_yields                       19         14      1  violated:NoJoinRefusal                violated:NoJoinRefusal                yes
+C_acq_panic                        414        312      1  pass                                  pass                                  yes
+M_wake_before_give_back            137        106      2  violated:Conservation                 violated:Conservation                 yes
 
-results matching EXPECTED.txt: 13 of 13
+results matching EXPECTED.txt: 28 of 28

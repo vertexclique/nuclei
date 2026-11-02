@@ -287,6 +287,7 @@ mod tests {
     /// The trial's answer is the kernel's: a file out of the table goes at
     /// once from Linux 6.13, late before.
     #[test]
+    #[cfg_attr(miri, ignore = "makes an io_uring ring")]
     fn the_release_trial_answers_as_the_kernel_behaves() {
         // SAFETY: plain data, all zeroes valid; the kernel fills it.
         let mut name: libc::utsname = unsafe { core::mem::zeroed() };
@@ -339,6 +340,7 @@ mod tests {
     /// Past a full table a source gets a slot naming its own descriptor,
     /// which entries name by number, reserved until its last entry.
     #[test]
+    #[cfg_attr(miri, ignore = "opens files and makes an io_uring ring")]
     fn past_a_full_table_a_slot_names_the_sources_own_descriptor_until_its_last_entry() {
         let mut files = Files::new(1);
         let fixed = files.take().unwrap();

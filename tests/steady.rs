@@ -11,7 +11,7 @@ mod handles_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use handles_support::open_handles;
@@ -78,6 +78,10 @@ const SLACK: isize = 16 * 1024;
 /// How long the live bytes get to come down to the slack after the rounds.
 const SETTLE: Duration = Duration::from_secs(5);
 
+/// The most blocking threads a watched runtime runs: a reclaim flushes
+/// that many at once, so it reaches every one.
+const POOL: usize = 4;
+
 /// The runtime whose workers hold retired nodes, if any, and how many.
 struct Watch<'a> {
     rt: Option<&'a nuclei::Runtime>,
@@ -85,7 +89,7 @@ struct Watch<'a> {
 }
 
 impl Watch<'_> {
-    /// Submits what every worker, the blocking pool and this thread retired
+    /// Submits what every worker, every blocking thread and this thread retired
     /// to reclamation. kovan batches 64 retired nodes a thread, and a worker
     /// that popped a queue's segments keeps them until its batch fills, 100
     /// KB of 1600-byte segments, so the live bytes swing with where the batch
@@ -124,7 +128,34 @@ impl Watch<'_> {
                     }
                 }
             }
-            rt.block_on(rt.spawn_blocking(kovan::flush));
+            // An idle pool thread keeps kovan's reservation of the era it last ran
+            // in, which holds the batches retired in that era until the thread runs
+            // again or exits: bounded by kovan's era bound, no leak. So every pool
+            // thread flushes: `POOL` jobs live together, one on each.
+            let started = Arc::new(AtomicUsize::new(0));
+            let jobs: Vec<_> = (0..POOL)
+                .map(|_| {
+                    let started = Arc::clone(&started);
+                    rt.spawn_blocking(move || {
+                        kovan::flush();
+                        started.fetch_add(1, Ordering::AcqRel);
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while started.load(Ordering::Acquire) < POOL {
+                            if std::time::Instant::now() >= deadline {
+                                return false;
+                            }
+                            std::thread::yield_now();
+                        }
+                        true
+                    })
+                })
+                .collect();
+            let saw: Vec<bool> = jobs.into_iter().map(|job| rt.block_on(job)).collect();
+            assert!(
+                saw.iter().all(|&all| all),
+                "{} of {POOL} blocking threads took a job to flush",
+                started.load(Ordering::Acquire)
+            );
         }
         kovan::flush();
     }
@@ -161,7 +192,7 @@ impl Watch<'_> {
             round();
         }
         let grew = self.grew_since(bytes);
-        let handles_after = open_handles();
+        let handles_after = handles_back_to(handles);
         assert!(
             handles_after <= handles,
             "{name}: {handles} open handles after the warm-up, {handles_after} after {rounds} more rounds"
@@ -170,6 +201,23 @@ impl Watch<'_> {
             grew <= SLACK,
             "{name}: {grew} live bytes more after {rounds} rounds than after the warm-up"
         );
+    }
+}
+
+/// The open handles once those the rounds left closing have closed: a
+/// file's close can finish a moment after its round. Counted again until
+/// it is back at `handles` or `SETTLE` has passed. A leaked handle stays
+/// open.
+fn handles_back_to(handles: usize) -> usize {
+    let deadline = std::time::Instant::now() + SETTLE;
+    let mut pause = Duration::from_millis(1);
+    loop {
+        let open = open_handles();
+        if open <= handles || std::time::Instant::now() >= deadline {
+            return open;
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
     }
 }
 
@@ -189,6 +237,7 @@ fn every_subsystem_holds_steady() {
     // growth. The handoff has a round of its own below, one every round.
     let rt = nuclei::Runtime::builder()
         .worker_threads(2)
+        .max_blocking_threads(POOL)
         .handoff_after(None)
         .build()
         .unwrap();
@@ -374,6 +423,7 @@ fn every_subsystem_holds_steady() {
     // the blocked thread waits as the next one.
     let rt = nuclei::Runtime::builder()
         .worker_threads(1)
+        .max_blocking_threads(POOL)
         .handoff_after(Some(std::time::Duration::from_millis(5)))
         .build()
         .unwrap();

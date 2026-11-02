@@ -247,6 +247,7 @@ impl ReadState {
                 self.eof = true;
                 after.drop_buf(buf);
             }
+            Answer::Done(Ok(_)) if self.shut => after.drop_buf(buf),
             Answer::Done(Ok(_)) => self.ahead.push(Piece::Pool(buf), after),
             Answer::Done(Err(err)) => {
                 self.error = Some(err);
@@ -457,7 +458,7 @@ impl ReadState {
                         }
                         // A connection reset in the backlog ended it: the tasks woken below ask
                         // for the next one.
-                        Answer::Done(Err(_)) => {}
+                        Answer::Done(Err(_)) => crate::rt::counters::accept_skipped(),
                         Answer::Undone { not_ready } => self.not_ready(not_ready),
                     }
                 }
@@ -475,7 +476,7 @@ impl ReadState {
             }
             // A connection reset in the backlog, closed already: the tasks woken below ask for
             // the next one (proofs/tla/accept).
-            Outcome::Accept(Answer::Done(Err(_))) => {}
+            Outcome::Accept(Answer::Done(Err(_))) => crate::rt::counters::accept_skipped(),
             Outcome::RecvFrom(buf, _) if stale => after.drop_buf(buf),
             Outcome::RecvFrom(buf, answer) => {
                 // The group may have buffers again: the next receive tries.

@@ -37,6 +37,7 @@ CONSTANTS                                                                    \* 
     Mutation     \* "none", or the name of the one rule this run takes away
 
 Calls == {1, 2}                                                              \* the cursor write and the positional one
+Kernel == 0                                                                  \* the kernel's number, which no call has (TLC compares numbers with numbers only)
 
 (* --algorithm PortFile                                                        \* the algorithm, in PlusCal
 variables                                                                    \* the shared state:
@@ -48,7 +49,7 @@ variables                                                                    \* 
     deadWrite = FALSE;             \* (record) the kernel wrote into a frame its call left
 
 \* The kernel: it ends each call it holds, at some time, writing into the call's frame.
-fair process kernel = "kernel"                                               \* weakly fair: what it holds ends
+fair process kernel = Kernel                                                 \* weakly fair: what it holds ends
 begin                                                                        \* the kernel's steps:
 K_end:                                                                       \* one call's end
     while TRUE do                                                            \* for as long as the run goes
@@ -67,6 +68,7 @@ fair process call \in Calls                                                  \* 
 begin                                                                        \* the call's steps:
 C_issue:                                                                     \* `WriteFile` with its `OVERLAPPED`
     held := held \union {self};                                              \* the kernel takes it
+C_back:                                                                      \* the call comes back (a step of its own: its end needs the kernel's step first)
     if Overlapped then                                                       \* it may come back at once, pending:
         either                                                               \* the kernel ended it already
             await self \in ended;                                            \* (it completed in the call)

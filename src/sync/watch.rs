@@ -989,4 +989,36 @@ mod tests {
         assert_eq!(version_of(state), 0);
         assert!(!rx.is_closed());
     }
+
+    #[test]
+    fn a_value_that_panics_as_it_is_replaced_does_not_break_the_channel() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        // Panics only on the thread that made it: reclamation may drop a
+        // value elsewhere, where a panic would break an unrelated test.
+        struct Boom(u32, std::thread::ThreadId);
+        impl Boom {
+            fn new(id: u32) -> Self {
+                Self(id, std::thread::current().id())
+            }
+        }
+        impl Drop for Boom {
+            fn drop(&mut self) {
+                if self.0 != 0 && !std::thread::panicking() && std::thread::current().id() == self.1
+                {
+                    panic!("a replaced value panicked as it dropped");
+                }
+            }
+        }
+        let (tx, rx) = channel(Boom::new(1));
+        for id in 2..8 {
+            let _ = catch_unwind(AssertUnwindSafe(|| tx.send(Boom::new(id))));
+        }
+        assert_eq!(rx.borrow().0, 7, "the newest value is the channel's");
+        assert!(rx.has_changed().unwrap_or(false));
+        assert!(
+            tx.send(Boom::new(0)).is_ok(),
+            "the channel still takes values"
+        );
+        assert_eq!(rx.borrow().0, 0);
+    }
 }

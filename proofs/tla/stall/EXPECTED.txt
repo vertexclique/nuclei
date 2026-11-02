@@ -2,4 +2,6 @@
 S_fair                         MC_Stall             pass
 M_release_no_grant             MC_Stall             violated:OthersEnd
 W_never_polled                 MC_Stall             violated:OthersEnd
-W_nested_frames                MC_Stall             violated:OthersEnd
+N_nested_frames                MC_Stall             pass
+N_nested_three                 MC_Stall             pass
+M_no_freeze                    MC_Stall             violated:OthersEnd

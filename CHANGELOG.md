@@ -4,20 +4,41 @@
 
 ### Fixed
 
+- **Every task ends when its runtime shuts down or its thread exits.** A task neither queued nor
+  woken was left live, its handle never resolved and its destructor never ran; a bound task woken
+  after its thread was gone was leaked. Each shard and each thread now keeps a list of its live
+  tasks, which the shutdown and the thread's exit walk, cancelling every task on its own thread, so
+  every handle resolves and every destructor runs. A drop waits for a thread still in a task's poll
+  only until its timeout (one second without one), and says so. A task whose wake is still on its
+  way at that deadline is left, logged and counted in `Stats::tasks_left`
+  (`proofs/tla/teardown/Teardown.tla`).
+- **A sleep that completes spends one operation of the task's budget.** A loop over sleeps that
+  were already due (`sleep(Duration::ZERO)`, `sleep_until` a past instant, a timer that fired
+  while the task ran) answered `Ready` every time and never yielded, so it held its shard as no
+  loop over IO or a channel can. `Sleep` and `SleepPrecise` now go through the budget's spend at
+  every `Ready` of their poll, as IO does; a spent budget wakes the task and answers `Pending`,
+  and the timer stays completed, so its next poll answers `Ready` and is charged then. A `Pending`
+  poll touches no budget. `Interval::tick` goes through the sleep's poll. `timeout` polls its future
+  first, so a future that is ready at once still wins; the elapsed answer is the sleep's `Ready`
+  and is charged once. Cost, `ci/op_counts.sh`, instructions per operation on the `sleep` row:
+  +3.3 on epoll (705.3 to 708.6) and +2.1 on io_uring (706.7 to 708.8) against the commit before,
+  within the row's run-to-run spread of about 1.5; the `timeout`, `spawn_join` and `block_on` rows
+  are unchanged (`tests/coop.rs`, `src/time/tests.rs`).
+
 - **A stream set to zero linger and dropped while its data is still on its way resets its peer**
-  (macOS, and every system that counts a socket's unacknowledged bytes). A close with no linger
-  resets the connection, and on macOS's loopback that reset could overtake the last data still on
-  its way: the peer took it for a stale one and answered with a challenge ACK the closed port never
-  answered, so the peer's stream stayed open for good, a read waiting forever
-  (`tests/net_streams.rs`'s resetting peer, about one run in two on CI's macOS). A handle dropped
-  while its kernel holds bytes the peer has not acknowledged (`SO_NWRITE` on macOS, `FIONWRITE` on
-  FreeBSD, `SIOCOUTQ` on Linux) now goes to a linger task, after the bytes written behind if there
-  are any, which waits until the peer acknowledged them, within `Builder::write_behind_linger`, and
-  only then resets (`proofs/tla/close/AbortAcks.tla`); a peer that stopped reading holds the reset
-  back until that time runs out, as it holds back a drain. A drop knows of a zero linger set through
-  `set_zero_linger` or `set_linger` (of the stream, or of the `TcpSocket` it was connected or
-  accepted from); one set on the descriptor another way waits only when bytes are behind. Unchanged
-  on Windows, which has no such count.
+  (macOS). A close with no linger resets the connection, and on macOS's loopback that reset could
+  overtake the last data still on its way: the peer took it for a stale one and answered with a
+  challenge ACK the closed port never answered, so the peer's stream stayed open for good, a read
+  waiting forever (`tests/net_streams.rs`'s resetting peer, about one run in two on CI's macOS). A
+  handle dropped there, to a peer at a loopback address, while its kernel holds bytes the peer has
+  not acknowledged (`SO_NWRITE`) now goes to a linger task, after the bytes written behind if there
+  are any, which waits until the peer acknowledged them, for at most 10 ms of its own (apart from
+  `Builder::write_behind_linger`), and then resets; a peer that never acknowledges holds the reset
+  back no longer than that. A drop knows of a zero linger set through `set_zero_linger` or
+  `set_linger` (of the stream, or of the `TcpSocket` it was connected or accepted from). Every
+  other system, and any peer that is not a loopback address, resets at once after the bytes written
+  behind, as before (`proofs/tla/close/AbortAcks.tla`: `M_uncapped_wait`, `M_close_at_drain`,
+  `M_close_at_once`).
 
 - **A shard's ring kept past its shard wakes for what is posted to it, and lets go of every post**
   (io_uring). A worker that goes with a zero-copy notification still out hands its ring to a
@@ -46,6 +67,15 @@
   zero-copy send that waits only for its notification ended at its first completion, and only
   keeps its buffer); the receive group is kept only when a receive that draws from it is out
   (`proofs/tla/keeper/Forgot.tla`).
+- **A going shard waits for its file calls up to the linger time, and says and counts what it
+  gives up** (io_uring). A worker's shard on a ring no keeper can take gave up after one second on
+  every operation still in the kernel as it went, file calls among them, with no word: a write or
+  a sync held up by a slow device was given up while the bytes it carried were still on their way,
+  and the count of give-ups was nowhere to read. A file call, which no peer can hold up, is now
+  waited for until it ends, for at most the runtime's `write_behind_linger`; a socket's operation
+  keeps the one-second wait. Whatever is given up is said once per shard at warn and counted in
+  the new `Stats::operations_given_up` (`proofs/tla/keeper/Forgot.tla`: `FM_file_short_wait`,
+  `FM_forget_unsaid`).
 - **A thread's own shard that leaves waits for an attach another thread still has to perform**
   (io_uring; every backend for the stale token). A source registered in a thread's `block_on`
   while another thread held one of its sides has its attach left to that holder. Once the
@@ -68,6 +98,17 @@
   (the poll's own panic, if it had one, stays the outcome). A panic nobody can take is logged at
   error. A spawn hook's panic unwinds out of the spawn, and the task is cancelled before it runs
   (`proofs/tla/task/Task.tla`, `Panics` and `Shutdown`).
+- **A task handle's waker that panics no longer aborts the process.** The waker a handle's awaiter
+  left was woken, dropped or cloned inside a change of the task's state, so a panic there aborted;
+  a clone that panicked while the handle stored its waker would have left the store's flag set, and
+  the handle never told again. Each runs now once the change is complete, in a catch that logs the
+  panic at error; the clone comes before anything is held, its panic going to the poller. An output
+  nobody took whose drop panics is caught and logged the same way (`proofs/tla/task/Task.tla`,
+  `MW_waker_aborts`, `MW_clone_in_register`).
+- **Awaiting task handles that are already finished yields to the shard's other tasks.** A handle
+  that answered at once spent nothing of the coop budget, so a loop over finished handles never
+  yielded. A handle's poll that returns ready now spends one unit, and one refused returns pending
+  and wakes itself, taking nothing (`proofs/tla/coop/Coop.tla`, `M_join_free`).
 - **A `shard_local!` value that panics as its worker stops no longer cuts the worker's going
   short.** The values were dropped before the shard settled its ring, outside any catch: a panic
   skipped the rest of the going, and the ring was dropped with its file operations still in the
@@ -84,12 +125,16 @@
   the listener's own (`lost_before_accept`) and skips the connection: a readiness side accepts the
   next one at once, a completion side keeps nothing and its task's poll sends the next accept, and a
   plain accept on io_uring that finds a connection a multishot accept brought gone (`ENOTCONN` from
-  its peer) takes the next one. `accept`, `incoming` and `UnixListener::accept` skip `ECONNABORTED`
-  as well, which they returned before (on macOS and the BSDs, for a connection reset in the
-  backlog), as `accept_multi` already skipped it on unix; Linux hands such a connection over as it
-  is, unchanged. The listener's own errors (out of descriptors or memory, not listening) still reach
-  `accept` and end the stream (`proofs/tla/accept/AcceptReset.tla`, and `AcceptStream.tla` with
-  reset connections).
+  its peer) takes the next one. On Linux the side skips as well the network errors accept(2) says to
+  retry (`EPROTO`, `ENETDOWN`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`,
+  `ENETUNREACH`), a connection's error pending as it is accepted, which `accept` returned and
+  `accept_multi`'s stream ended with before. Every backend counts each connection it skips, in the
+  new `ErrorCounts::accepts_skipped`. `accept`, `incoming` and `UnixListener::accept` skip
+  `ECONNABORTED` as well, which they returned before (on macOS and the BSDs, for a connection reset
+  in the backlog), as `accept_multi` already skipped it on unix; Linux hands such a connection over
+  as it is, unchanged. The listener's own errors (out of descriptors or memory, not listening) still
+  reach `accept` and end the stream (`proofs/tla/accept/AcceptReset.tla`, and `AcceptStream.tla`
+  with reset connections).
 - **`accept_multi` on Windows pauses for a socket the system has no room for, as for one it has no
   descriptor for.** Windows answers a socket it cannot make, the one an accept takes its connection
   into among them, with `WSAENOBUFS` as well as `WSAEMFILE`, and an `AcceptEx` that ends for want of
@@ -170,6 +215,13 @@
   once none of its operations is out, or its send ended, it is registered again and the move is
   made (`proofs/tla/port/PortKeep.tla`, `Duplex`). One registering again with the shard whose port
   its handle is bound to (its thread's next `block_on`) needs no move.
+- **A datagram longer than the buffer answers `WSAEMSGSIZE` on Windows, as std's receive does.** A
+  receive or a peek of a datagram cut to the buffer answered the buffer's length as a success, so
+  the caller could not tell a cut datagram from one that filled the buffer. It now answers
+  `WSAEMSGSIZE`, the buffer holding the bytes that fit; a receive takes the datagram and a peek
+  leaves it, whether the driver received it ahead into the pool or the task's own receive took it.
+  On unix the kernel cuts it with no error, as std's receive does, so the caller sizes the buffer,
+  unchanged (`proofs/tla/ring/RingRecv.tla`: `MRR_port_cut_ok`, `MRR_port_starved_cut_ok`).
 - **A datagram an owned receive given up had cut is dropped, not handed on.** A `recv_from_owned`
   whose future was dropped after the driver received a datagram into its buffer hands the datagram
   to the next receive; one longer than that buffer was cut to it, and the next receive took its
@@ -193,19 +245,30 @@
   file's end only while a handle to the file is open, and frees it when the last one closes (a
   1 MiB reservation read back 1 MiB with a handle open and 0 once reopened after the last close);
   the docs promised it as a lasting reservation. A test checks both on Windows.
-- **The docs no longer say a direct file's writes have no write-behind** (every backend). A
-  cursor write through `AsyncWrite` on a file opened for direct IO is one kernel write of exactly
-  the caller's bytes, joined with no other, but it is accepted as it is submitted, from a copy,
-  and its error is answered by the next call; `flush` waits for it. The crate docs and the Learn
-  page now say so, and point to `write_owned`, `write_at` and `write_all_at`, which return only
-  once their own write landed (`proofs/tla/lent/LentFile.tla`, `WF_direct_ok_early`).
+- **A write to a file opened for direct IO, or to sync each write, returns once it landed, with
+  its own result** (every backend). A file opened with `O_DIRECT`, `O_DSYNC` or `O_SYNC`
+  (`FILE_FLAG_NO_BUFFERING` or `FILE_FLAG_WRITE_THROUGH` on Windows) is one whose writes the caller
+  counts as done when they return, but a write through `AsyncWrite` was answered as it was
+  submitted, from a copy: an unaligned `O_DIRECT` write of 100 bytes answered `Ok(100)` and its
+  `EINVAL` went to the next call, and a write to an `O_DSYNC` file joined the write-behind like any
+  buffered one. The sync flags are now read from the descriptor on every system, and such a file
+  has no write-behind: each write at the cursor is one kernel write, Ready only once it landed,
+  with its own result. An unaligned direct write answers the kernel's `EINVAL` itself and moves
+  the cursor nowhere. A write whose future was dropped still lands, and its answer goes only to a
+  poll of that same write (the same bytes at the same place), so the next write, of other bytes or
+  from a buffer filled again, makes its own call; tasks writing through `&File` at once each get
+  their own answer. A failed write whose answer nobody took is said at warn and counted in
+  `Stats::write_behind_lost` as its handle goes. Reads of a file opened to sync each write still go
+  through the read-ahead (`proofs/tla/lent/LentFile.tla`, scenarios "direct" and "dsync":
+  `MF_direct_ok_early`, `MF_answer_by_place`, `MF_failure_moves_cursor`).
 - **A file dropped with bytes written behind no longer loses them unsaid** (every backend). The
   drop handed its write-behind to a task, and the process default runtime, which is never
   dropped, never waited for it: a file written and dropped in `nuclei::block_on`, or on a worker,
   just before `main` returned came out short, with no error anywhere. A linger whose write failed,
   or whose `write_behind_linger` ran out, gave the rest up without a word. A file dropped on a
-  thread that is no worker now writes its write-behind before its drop returns; one dropped on a
-  worker leaves its task, which is counted wherever it runs, and the process's exit (an `atexit`
+  thread that is no worker and none of the blocking pool's now writes its write-behind before its
+  drop returns; one dropped on a worker, or on the pool, whose writes the wait would need, leaves
+  its task, which is counted wherever it runs, and the process's exit (an `atexit`
   hook) waits for every such task, for at most the default runtime's linger time. Bytes given up
   with nobody left to answer, there or at `get_mut` and `into_inner`, are said at warn and counted
   in the new `Stats::write_behind_lost` (`proofs/tla/going/Linger.tla`: `LM_no_exit_wait`,
@@ -223,6 +286,15 @@
   a lost write-back of the open file to one of the two only
   (`proofs/tla/lent/LentFile.tla`, scenarios "sync_lost" and "sync_clone":
   `MF_sync_forgets_loss`, `MF_sticky_unshared`).
+- **A sync of a handle and one of its clone at once no longer answer success for a lost
+  write-back** (every backend). A handle and its clone (`try_clone`, the same open file) shared the
+  record of a failure, but each made its own sync calls, so two syncs at once could make two calls
+  side by side: the kernel reports a lost write-back of the open file to one call only, and the
+  other call, finding no error, answered success for writes that never reached the device. The
+  handle and its clones now make one sync call at a time across them all: a sync whose call would
+  go beside another's waits for that call's end, whoever's, and a failure seen through either
+  fails every later sync of both (`proofs/tla/lent/LentFile.tla`, scenario "sync_clone_race":
+  `MF_syncs_per_handle`).
 - **A polled ring no longer refuses a file's sync, nor a buffered file's reads and writes**
   (Linux, io_uring with `IoUringConfiguration::io_poll`). A ring made to poll for its completions
   (`IORING_SETUP_IOPOLL`) takes only the reads and writes of direct IO: the kernel answers a sync,
@@ -519,29 +591,114 @@
   come round at one reuse a nanosecond (`proofs/lean/Nuclei/Wheel.lean`,
   `stale_key_stays_stale`). An entry of the wheel takes 56 bytes instead of 48.
 
-- **A reentrant lock request that queued before its owner took the lock enters at its next
-  poll.** A `ReentrantMutex` lock, or a `ReentrantRwLock` read, looked for its owner only on its
-  first poll; once queued it only looked at its place in line. So an owner with two requests out
-  at once (`join!(lock.write(&me), lock.read(&me))` behind another owner) took the write with the
+- **A paused clock never jumps past a sleep armed from a thread outside the runtime.** A sleep
+  polled from a thread that runs no shard of the runtime (or one whose shard the handoff took)
+  read the clock and posted its arm request in two steps, and a jump decided between them moved
+  the clock past its deadline. Such a poll now counts itself in flight and waits for a jump being
+  decided to end before it looks at the clock and posts, so no jump is decided while it is in
+  between (`proofs/tla/clock/ForeignArm.tla`, `FA_protocol`, `M_no_in_flight`,
+  `M_no_wait_advance_foreign`).
+- **A nested `block_on` of another runtime keeps its own clock and its own timers.** A thread's
+  shard has one timer wheel and read the time from the clock of the runtime the thread was
+  inside, so a task that called another runtime's `block_on` with a paused clock, and advanced
+  it, made the shard's loop fire the outer runtime's sleeps by the inner clock, before their
+  deadline on their own. The nested `block_on` now swaps in the inner runtime's wheels: the
+  shard's loop runs under the outer runtime and fires its timers by its clock, the nested
+  future's polls run under the inner runtime, and the inner wheels fire between polls by theirs.
+  A single runtime takes the path it took before. The limits: on a worker's shard, whose polls
+  the handoff may take, the nested runtime's sleeps share the worker's wheels and fire by the
+  worker's runtime's clock, and on a thread's own shard each runtime keeps its own; a sleep made
+  inside the nested `block_on` and polled after it returned reads as elapsed; with three runtimes nested, the
+  outermost one's timers wait until the inner frame returns; the inner runtime's paused clock
+  does not count this shard (`proofs/tla/clock/OneWheel.tla`, `OW_wheels`, and the mutation
+  `M_one_wheel`, the code before).
+- **A reentrant lock request that queued before its owner took the lock enters at once.** A
+  `ReentrantMutex` lock, or a `ReentrantRwLock` read, looked for its owner only on its first
+  poll; once queued it only looked at its place in line. So an owner with two requests out at
+  once (`join!(lock.write(&me), lock.read(&me))` behind another owner) took the write with the
   first and left the second waiting for a share its own write kept out, and the join, which held
   the write until the read ended, hung. A queued `ReentrantRwLock` write whose owner read
   meanwhile waited for that read instead of failing with `ReadHeldByOwner`, and two queued reads
   of one owner granted together claimed two records. Every poll now looks for the owner first,
   queued or not: a request whose owner holds the lock leaves the line, passing on a share it was
-  granted, and enters on the owner's record; a write whose owner reads is refused. A request is
-  not woken for that, so one last polled before its sibling entered (a `join!` that polls it
-  first, or another task of the same owner) still waits as another owner's would
-  (`proofs/tla/reentrant`, `L_join`, `RW_join_write_read`, `RW_join_reads`,
-  `RW_write_queued_read`, and the witness `W_join_young_first`).
+  granted, and enters on the owner's record; a write whose owner reads is refused. And the entry
+  that makes an owner the holder (the mutex's, the write's, the first read's) wakes the owner's
+  other queued requests on that lock, so one last polled before its sibling entered (a `join!`
+  in either order, or another task of the same owner) no longer waits as another owner's would.
+  The requests of one thread are kept in a thread-local list, which an entry reads with one load
+  when it is empty (`proofs/tla/reentrant`, `L_join`, `RW_join_write_read`, `RW_join_reads`,
+  `RW_write_queued_read`, `L_join_young_first`, and the mutation `M_no_sibling_wake`).
+- **A panicking waker loses no permit, node, message or wake in the atomic primitives.** A
+  waker is user code, and its wake, clone or drop may panic. A lock, semaphore or send that took
+  what it waited for and was then refused by the spent budget woke its task before it gave the
+  permit back, so a panic in that wake lost the permit for good; a wait that cloned its waker
+  after taking a node from the pool left the node out, a clone that panicked while the node
+  registered left it registering for good (a release then granted it without a wake), and the
+  waker a withdrawing wait dropped ran before the pass its nudge asks for. The take of a nudged
+  retry, and of the follow-up pass of a last-chance take, was lost when the pass's wakes
+  panicked, and a second panicking waker in one wake list aborted the process. Now the budget's
+  refusal gives back first and wakes after; a wait clones before it takes a node; a node whose
+  clone panics is settled and armed with its nudge kept; a withdrawing wait releases its node and
+  drops the old waker after the owner's pass; the takes give back on unwind; and the rest of a
+  wake list is woken even when a second waker panics. The panic still reaches the caller
+  (`proofs/tla/coop`, `WakePanics` and `M_wake_before_give_back`; `proofs/tla/waiter`).
+- **The waker cell is usable after a panicking clone.** `AtomicWaker::register` clones the
+  waker while it holds the cell; a clone that panicked left the cell registering for good, so
+  every later registration woke its caller at once and every wake took nothing, and the wake
+  of a taken waker that panicked in the failure path skipped the waker it displaced. The cell
+  is now given back as the failure path gives it back, and a wake that met the registration is
+  delivered to the waker the cell held; the displaced waker is woken even when the wake before
+  it panics (`proofs/tla/atomicwaker`, `A_clone_panics`, `A_clone_panics_displacing` and the
+  mutation `M_clone_unguarded`).
+- **A receive keeps the value it popped when a sender's waker panics.** Receiving a value gives
+  its slot back, which wakes a sender waiting for one; a sender's waker that panicked unwound
+  the receive with the value in hand, and it was dropped. The value now goes to a stash the
+  receiver owns and the next receive returns it first, once, without a second release, and it
+  counts in `len`; the pop costs nothing for it (the stash is read in a branch each queue takes
+  rarely anyway). The unbounded and local channels do the same. A value whose `Drop` panics as
+  a `broadcast` or `watch` channel retires it needed no change: the channel stays usable and no
+  message is lost, but the panic can surface in whichever thread runs kovan's reclamation, not
+  only the sender's (`proofs/tla/mpsc/Stash.tla`, `M_pop_lost` and
+  `M_stash_released_again`; `proofs/tla/localchan`, `MLC_pop_lost`).
+- **The local primitives survive a re-entrant or panicking waker.** The single-shard channel,
+  one-shot channel and semaphore called wakers while their state was half changed. A waker's
+  clone is user code that may send, close or release: a receive that registered its waker and
+  then slept missed what the clone did, as did a `closed()` wait and a semaphore acquire, which
+  now look again after the clone. A `close` or a semaphore's serve loop whose first waker
+  panicked left the other waiters asleep; both now finish the loop before the panic goes on
+  (`proofs/tla/localchan`, `MLC_no_relook`, `MLC_closed_no_relook`, `MLO_no_relook`,
+  `MLC_close_stops_at_panic`; `proofs/tla/localsemaphore`, `M_join_after_clone`,
+  `M_serve_stops_at_panic`).
+- **A timer's waker that panics does not stop the other timers or the worker.** The timer fire
+  loop took every due timer out of the wheel, then called the wakers one by one; a waker that
+  panicked left the rest, whose timers were gone, never woken, and in a worker's own loop the
+  panic ended the worker and lost its shard. Every fired timer is now woken. In the worker's
+  loop the panic is caught, logged at error and the loop runs on; `time::advance`, run by a
+  task, hands the panic to that task (`proofs/tla/timer/FireLoop.tla`, `MFL_drop_on_panic` and
+  `MFL_run_loop_uncaught`).
+- **Nested blocking frames never wait on each other with the lock free.** A task on a shard that
+  called `blocking_lock` (or `blocking_acquire`, `blocking_read`, `blocking_write`,
+  `blocking_send`) ran a nested `block_on` that polls only its own wait. If a task that frame
+  ran blocked too, its frame sat on top, and a release that granted or nudged the first wait
+  could not be seen until the top frame ended: the top frame waited behind it for good with the
+  lock free. A frame that opens now makes the queued blocking waits of the frames under it give
+  up their place in line, passing on a grant or a nudge they hold as a dropped wait does; once
+  its frame is on top again such a wait is polled and asks again, at the back
+  (`proofs/tla/stall`, `N_nested_frames`, `N_nested_three` and the mutation `M_no_freeze`).
 - **A `Notified` that takes a stored permit after a broadcast it was owed passes the permit on.**
   A `Notified` looks at the generation, then takes a stored permit, in two steps. A
   `notify_waiters` and a `notify_one` between them left a waiter the broadcast had served holding
   the permit too, so a waiter made after the `notify_one` found none and waited for good. A waiter
   that took the permit looks at the generation again and passes the permit on when it moved
   (`proofs/tla/notify/Notify.tla`, `L_owed_permit` and the `no_recheck` mutation; one load more on
-  the path that takes a permit). The queue's pass reads the generation once as well, and a
-  broadcast and a `notify_one` that land while it runs still lose the permit to a waiter the
-  broadcast woke; that path is open (the witness `W_owed_to_woken`).
+  the path that takes a permit). A `notify_one` that lands just after a broadcast while a pass runs
+  no longer goes to a waiter that broadcast woke: each owed count is kept in one word with the
+  generation it was made at, and the pass reads the generation before it takes the counts and gives
+  a word of a newer generation back for the pass that generation's broadcast asks for, so its
+  counts go to that generation's waiters or to the permit, and one made before the broadcast to a
+  waiter the broadcast woke, which then leaves no permit (`proofs/tla/notify/Notify.tla`, the
+  `split_word`, `owed_before_generation`, `newer_as_old` and `old_to_permit` mutations;
+  `proofs/lean/Nuclei/Notify.lean`, the owed word).
 - **A barrier leader's wait polled again after it completed counts no second arrival.** The
   leader's `BarrierWait` kept no mark that it led, so a poll after its `Ready` arrived again: the
   phantom stood in for a real arrival, the next generation completed one task short, and a wait
@@ -567,15 +724,106 @@
   than 2^32 periods (49 days at a millisecond), its next tick was still in the past and fired at
   once. It now takes what is left of the period now falls in, so the next tick is the next one
   of the schedule after now (`proofs/tla/interval/Interval.tla`).
+- **A shard's inbox keeps its own node by a raw pointer, not a `Box`.** The queue's ends point at
+  the node, and each move of the inbox (into its shard, its pool or a `JoinSet`) made the `Box`
+  claim the node alone, so the next push or take through those ends broke Rust's aliasing rules
+  (found by Miri). The node is now held raw and freed with the inbox, also when an item's drop
+  panics as the inbox drains.
+- **A Unix socket address for an empty path no longer hands C a dangling pointer.** The check for
+  a NUL in the path passed an empty path's dangling pointer to `memchr`, which wants a valid
+  pointer even for no bytes (found by Miri); an empty path now holds no NUL without the call.
+- **A dropped `lock_file` holds no thread** (every backend). `lock_file` was std's blocking lock
+  made as a job of the blocking pool, and a future dropped while the job waited in the kernel could
+  not reach it: a lock another process kept for good kept a pool thread for good, and with enough
+  of them every file call waited. It now asks the kernel with the call that never waits (std's
+  `try_lock`: `flock` with `LOCK_NB`, `LockFileEx` with `LOCKFILE_FAIL_IMMEDIATELY` on Windows) on
+  the calling thread, and while another holder has the lock sleeps on a timer, from 50
+  microseconds doubling to 20 milliseconds, and asks again. A future dropped while it waits holds
+  nothing. Such a lock takes no place in the kernel's line of waiters
+  (`proofs/tla/flock/FileLock.tla`: `M_lock_keeps_pool`, `M_try_apart`, `M_no_timer`).
+- **Reads after `shut(Read)` answer the end on Windows too, and bytes a receive brings after it are
+  dropped** (Windows; macOS and the BSDs). A completion port's receive made before the shut could
+  complete after it, and its bytes became read-ahead that the next read returned, where std's read
+  answers the end; and a read after the shut went to the kernel, which answers Windows' error
+  (`WSAESHUTDOWN`) where unix answers the end. Where the kernel drops its queue as it shuts the
+  reading half, the side is now marked shut as it drops what it read ahead: every later read
+  answers the end with no call, and a receive's late bytes are dropped as they come. Linux is
+  unchanged: it hands out what came before the shut, then the end
+  (`proofs/tla/close/ShutRead.tla`: `M_late_kept`, `M_kernel_answers`).
+- **A completion the kernel drops no longer ends its shard** (io_uring). When a ring's completion
+  queue is full and the kernel cannot allocate an entry to hold a completion past it (a memory
+  cgroup at its limit can do that), it drops the completion and its next wait answers `EBADR`,
+  once. The shard panicked on that answer, ending every task on it. It now counts what the
+  kernel's count says it dropped, in the new `Stats::completions_dropped`, says it at error, and
+  recovers, whether the kernel said so with `EBADR` or a busy shard that never sleeps saw the
+  count grow: it cancels every operation it still has out, and each one still in the kernel ends
+  with that cancel and is made again; one whose end never comes is ended for its task a bounded
+  time later (a socket's operation and a child's exit watch after 1 s, a file's call after the
+  runtime's linger time) with an error that says the kernel dropped its completion. An operation
+  ended that way keeps its memory until the kernel ends it, so a late completion is still safe; a
+  zero-copy send whose bytes went and that only holds its buffer until the peer acknowledges them is
+  left to hold it, no task waiting on it (`proofs/tla/admission/Admission.tla`:
+  `M_panic_on_dropped`, `M_drop_uncounted`, `M_poll_end_dropped`, `M_skip_sweep`, `M_no_cancel`,
+  `G_dropped_recovers`).
+- **An operation a full ring table cannot take ends with `ENOMEM`** (io_uring). The ring's table
+  of operations in flight holds 2^31 - 1 of them. One it could not take ended with `ENOBUFS`,
+  which a multishot receive reads as its buffer group running dry: it armed again at once, met the
+  full table again, and spun. It now ends with `ENOMEM`, the resource it ran out of, as a child's
+  exit watch past its own table does.
 
-- **An interval never panics on a tick past the clock's range, and a skip lands after now
-  however far behind it is.** The next tick was the last one plus the period with `+`, which
-  panics past the clock's range: `interval(Duration::MAX)` panicked in its first tick, and
-  `reset` did the same. Such a tick now waits in the far future, as a timeout's deadline does,
-  so a period too large ticks once. `Skip` counted the periods it missed in a `u32`: late by more
-  than 2^32 periods (49 days at a millisecond), its next tick was still in the past and fired at
-  once. It now takes what is left of the period now falls in, so the next tick is the next one
-  of the schedule after now (`proofs/tla/interval/Interval.tla`).
+- **`worker_index`, `stop_current_thread` and `Proactor::backend` answer for the worker in the
+  rest of a poll the handoff took.** Once the monitor moved a blocked worker's shard to another
+  thread, the rest of that poll ran on a thread with no shard: `worker_index()` answered `None`,
+  `stop_current_thread()` stopped nothing (its task ran on the thread's own shard, which is no
+  worker), and `Proactor::backend()` answered the platform's default. They now answer for the
+  shard the poll lost, the worker the code runs for (`proofs/tla/handoff/Detached.tla`).
+- **A spawn from the rest of a blocked poll, with no worker taking tasks, runs.** A task that is
+  not bound, spawned there when every worker had stopped taking tasks, was queued on the thread's
+  own shard, which runs nothing until the poll returns: it waited there until the thread's next
+  `block_on`, or was dropped unrun as the thread exited. It now goes
+  to the shard the poll lost, whose new thread runs it (`proofs/tla/handoff/Detached.tla`).
+- **`blocking_*` calls and a nested `block_on` in the rest of a blocked poll no longer spin, hang
+  or lose a wake.** A blocking call there parked the thread, so a task bound to it (`spawn_local`)
+  never ran and the call never returned; a wait polled with the spent budget of the poll around
+  it refused every poll and spun; and a nested `block_on` on the thread's own shard had the wake of
+  a bound task sent to the shard's new thread, not to it, once its loop slept. The call now runs
+  on the thread's own shard, the home of its bound tasks aimed at it from the take on, and a wait's
+  polls are unbudgeted. On `wasm32` a spent budget also made a free lock answer the "waits for
+  something its own thread holds" panic; its one poll is unbudgeted too
+  (`proofs/tla/handoff/Detached.tla`).
+- **A file write made in the rest of a blocked poll is counted on its worker.** The write was
+  counted on no shard, so a runtime's drop did not wait for it. It is now counted on the shard the
+  poll lost, and the drop waits for it as for any other write (`proofs/tla/handoff/Detached.tla`).
+- **The tasks bound to a worker's thread run while its inbox stays full.** A worker took its
+  thread's bound tasks only once its inbox was empty, so other threads that kept waking its tasks
+  held them off for as long as they did. Every `global_queue_interval` runs, which look at the work
+  other threads woke first, every other one now looks at the bound tasks first
+  (`proofs/tla/sched/Sched.tla`, which checks every place work waits in is served within a bound
+  of runs: the LIFO slot's cap, the inbox interval, the home's turn and the `block_on` future's
+  owed runs).
+- **A cancel answers `None` only once the task's output is gone.** A handle that cancelled during
+  the poll that completed its task saw the task closed and not running while the run still held
+  the output, so `cancel` answered `None` with that output alive and its drop still to come. The
+  run now drops the output before it clears the task's running flag
+  (`proofs/tla/task/Task.tla`).
+- **A worker's last look before it parks reads the posted timer and IO counts in order**
+  (aarch64 and other weak-memory machines). The look followed the store of the parked flag but
+  could pass it, and held only because the inbox's look came first; it is now sequentially
+  consistent (`proofs/tla/handshake/ParkLook.tla`).
+- **The long-poll hook is not told the next poll's task under the word of the one before** (aarch64
+  and other weak-memory machines). The monitor's reads of the poll word and the task are now
+  ordered (`proofs/tla/longpoll`).
+- **A worker that stops waits a bounded time for the threads that hold its sources.** It yielded
+  for as long as a holder on another thread did not let go. It now yields briefly, then sleeps in
+  growing steps, and past one second stops waiting, logs a warning and counts it in
+  `ErrorCounts::evictions_given_up`; the source's registration ends when the holder does
+  (`proofs/tla/going/Pending.tla`).
+- **A run loop whose park keeps backing out still looks at its driver.** A shard about to park with
+  its spin cold that found work posted after its last look started its count of runs to the next
+  look at timers and the poller over without looking; work posted at that moment, again and again,
+  kept the poller from ever being looked at. Such a back-out now keeps the count, and counts like a
+  turn in which the future woke itself, so every `driver_interval`th one looks without waiting
+  (`proofs/tla/loop/RunLoop.tla`).
 
 ### Changed
 
@@ -589,6 +837,15 @@
   one-shot channel, the remote timer and the paused clock) has a configuration that removes it
   and must fail. The owner-named lock, which nothing used, is gone (`proofs/README.md`, "More
   sync and time models").
+- **The hangup's mark on epoll and kqueue has a model.** As the driver serves the edge of a
+  stream whose peer closed (`EPOLLRDHUP`, kqueue's `EV_EOF`) it marks the side unsure before the
+  serve wakes the task, so neither a count of what is left that leaves the end out (a Unix
+  stream's `SO_INQ`) nor a TCP read shorter than it asked for has the task wait for an edge the
+  hangup already was. `proofs/tla/starve` now checks it with each peer closing after its request,
+  and fails with a hangup that marks nothing and with a mark applied only after the serve
+  (`MFS_hangup_sure`, `MFS_unsure_after_serve`). The liveness runs of a file's reads and writes
+  tell states apart only by what a step reads (`LiveView` in `proofs/tla/lent/LentFile.tla`), so
+  the longest, `PF_live`, takes 49 s at one worker instead of 122 s.
 - **A task's panic stays for its handle after a cancel, and a panic nobody awaits is logged.** A
   task cancelled while its poll panicked, or whose future panicked as the cancel dropped it, now
   completes with that panic for the handle that cancelled it: `cancel().await` resumes it and
@@ -669,6 +926,14 @@
   so a read the page cache serves spills nothing: 2617 to 2596 per read on io_uring, but each read
   that misses the cache 35 more on io_uring and 75 more on epoll, and with only the submit and the
   wait out of line still about 20 more on io_uring.
+- **CI runs the Miri-safe unit tests under Miri.** The unit tests that make no system call Miri
+  cannot carry out run under Miri with Tree Borrows, the lock-free structures underneath with
+  them (`.github/workflows/miri.sh` names them and says why each group can run).
+- **A future its user never polls again is a documented limit.** The fair queues of the locks,
+  semaphores and bounded channels hand what is freed to the waiter at their front and serve
+  nobody else until it acts, so a waiting future that is kept but never polled again holds its
+  place, and the waiters behind it wait until it is polled or dropped
+  (`proofs/tla/stall/Stall.tla`).
 
 ## 0.5.3
 

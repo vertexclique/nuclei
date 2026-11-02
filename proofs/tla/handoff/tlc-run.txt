@@ -162,3 +162,29 @@ M_no_second_look                   142         73      1  violated:Watched      
 W_backout_asleep                    50         31      1  violated:NoBackOutAsleep              violated:NoBackOutAsleep              yes
 
 results matching EXPECTED.txt: 55 of 55
+
+Added and rechecked since, run locally on 2026-11-03, one worker each, at the lowest priority on a
+shared host: a take with no spare waiting, two limits of the rescue, the store-buffer mutations of
+Asleep.tla and the signal's reuse (SignalReuse.tla). These times replace any above. The rest of the
+family was not rerun as a whole: D_safe (286951 distinct), N_safe (283406), L_rescue (120736),
+H_safe (4903665), H_rescue (40251), M_no_fence, W_handoff and M_owner_skips_running were rerun and
+keep the state counts of the model before these changes, run the same day.
+
+configuration                 generated   distinct    sec  result                                expected                              match
+G_wait                          301627      86676     21  pass                                  pass                                  yes
+G_wait_spare                     49613      15476      5  pass                                  pass                                  yes
+M_start_drops_gift               35161      11477      4  violated:Rescued                      violated:Rescued                      yes
+W_inside_block                      21         12      1  violated:Rescued                      violated:Rescued                      yes
+M_hook_blocks                     1435        551      2  violated:Rescued                      violated:Rescued                      yes
+A_safe                             171         86      1  pass                                  pass                                  yes
+M_no_backout_ring                  151         78      1  violated:Watched                      violated:Watched                      yes
+M_no_wake_ring                     160         80      0  violated:Watched                      violated:Watched                      yes
+M_no_second_look                   142         73      1  violated:Watched                      violated:Watched                      yes
+W_backout_asleep                    50         31      1  violated:NoBackOutAsleep              violated:NoBackOutAsleep              yes
+M_asleep_look_first                174         91      1  violated:Watched                      violated:Watched                      yes
+M_backout_look_first               244        125      1  violated:Watched                      violated:Watched                      yes
+SR_safe                            101         63      1  pass                                  pass                                  yes
+MS_reuse_held                       22         17      1  violated:NoStaleWake                  violated:NoStaleWake                  yes
+MS_reuse_moved_kept                 20         15      1  violated:WakesItsShard                violated:WakesItsShard                yes
+SR_moved_unchecked                 101         63      0  pass                                  pass                                  yes
+SR_keep_unguarded                  101         63      1  pass                                  pass                                  yes

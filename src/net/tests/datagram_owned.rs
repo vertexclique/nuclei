@@ -58,7 +58,11 @@ fn udp_owned_receive_appends_and_cuts_to_the_spare_capacity() {
         let mut buf = Vec::with_capacity(8 + 40);
         buf.extend_from_slice(b"prefix!!");
         let (got, buf) = within(b.recv_from_owned(buf)).await;
+        // Windows answers a longer datagram `WSAEMSGSIZE`, as std's does, the buffer holding what fits.
+        #[cfg(unix)]
         assert_eq!(got.unwrap().0, 40);
+        #[cfg(windows)]
+        assert_eq!(got.unwrap_err().raw_os_error(), Some(10040));
         assert_eq!(&buf[..8], b"prefix!!");
         assert_eq!(&buf[8..], &pattern(100)[..40]);
         // The cut part is gone: the next receive waits for the next datagram.

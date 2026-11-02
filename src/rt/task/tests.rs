@@ -1,9 +1,12 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use super::join::Task;
 use super::{Runnable, Schedule, ScheduleInfo, spawn, spawn_unchecked};
@@ -610,3 +613,59 @@ fn a_detached_task_whose_last_waker_goes_during_its_poll_drops_its_future() {
 }
 
 mod panics;
+
+/// An output whose drop takes a while, then says it is done.
+struct SlowDrop(Arc<AtomicBool>);
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        std::thread::sleep(Duration::from_millis(50));
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A cancel that finds the task closed and not running answers `None` only
+/// once the output the poll made is dropped (proofs/tla/task/Task.tla, `R_out`).
+#[test]
+fn a_cancel_answers_none_only_once_the_output_is_dropped() {
+    const WAIT: Duration = Duration::from_secs(20);
+    let rt = crate::runtime::Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .build()
+        .unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (started_tx, started) = mpsc::channel::<()>();
+    let (polled_tx, polled) = mpsc::channel::<()>();
+    let output = SlowDrop(Arc::clone(&dropped));
+    let task = rt.spawn(async move {
+        started_tx.send(()).expect("the test is waiting");
+        polled
+            .recv_timeout(WAIT)
+            .expect("the canceller polled its cancel future");
+        output
+    });
+    started
+        .recv_timeout(WAIT)
+        .expect("the task never started its poll");
+    let mut cancel = Box::pin(task.cancel());
+    assert!(cancel.as_mut().poll(&mut noop_cx()).is_pending());
+    polled_tx.send(()).expect("the task is waiting");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match cancel.as_mut().poll(&mut noop_cx()) {
+            Poll::Ready(answer) => {
+                assert!(answer.is_none(), "a cancel of a closed task has no output");
+                break;
+            }
+            Poll::Pending => {
+                assert!(Instant::now() < deadline, "the cancel never answered");
+                std::thread::yield_now();
+            }
+        }
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the cancel answered None while the output was alive"
+    );
+}

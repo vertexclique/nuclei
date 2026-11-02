@@ -308,6 +308,37 @@ fn a_peek_leaves_the_bytes_for_the_read() {
     });
 }
 
+#[cfg(completion)]
+#[test]
+fn a_receive_completing_after_the_drop_ahead_brings_no_bytes() {
+    use super::ops::{Answer, Done, Outcome};
+    let rt = runtime(None);
+    let (_a, b) = pair();
+    rt.block_on(async {
+        within(poll_fn(|cx| b.src.poll_drop_ahead(cx)))
+            .await
+            .unwrap();
+        // A receive made before the shut, completing after it.
+        let mut buf = crate::buf::with_pool(|pool| pool.and_then(|p| p.get(16))).unwrap();
+        buf.spare()[..5].copy_from_slice(b"late!");
+        buf.set_filled(5);
+        b.src.ops_out.fetch_add(1, Ordering::SeqCst);
+        b.src.op_done(
+            Done {
+                outcome: Outcome::Recv(buf, Answer::Done(Ok(5))),
+                epoch: 0,
+                read: true,
+            },
+            None,
+        );
+        let mut out = [0u8; 8];
+        for _ in 0..2 {
+            assert_eq!(within(read(&b.src, &mut out)).await.unwrap(), 0);
+        }
+        assert_eq!(out, [0u8; 8], "no late byte reached the caller");
+    });
+}
+
 #[test]
 fn the_end_of_a_stream_reads_as_zero() {
     let rt = runtime(None);

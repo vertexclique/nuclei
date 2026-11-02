@@ -15,24 +15,30 @@
 //!
 //! A write that failed is reported by the sync, as by a flush (which then
 //! forgets it, as a stream does). A failed sync is reported, and every sync of
-//! the handle called after it fails with the same error without a call: the
-//! kernel reports a write-back error to one call only, so a later call that
-//! succeeded would say nothing of the data that did not reach the device. Both
+//! the handle or a clone called after it fails with the same error without a
+//! call: the kernel reports a write-back error to one call only, so a later
+//! call that succeeded would say nothing of the data that did not reach the
+//! device. Both
 //! are kept in the handle's [`Lost`], which no report forgets: a write the
 //! handle accepted and the kernel then failed (whoever took its failure: a
 //! flush, a call beside the reads and writes, `get_mut`, the drop), and a sync
 //! call that failed. Every sync reads it before it makes a call, and fails with
 //! it. The handle keeps it across `get_mut`, and its clones (`try_clone`, the
 //! same open file, whose error the kernel reports to one of them) share it.
-//! So that no failure the kernel reports goes unseen, the calls are
-//! the file state's, not their tasks' ([`Syncs`]): the handle makes one at a
-//! time, a sync whose call would go beside another's waiting for that one's
-//! end (two at once, the kernel could report the error to one and the other's
-//! task look first, `MF_sync_unserialized`), and a task that goes away with
-//! its call out (a timeout dropped its future) leaves the call to the state,
-//! whose next sync takes its end and its failure (`MF_sync_task_records`). A
-//! sync fails for its own call's failure and for one of a call made before
-//! its own, never for a later call's (`MF_sync_any_failure`).
+//! So that no failure the kernel reports goes unseen, the calls are the
+//! record's, not their tasks' ([`Syncs`]), and the record is the handle's and
+//! its clones' together: they make one call at a time across them all, a sync
+//! whose call would go beside another's (the handle's or a clone's) waiting for
+//! that one's end. The kernel reports a lost write-back of the open file to one
+//! call only, so a call made beside another could find no error and answer Ok
+//! for writes that never reached the device, though the other call took it
+//! (`proofs/tla/lent/LentFile.tla`, scenario "sync_clone_race", mutation
+//! `syncs_per_handle`; for one handle, `MF_sync_unserialized`). A task that
+//! goes away with its call out (a timeout dropped its future) leaves the call
+//! to the record, whose next sync, of either handle, takes its end and its
+//! failure (`MF_sync_task_records`). A sync fails for its own call's failure
+//! and for one of a call made before its own, never for a later call's
+//! (`MF_sync_any_failure`).
 //!
 //! A sync of a range of the file (`sync_range`) is the same call with
 //! another kind: on Linux `sync_file_range(2)` (an `IORING_OP_SYNC_FILE_RANGE`
@@ -47,10 +53,12 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::io;
 use std::sync::Arc;
+use std::task::Wake;
 
-use super::FileIo;
+use super::{FILE_SLOTS, FileIo};
 #[cfg(ring)]
 use crate::fs::call::SlotJob;
+use crate::io::side::{After, Hooks, Side, WakerSet};
 use crate::io::source::Failure;
 use crate::io::source::requests::Lease;
 use crate::rt::task::Join;
@@ -77,12 +85,23 @@ impl FileIo {
     pub(crate) async fn sync(self: &Arc<Self>, kind: SyncKind) -> io::Result<()> {
         poll_fn(|cx| self.poll_flush(cx)).await?;
         let mut mine = 0;
-        poll_fn(|cx| {
-            self.with_state(cx, |st, io, waker, _| {
-                st.syncs.poll(io, kind, &mut mine, waker)
-            })
-        })
-        .await
+        poll_fn(|cx| self.lost.poll_sync(self, kind, &mut mine, cx.waker())).await
+    }
+
+    /// How many sync calls the record shared with this handle's clones made.
+    #[cfg(test)]
+    pub(crate) fn sync_calls_made(&self) -> u64 {
+        self.lost.made.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fails the next `n` sync calls made on the blocking pool by this handle
+    /// or its clones, as a device that lost a write-back would, without a
+    /// call: the system reports it to whichever call looks first.
+    #[cfg(test)]
+    pub(crate) fn fail_next_syncs(&self, n: u32) {
+        self.lost
+            .fail_syncs
+            .store(n, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// A sync call of `kind`: on the ring of this thread's shard where it
@@ -105,7 +124,7 @@ impl FileIo {
         }
         let fd = self.fd.clone();
         #[cfg(test)]
-        let fails = self.sync_fails();
+        let fails = self.lost.sync_fails();
         SyncCall::Pool(
             crate::runtime::spawn_blocking(move || {
                 #[cfg(test)]
@@ -119,9 +138,10 @@ impl FileIo {
     }
 }
 
-/// The handle's sync calls, kept by the file state rather than by the tasks
-/// that make them: one out at a time, and the number of the first that
-/// failed (`proofs/tla/lent/LentFile.tla`, scenario "sync").
+/// The sync calls of a handle and its clones, kept by their shared record
+/// rather than by the tasks that make them: one out at a time across all of
+/// them, and the number of the first that failed
+/// (`proofs/tla/lent/LentFile.tla`, scenarios "sync" and "sync_clone_race").
 #[derive(Default)]
 pub(super) struct Syncs {
     /// The call out, or ended and not taken yet, and its number.
@@ -132,27 +152,115 @@ pub(super) struct Syncs {
     ended: u64,
     /// The first call that failed, and its failure: every sync whose own
     /// call came after it, or was it, fails, and so does every sync called
-    /// after it, without a call (through the handle's [`Lost`]).
+    /// after it, without a call (through the [`Lost`]).
     failed: Option<(u64, Failure)>,
 }
 
-/// What a handle's syncs answer once a byte it accepted may not be on the
-/// device: the first write the kernel failed after the handle accepted it,
-/// or the first sync call that failed. Kept for good, by the handle across
-/// `get_mut` and by its clones, which share one (`proofs/tla/lent/LentFile.tla`,
-/// scenarios "sync_lost" and "sync_clone").
-#[derive(Default)]
-pub(crate) struct Lost(std::sync::OnceLock<Failure>);
+/// What the syncs of a handle and its clones answer once a byte it accepted
+/// may not be on the device: the first write the kernel failed after the
+/// handle accepted it, or the first sync call that failed. Kept for good, by
+/// the handle across `get_mut` and by its clones, which share one. It holds
+/// their sync calls too, one at a time across them all: the kernel reports a
+/// lost write-back of the open file to one call only, so a call beside
+/// another's could answer Ok after the other took the error
+/// (`proofs/tla/lent/LentFile.tla`, scenarios "sync_lost", "sync_clone" and
+/// "sync_clone_race").
+pub(crate) struct Lost {
+    failure: std::sync::OnceLock<Failure>,
+    /// The calls, behind the guard.
+    calls: Side<Syncs>,
+    /// Tasks waiting on a call of any of the handles: all woken when a call ends.
+    waiters: WakerSet<FILE_SLOTS>,
+    /// How many calls were made, for a test.
+    #[cfg(test)]
+    made: core::sync::atomic::AtomicU64,
+    /// How many of the next sync calls on the blocking pool fail without a
+    /// call, for a test of a write-back the device lost.
+    #[cfg(test)]
+    fail_syncs: core::sync::atomic::AtomicU32,
+}
+
+impl Default for Lost {
+    fn default() -> Self {
+        Self {
+            failure: std::sync::OnceLock::new(),
+            calls: Side::new(Syncs::default()),
+            waiters: WakerSet::new(),
+            #[cfg(test)]
+            made: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            fail_syncs: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
 
 impl Lost {
     /// Keeps `failure`, unless one is kept already.
     pub(crate) fn keep(&self, failure: Failure) {
-        let _ = self.0.set(failure);
+        let _ = self.failure.set(failure);
     }
 
     /// The failure kept, if any.
     pub(crate) fn get(&self) -> Option<Failure> {
-        self.0.get().copied()
+        self.failure.get().copied()
+    }
+
+    /// One poll of a sync of `kind` made through `io`, whose own call is
+    /// numbered `mine` (0 until it made one): the task is woken when any call
+    /// of the record ends, or, if another task holds the calls, when that one
+    /// lets go.
+    fn poll_sync(
+        self: &Arc<Self>,
+        io: &FileIo,
+        kind: SyncKind,
+        mine: &mut u64,
+        task: &Waker,
+    ) -> Poll<io::Result<()>> {
+        self.waiters.register(task);
+        let waker = Waker::from(Arc::clone(self));
+        let mut after = After::default();
+        let out = self.calls.poll(&mut after, task, &CallHooks, |calls, _| {
+            calls.poll(self, io, kind, mine, &waker)
+        });
+        after.run();
+        out
+    }
+
+    /// Whether the sync call made now is one [`FileIo::fail_next_syncs`] fails.
+    #[cfg(test)]
+    fn sync_fails(&self) -> bool {
+        self.fail_syncs
+            .try_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+    }
+}
+
+impl Wake for Lost {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let mut after = After::default();
+        self.waiters.take_all(&mut after);
+        after.run();
+    }
+}
+
+/// What the holder of the calls does for the work others left it: nothing,
+/// the record has no driver and its calls wake the waiting tasks instead.
+struct CallHooks;
+
+impl Hooks<Syncs> for CallHooks {
+    fn serve(&self, _st: &mut Syncs, _after: &mut After) {}
+
+    // The record's side takes through its word only (`Side::new`).
+    fn releases_inline(&self) -> bool {
+        true
     }
 }
 
@@ -183,11 +291,12 @@ impl SyncCall {
 
 impl Syncs {
     /// A sync of `kind` whose own call is numbered `mine` (0 until it made
-    /// one), under the file state: first the end of the call out, whoever's,
+    /// one), under the record's guard: first the end of the call out, whoever's,
     /// is taken (`waker` is woken when it comes); then the sync answers if
     /// its own call ended, fails if a call failed, or makes its call.
     pub(super) fn poll(
         &mut self,
+        lost: &Lost,
         io: &FileIo,
         kind: SyncKind,
         mine: &mut u64,
@@ -201,21 +310,24 @@ impl Syncs {
                 });
             }
             if self.out.is_some() {
-                core::task::ready!(self.take(io, waker));
+                core::task::ready!(self.take(lost, waker));
                 continue;
             }
-            if let Some(failure) = io.lost.get() {
+            if let Some(failure) = lost.get() {
                 return Poll::Ready(Err(failure.error()));
             }
             self.made += 1;
+            #[cfg(test)]
+            lost.made
+                .store(self.made, core::sync::atomic::Ordering::Relaxed);
             *mine = self.made;
             self.out = Some((self.made, io.sync_call(kind)));
         }
     }
 
     /// Takes the end of the call out once it came, keeping its failure if
-    /// it is the first, in the handle's record too.
-    fn take(&mut self, io: &FileIo, waker: &Waker) -> Poll<()> {
+    /// it is the first, in the record too.
+    fn take(&mut self, lost: &Lost, waker: &Waker) -> Poll<()> {
         let Some((at, call)) = self.out.as_mut() else {
             return Poll::Ready(());
         };
@@ -226,7 +338,7 @@ impl Syncs {
         {
             let failure = Failure::of(&err);
             self.failed = Some((*at, failure));
-            io.lost.keep(failure);
+            lost.keep(failure);
         }
         self.out = None;
         Poll::Ready(())

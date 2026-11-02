@@ -430,6 +430,42 @@ fn has_no_peer(fd: RawFd) -> bool {
     ret < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOTCONN)
 }
 
+/// Whether the socket's peer is a loopback address: IPv4 127.0.0.0/8, IPv6 `::1`, or an
+/// IPv4-mapped loopback. `false` where the call fails or the peer has no IP address.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn peer_is_loopback(fd: RawFd) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most `len` bytes of address.
+    let ret = unsafe {
+        libc::getpeername(
+            fd,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    };
+    if ret < 0 {
+        return false;
+    }
+    let ip = match libc::c_int::from(storage.ss_family) {
+        libc::AF_INET => {
+            // SAFETY: the family says the kernel wrote a `sockaddr_in`, which fits the storage.
+            let a = unsafe { &*(&raw const storage).cast::<libc::sockaddr_in>() };
+            IpAddr::V4(Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: the family says the kernel wrote a `sockaddr_in6`, which fits the storage.
+            let a = unsafe { &*(&raw const storage).cast::<libc::sockaddr_in6>() };
+            IpAddr::V6(Ipv6Addr::from(a.sin6_addr.s6_addr))
+        }
+        _ => return false,
+    };
+    ip.is_loopback()
+        || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
+}
+
 /// Makes a descriptor nuclei just received its own: non-blocking where the
 /// call could not say so, close-on-exec, no `SIGPIPE`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -916,6 +952,9 @@ pub(crate) struct FileMode {
     /// straight between the caller's memory and the device, by its alignment
     /// rules. Apple's `F_NOCACHE` sets no such rule and is not this.
     pub(crate) direct: bool,
+    /// To sync each write (`O_DSYNC` or `O_SYNC`): a write returns once its
+    /// bytes are on the device.
+    pub(crate) sync: bool,
 }
 
 /// How the file `fd` was opened (`F_GETFL`).
@@ -926,9 +965,22 @@ pub(crate) fn file_mode(fd: RawFd) -> io::Result<FileMode> {
     let direct = flags & libc::O_DIRECT != 0;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let direct = false;
+    // `O_SYNC` includes `O_DSYNC`'s bits on Linux and Android.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let sync = flags & libc::O_DSYNC != 0;
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    let sync = flags & (libc::O_DSYNC | libc::O_SYNC) != 0;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd"
+    )))]
+    let sync = false;
     Ok(FileMode {
         append: flags & libc::O_APPEND != 0,
         direct,
+        sync,
     })
 }
 

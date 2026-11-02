@@ -1,80 +1,94 @@
-TLC run of every configuration in proofs/tla/task, 2026-11-01 04:56 UTC.
+TLC run of every configuration in proofs/tla/task, 2026-11-03 06:37 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-T_await                           1878        862      2  pass                                  pass                                  yes
-T_await_self                      8309       3618      2  pass                                  pass                                  yes
-T_cancel                         35537      15177      3  pass                                  pass                                  yes
-T_cancel_dropped_waker           14743       5678      2  pass                                  pass                                  yes
-T_detach                          4090       1772      2  pass                                  pass                                  yes
-T_drop                            7417       3216      2  pass                                  pass                                  yes
-T_drop_ref                        6350       2661      1  pass                                  pass                                  yes
-T_last_waker                       394        178      1  pass                                  pass                                  yes
-T_live_await                      8309       3618      4  pass                                  pass                                  yes
-T_live_cancel                    17709       7565      3  pass                                  pass                                  yes
-T_live_detach                      394        178      2  pass                                  pass                                  yes
-T_await_spurious                  5298       2474      1  pass                                  pass                                  yes
-M_wake_running_schedules          2297        986      1  violated:OnePoll                      violated:OnePoll                      yes
-M_run_drops_woken                 1092        470      2  deadlock                              deadlock                              yes
-M_free_ignores_handle              599        271      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
+T_await                           5672       2339      3  pass                                  pass                                  yes
+T_await_self                     19302       7806      2  pass                                  pass                                  yes
+T_cancel                         75056      30435      3  pass                                  pass                                  yes
+T_cancel_dropped_waker           25731       9663      2  pass                                  pass                                  yes
+T_detach                          5664       2386      2  pass                                  pass                                  yes
+T_drop                           11906       4956      2  pass                                  pass                                  yes
+T_drop_ref                        8891       3634      2  pass                                  pass                                  yes
+T_last_waker                       405        184      1  pass                                  pass                                  yes
+T_live_await                     19302       7806      4  pass                                  pass                                  yes
+T_live_cancel                    37617      15288      4  pass                                  pass                                  yes
+T_live_detach                      405        184      2  pass                                  pass                                  yes
+T_await_spurious                 17906       7398      2  pass                                  pass                                  yes
+M_wake_running_schedules          4836       1931      1  violated:OnePoll                      violated:OnePoll                      yes
+M_run_drops_woken                 1959        820      1  deadlock                              deadlock                              yes
+M_free_ignores_handle              652        296      2  violated:NothingAfterFree             violated:NothingAfterFree             yes
 M_cancel_drops_future              335        172      1  violated:FutureOnce                   violated:FutureOnce                   yes
-M_no_recheck                      1038        459      1  deadlock                              deadlock                              yes
-M_wake_no_ref                      960        450      2  violated:NothingAfterFree             violated:NothingAfterFree             yes
-M_detach_skips_last                707        319      1  violated:CleanEnd                     violated:CleanEnd                     yes
-M_complete_leaks_output            572        261      1  violated:CleanEnd                     violated:CleanEnd                     yes
+M_no_recheck                      2925       1235      2  deadlock                              deadlock                              yes
+M_wake_no_ref                     1546        696      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
+M_detach_skips_last               1008        448      2  violated:CleanEnd                     violated:CleanEnd                     yes
+M_complete_leaks_output            683        320      1  violated:CleanEnd                     violated:CleanEnd                     yes
 M_pending_leaks_future             296        129      1  violated:FreedAfterFuture             violated:FreedAfterFuture             yes
-M_release_after_complete          1553        690      2  violated:RunnerFreesNoAwaited         violated:RunnerFreesNoAwaited         yes
-M_pending_two_steps               4534       1940      1  violated:RunnerFreesNoAwaited         violated:RunnerFreesNoAwaited         yes
-M_pending_drops_woken              607        279      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
-M_closed_keeps_running            3690       1635      2  deadlock                              deadlock                              yes
-M_wake_running_entry               517        244      2  violated:RunnableScheduled            violated:RunnableScheduled            yes
-W_wake_while_running               133         71      2  violated:NoWakeWhileRunning           violated:NoWakeWhileRunning           yes
+M_release_after_complete          1932        858      1  violated:RunnerFreesNoAwaited         violated:RunnerFreesNoAwaited         yes
+M_pending_two_steps               7662       2992      2  violated:RunnerFreesNoAwaited         violated:RunnerFreesNoAwaited         yes
+M_pending_drops_woken              612        282      2  violated:NothingAfterFree             violated:NothingAfterFree             yes
+M_closed_keeps_running            9558       4026      1  deadlock                              deadlock                              yes
+M_wake_running_entry               704        323      2  violated:RunnableScheduled            violated:RunnableScheduled            yes
+M_closed_no_wait                   962        459      1  violated:CancelWaits                  violated:CancelWaits                  yes
+W_wake_while_running               133         71      1  violated:NoWakeWhileRunning           violated:NoWakeWhileRunning           yes
 W_cancel_while_running              51         30      2  violated:NoCancelWhileRunning         violated:NoCancelWhileRunning         yes
-W_cancel_in_queue                   82         47      2  violated:NoCancelInQueue              violated:NoCancelInQueue              yes
-W_register_meets_notify           1406        619      2  violated:NoRegisterMeetsNotify        violated:NoRegisterMeetsNotify        yes
+W_cancel_in_queue                   82         47      1  violated:NoCancelInQueue              violated:NoCancelInQueue              yes
+W_register_meets_notify           3534       1506      2  violated:NoRegisterMeetsNotify        violated:NoRegisterMeetsNotify        yes
 W_last_waker_close                 297        130      1  violated:NoLastWakerClose             violated:NoLastWakerClose             yes
-W_park_woken                      1194        529      2  violated:NoParkWoken                  violated:NoParkWoken                  yes
+W_park_woken                      3132       1329      2  violated:NoParkWoken                  violated:NoParkWoken                  yes
+M_output_after_exchange           6745       2935      1  violated:OutputGoneAtNone             violated:OutputGoneAtNone             yes
+TP_await                          6019       2472      2  pass                                  pass                                  yes
+TP_cancel                        79492      32257      3  pass                                  pass                                  yes
+TP_drop                          15335       6379      1  pass                                  pass                                  yes
+TP_detach                          405        184      2  pass                                  pass                                  yes
+TP_hook                          11547       4833      2  pass                                  pass                                  yes
+TP_shutdown                      24673      10087      1  pass                                  pass                                  yes
+TP_shutdown_cancel               98863      39895      3  pass                                  pass                                  yes
+TP_live                         122313      48625      6  pass                                  pass                                  yes
+MP_drop_aborts                     114         61      1  violated:NoAbort                      violated:NoAbort                      yes
+MP_output_drop_aborts              377        179      1  violated:NoAbort                      violated:NoAbort                      yes
+MP_free_aborts                    1496        661      2  violated:NoAbort                      violated:NoAbort                      yes
+MP_hook_aborts                      30         19      1  violated:NoAbort                      violated:NoAbort                      yes
+MP_shutdown_aborts                 129         64      1  violated:NoAbort                      violated:NoAbort                      yes
+MP_free_skips                     2498       1066      2  violated:CleanEnd                     violated:CleanEnd                     yes
+MP_cancel_panic_logged            4336       1922      1  violated:AwaiterGetsPanic             violated:AwaiterGetsPanic             yes
+MP_unclose_ignores_handle          356        163      1  violated:FreedAfterFuture             violated:FreedAfterFuture             yes
+MP_closed_no_recheck             24601      10324      2  violated:AwaiterGetsPanic             violated:AwaiterGetsPanic             yes
+MP_complete_keeps_value           1935        841      2  violated:AwaiterGetsPanic             violated:AwaiterGetsPanic             yes
+MP_unclaimed_silent                780        362      1  violated:PanicTold                    violated:PanicTold                    yes
+MP_detach_panic_silent            4012       1747      1  violated:PanicTold                    violated:PanicTold                    yes
+WP_unclose                         132         73      2  violated:NoUnclose                    violated:NoUnclose                    yes
+WP_shutdown_drop                    48         29      1  violated:NoShutDrop                   violated:NoShutDrop                   yes
+M_push_no_keep                    4280       1781      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
+T_push_stopped                    7445       3306      2  pass                                  pass                                  yes
+T_push_stopped_cancel            76111      31018      2  pass                                  pass                                  yes
+W_waker_drops                     1243        558      1  violated:NoWakerDrop                  violated:NoWakerDrop                  yes
+M_unrun_clear_first               3660       1627      2  violated:CancelWaits                  violated:CancelWaits                  yes
+M_unrun_no_notify                 7120       2999      1  deadlock                              deadlock                              yes
+M_unrun_no_close                   685        318      2  violated:FutureOnce                   violated:FutureOnce                   yes
+T_give_up                        24014       9818      2  pass                                  pass                                  yes
+T_give_up_running                73836      29795      3  pass                                  pass                                  yes
+W_cancel_notifies                 1132        509      2  violated:NoCancelNotify               violated:NoCancelNotify               yes
+T_poll_detach                     1262        515      1  pass                                  pass                                  yes
+M_destroy_keeps_awaiter           1166        463      2  violated:AwaiterOnce                  violated:AwaiterOnce                  yes
+T_abort                        1449826     443930      6  pass                                  pass                                  yes
+T_abort_detach                   27224       8679      2  pass                                  pass                                  yes
+W_aborted                            5          5      1  violated:NoAborted                    violated:NoAborted                    yes
+M_abort_no_ref                   36184      12701      2  violated:NothingAfterFree             violated:NothingAfterFree             yes
+M_complete_no_reclaim             3378       1432      2  deadlock                              deadlock                              yes
+M_take_ignores_flags             47434      16523      2  violated:OneAtTheCell                 violated:OneAtTheCell                 yes
+T_two_wakers                     37443      15673      2  pass                                  pass                                  yes
+W_stale_stored                    4036       1725      1  violated:NoStaleStored                violated:NoStaleStored                yes
+M_register_trusts_stored         11401       4775      2  deadlock                              deadlock                              yes
+M_register_no_self_wake         939155     295393     13  deadlock                              deadlock                              yes
+W_claim_stale                    66626      22843      3  violated:NoClaimEmpty                 violated:NoClaimEmpty                 yes
+T_waker_panics                    8927       3683      2  pass                                  pass                                  yes
+T_waker_panics_cancel            43189      17695      2  pass                                  pass                                  yes
+T_waker_panics_live               8927       3683      3  pass                                  pass                                  yes
+MW_waker_aborts                   1897        827      2  violated:NoAbort                      violated:NoAbort                      yes
+MW_clone_in_register              6680       2771      2  deadlock                              deadlock                              yes
+MW_drop_in_register               6680       2771      1  deadlock                              deadlock                              yes
+MW_wake_in_take                  11107       4649      2  violated:CleanEnd                     violated:CleanEnd                     yes
+WW_clone_panics                   1334        596      1  violated:NoClonePanic                 violated:NoClonePanic                 yes
 
-results matching EXPECTED.txt: 32 of 32
-
-Rechecked as CI ran them: TLA+ run 41460094467 on 569d1418, 2026-11-02, one worker each (the
-share jobs of .github/workflows/tla.yml). These times replace the ones above.
-
-configuration                generated   distinct    sec  result                                expected                              match
-T_await                           2211       1004      2  pass                                  pass                                  yes
-T_await_self                      9769       4216      2  pass                                  pass                                  yes
-T_cancel                         37459      15951      2  pass                                  pass                                  yes
-T_cancel_dropped_waker           14743       5678      2  pass                                  pass                                  yes
-T_detach                          4500       1952      1  pass                                  pass                                  yes
-T_drop                            7847       3406      1  pass                                  pass                                  yes
-T_drop_ref                        6764       2833      1  pass                                  pass                                  yes
-T_last_waker                       394        178      1  pass                                  pass                                  yes
-T_live_await                      9769       4216      3  pass                                  pass                                  yes
-T_live_cancel                    18640       7937      3  pass                                  pass                                  yes
-T_live_detach                      394        178      1  pass                                  pass                                  yes
-T_await_spurious                  6565       3012      1  pass                                  pass                                  yes
-M_wake_running_schedules          2337       1006      2  violated:OnePoll                      violated:OnePoll                      yes
-M_run_drops_woken                 1162        501      2  deadlock                              deadlock                              yes
-M_free_ignores_handle              599        271      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
-M_cancel_drops_future              335        172      1  violated:FutureOnce                   violated:FutureOnce                   yes
-M_no_recheck                      1144        505      1  deadlock                              deadlock                              yes
-M_wake_no_ref                     1000        468      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
-M_detach_skips_last                771        347      2  violated:CleanEnd                     violated:CleanEnd                     yes
-M_complete_leaks_output            628        286      1  violated:CleanEnd                     violated:CleanEnd                     yes
-M_pending_leaks_future             296        129      1  violated:FreedAfterFuture             violated:FreedAfterFuture             yes
-M_release_after_complete          1553        690      2  violated:RunnerFreesNoAwaited         violated:RunnerFreesNoAwaited         yes
-M_pending_two_steps               4974       2132      2  violated:RunnerFreesNoAwaited         violated:RunnerFreesNoAwaited         yes
-M_pending_drops_woken              612        282      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
-M_closed_keeps_running            3755       1664      1  deadlock                              deadlock                              yes
-M_wake_running_entry               517        244      2  violated:RunnableScheduled            violated:RunnableScheduled            yes
-M_closed_no_wait                   732        353      2  violated:CancelWaits                  violated:CancelWaits                  yes
-W_wake_while_running               133         71      2  violated:NoWakeWhileRunning           violated:NoWakeWhileRunning           yes
-W_cancel_while_running              51         30      1  violated:NoCancelWhileRunning         violated:NoCancelWhileRunning         yes
-W_cancel_in_queue                   82         47      2  violated:NoCancelInQueue              violated:NoCancelInQueue              yes
-W_register_meets_notify           1440        635      1  violated:NoRegisterMeetsNotify        violated:NoRegisterMeetsNotify        yes
-W_last_waker_close                 297        130      1  violated:NoLastWakerClose             violated:NoLastWakerClose             yes
-W_park_woken                      1334        591      2  violated:NoParkWoken                  violated:NoParkWoken                  yes
-W_none_while_output_lives         4826       2164      1  violated:OutputGoneAtNone             violated:OutputGoneAtNone             yes
-
-results matching EXPECTED.txt: 34 of 34
+results matching EXPECTED.txt: 87 of 87

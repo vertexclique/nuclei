@@ -47,10 +47,11 @@
 //! as a whole one (`proofs/tla/close`). A runtime that drops waits for those
 //! tasks (see `rt::linger`), and none starts a runtime to run them.
 //!
-//! A file dropped on a worker leaves such a task too, and the process's exit
-//! waits for it as well (the process default runtime is never dropped); a
-//! file dropped on any other thread (`block_on`'s, the blocking pool's, one
-//! of the application's) writes its write-behind before its drop returns.
+//! A file dropped on a worker or a thread of the blocking pool leaves such a
+//! task too, and the process's exit waits for it as well (the process
+//! default runtime is never dropped); a file dropped on any other thread
+//! (`block_on`'s, one of the application's) writes its write-behind before
+//! its drop returns.
 //! Bytes a file's write-behind gives up with nobody left to answer (a write
 //! that failed, a linger's time run out) are said at warn and counted in
 //! [`Stats::write_behind_lost`](crate::stats::Stats::write_behind_lost)
@@ -363,10 +364,12 @@ impl<T> Drop for Handle<T> {
     /// last lease or the driver lets go of it).
     fn drop(&mut self) {
         // A file's writes in flight hold leases on its descriptor; what waits
-        // behind them goes before the drop returns, or, on a worker, which
-        // must not wait, is handed to a task, the file's state with its lease.
+        // behind them goes before the drop returns, or is handed to a task, the
+        // file's state with its lease: on a worker, which must not wait, and
+        // on a thread of the blocking pool, whose writes the wait would need
+        // (proofs/tla/going/Linger.tla, `pool_delivers`).
         if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
-            if crate::runtime::worker_index().is_some() {
+            if crate::runtime::worker_index().is_some() || crate::rt::blocking::on_pool_thread() {
                 crate::rt::linger::hand_file(async move { deliver_file(&file).await });
             } else {
                 crate::sync::internal::blocking(deliver_file(&file));
@@ -416,25 +419,27 @@ async fn deliver_file(file: &Arc<FileIo>) {
     }
 }
 
+/// How long a zero-linger reset waits for acknowledgements: macOS's loopback can let the reset
+/// overtake the data still on its way, and the loopback acknowledges what it takes almost at once; the
+/// cap bounds a peer that never acknowledges.
+const ACK_CAP: Duration = Duration::from_millis(10);
+
 /// Delivers what a dropped handle's write-behind holds through `kept`, its
 /// object itself (whose descriptor is `own`), then closes it. Bytes still
 /// behind as the drain ends (its time ran out, or it failed) are given up,
 /// and a TCP stream resets: its peer must not read the end of the stream
 /// after a cut one. A Unix stream has no reset: it closes, and its peer
 /// reads the end after the bytes that reached it (proofs/tla/close,
-/// `W_unix_cut`). A TCP stream set to zero linger waits for the peer to acknowledge what it
-/// sent (`wait_for_acks`), within the same time, so its reset cannot overtake it, whether it was
-/// dropped with bytes behind or with none behind but bytes its kernel holds unacknowledged.
+/// `W_unix_cut`). A TCP stream set to zero linger then resets at once; only where
+/// `Source::waits_for_acks` says (macOS, a loopback peer) it first waits at most `ACK_CAP` for the
+/// peer to acknowledge what it sent, whether it was dropped with bytes behind or with none behind
+/// but bytes its kernel holds unacknowledged.
 async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
     let budget = crate::rt::linger::time();
-    let start = std::time::Instant::now();
     let drain = core::future::poll_fn(|cx| source.poll_drain(cx));
     let _ = crate::time::timeout(budget, drain).await;
-    if !source.has_unsent()
-        && source.kind() == Kind::Tcp
-        && matches!(crate::net::opt::linger_time(own), Ok(Some(d)) if d.is_zero())
-    {
-        wait_for_acks(own, budget.saturating_sub(start.elapsed())).await;
+    if !source.has_unsent() && source.waits_for_acks(own) {
+        wait_for_acks(own, ACK_CAP).await;
     }
     if source.has_unsent()
         && source.kind() == Kind::Tcp

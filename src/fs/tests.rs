@@ -343,6 +343,8 @@ mod copy_range;
 mod direct;
 mod durable;
 mod job_end;
+#[cfg(unix)]
+mod landed;
 mod lent_wake;
 mod linger;
 mod lock;

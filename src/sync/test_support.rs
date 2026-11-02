@@ -11,7 +11,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Wake;
 
 struct Counter(AtomicUsize);
@@ -129,6 +129,42 @@ pub(crate) fn hooked(
     let data = Rc::into_raw(hook) as *const ();
     // SAFETY: the vtable's contract is met by a pointer from `Rc::into_raw`.
     unsafe { Waker::from_raw(RawWaker::new(data, &HOOK)) }
+}
+
+static DROP_PANICS: RawWakerVTable = RawWakerVTable::new(
+    drop_panics_clone,
+    drop_panics_noop,
+    drop_panics_noop,
+    drop_panics_drop,
+);
+
+// The four functions below are the vtable of a waker built by `drop_panics`,
+// whose data is a leaked `AtomicBool`.
+unsafe fn drop_panics_clone(data: *const ()) -> RawWaker {
+    RawWaker::new(data, &DROP_PANICS)
+}
+
+unsafe fn drop_panics_noop(_: *const ()) {}
+
+unsafe fn drop_panics_drop(data: *const ()) {
+    // SAFETY: `data` is the leaked flag of `drop_panics`, live for good.
+    let armed = unsafe { &*(data as *const AtomicBool) };
+    if armed.swap(false, Ordering::SeqCst) {
+        panic!("a waker's drop panicked");
+    }
+}
+
+/// A waker whose first drop, of it or of any clone, panics: what a task's
+/// waker does when releasing it runs user code that fails. It wakes nobody.
+pub(crate) fn drop_panics() -> Waker {
+    let armed: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
+    // SAFETY: the vtable's contract is met by the leaked flag it reads.
+    unsafe {
+        Waker::from_raw(RawWaker::new(
+            armed as *const AtomicBool as *const (),
+            &DROP_PANICS,
+        ))
+    }
 }
 
 /// Runs `poll` inside a poll whose budget is spent.

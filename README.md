@@ -141,7 +141,7 @@ on completion ports on Windows. `NUCLEI_BACKEND` picks one: `auto`, `io_uring` o
 handshake, the IO source's sides, the ring's operations, the sync primitives' queues) and Lean
 proofs of the arithmetic they rest on; `proofs/README.md` says what each one checks and what it
 leaves out. The sync primitives and the runtime's handshakes have loom models, and CI runs the
-suite under AddressSanitizer on both Linux backends.
+suite under AddressSanitizer on both Linux backends and the Miri-safe unit tests under Miri.
 
 ## Examples
 

@@ -7,18 +7,22 @@
 //! the shard to wake (its [`Target`]): the worker shard its thread runs,
 //! until that shard is taken from the thread, then the thread's own. A
 //! thread makes a new home each time it starts to run a worker shard, and
-//! its own shard has one. A runnable pushed to a home whose thread is gone
-//! is leaked, not dropped: its future may not be dropped on another thread.
+//! its own shard has one. The home's thread cancels every task of its home at the close and as
+//! it exits, waiting for a wake still on its way until the shutdown deadline; a task left then
+//! is said and counted (`Stats::tasks_left`), its future leaked, for it may not be dropped on
+//! another thread (proofs/tla/teardown/Teardown.tla).
 
 use core::task::{Context, Poll};
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::target::Target;
 use crate::rt::inbox::{Inbox, Pop};
-use crate::rt::shard::Shared;
+use crate::rt::shard::backoff::Backoff;
+use crate::rt::shard::{Shard, Shared};
 use crate::rt::task::Runnable;
+use crate::rt::task::list::{Links, TaskList};
 use crate::sync::atomic_waker::AtomicWaker;
-use crate::sync::internal::{AtomicUsize, Ordering};
 
 /// Where a runner's bound tasks are handed from other threads.
 pub(crate) struct Home {
@@ -26,8 +30,8 @@ pub(crate) struct Home {
     /// alone takes from it, holding the taker's role from the home's making.
     inbox: Inbox,
     target: Target,
-    /// The home's live tasks.
-    live: AtomicUsize,
+    /// The home's live tasks, touched on its thread only.
+    tasks: TaskList,
     /// Woken as the last live task ends.
     drained: AtomicWaker,
 }
@@ -38,7 +42,7 @@ impl Home {
         Self {
             inbox: Inbox::new(),
             target: Target::new(target),
-            live: AtomicUsize::new(0),
+            tasks: TaskList::new(),
             drained: AtomicWaker::new(),
         }
     }
@@ -81,30 +85,53 @@ impl Home {
         &self.target
     }
 
-    /// A task of the home begins.
-    pub(crate) fn began(&self) {
-        self.live.fetch_add(1, Ordering::Relaxed);
+    /// Lists a task of the home.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the home's thread, and the task is on no list.
+    #[inline(always)]
+    pub(crate) unsafe fn push_task(&self, task: &Links) {
+        // SAFETY: the caller's contract.
+        unsafe { self.tasks.push(task) }
     }
 
-    /// A task of the home ended: its future was dropped.
-    pub(crate) fn ended(&self) {
-        if self.live.fetch_sub(1, Ordering::AcqRel) == 1 {
+    /// A task of the home ended: its future was dropped and it left the list.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the home's thread.
+    #[inline(always)]
+    pub(crate) unsafe fn task_ended(&self) {
+        // SAFETY: the caller's contract.
+        if unsafe { self.tasks.is_empty() } {
             self.drained.wake();
         }
     }
 
     /// Whether the home has no live task.
-    pub(crate) fn is_idle(&self) -> bool {
-        self.live.load(Ordering::Acquire) == 0
+    ///
+    /// # Safety
+    ///
+    /// The caller is the home's thread.
+    pub(crate) unsafe fn is_idle(&self) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe { self.tasks.is_empty() }
     }
 
     /// Ready once the home has no live task.
-    pub(crate) fn poll_drained(&self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.live.load(Ordering::Acquire) == 0 {
+    ///
+    /// # Safety
+    ///
+    /// The caller is the home's thread.
+    pub(crate) unsafe fn poll_drained(&self, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the caller's contract.
+        if unsafe { self.tasks.is_empty() } {
             return Poll::Ready(());
         }
         self.drained.register(cx.waker());
-        if self.live.load(Ordering::Acquire) == 0 {
+        // SAFETY: as above.
+        if unsafe { self.tasks.is_empty() } {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -112,10 +139,61 @@ impl Home {
     }
 }
 
+impl Home {
+    /// Cancels the home's tasks that are idle, on the home's thread (see
+    /// [`TaskList::cancel_all`]). Returns how many it dropped.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the home's thread.
+    pub(crate) unsafe fn cancel_listed(&self) -> usize {
+        // SAFETY: the caller's contract.
+        unsafe { self.tasks.cancel_all() }
+    }
+
+    /// Ends every task of the home on its thread, as the thread is done with the home: the
+    /// runnables pushed to it, and in `own`'s queues, are dropped, the idle tasks cancelled, until
+    /// none is listed; a task whose wake is still on its way is waited for until `deadline`, after
+    /// which it is left, said once and counted.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the home's thread.
+    pub(crate) unsafe fn cancel_all(&self, own: Option<&Shard>, deadline: Instant) {
+        let mut backoff = Backoff::new();
+        loop {
+            // SAFETY: the caller's contract.
+            while let Some(runnable) = unsafe { self.pop() } {
+                drop(runnable);
+            }
+            if let Some(own) = own {
+                own.drop_queued();
+            }
+            // SAFETY: as above.
+            unsafe { self.tasks.cancel_all() };
+            // SAFETY: as above.
+            if unsafe { self.is_idle() } {
+                return;
+            }
+            if Instant::now() >= deadline {
+                // SAFETY: as above.
+                let left = unsafe { self.tasks.len() };
+                crate::rt::counters::tasks_left(left as u64);
+                log::warn!(
+                    "{left} tasks bound to an exiting thread were still being woken at the shutdown deadline; they are leaked"
+                );
+                return;
+            }
+            backoff.pause();
+        }
+    }
+}
+
 impl Drop for Home {
     fn drop(&mut self) {
-        // SAFETY: the home is gone, so nothing else reaches its inbox; what
-        // it holds was pushed after its thread went.
-        unsafe { self.inbox.drain(core::mem::forget) };
+        // SAFETY: the home is gone, so nothing else reaches its inbox. Every task of the home
+        // holds it, and its thread ended each before it went (a task left at the deadline is
+        // leaked, and holds the home for good), so the inbox holds nothing.
+        unsafe { self.inbox.drain(drop) };
     }
 }

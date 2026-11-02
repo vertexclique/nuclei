@@ -1,7 +1,9 @@
 ------------------------------- MODULE Park -------------------------------
 (***************************************************************************)
 (* A shard going to sleep and the threads that give it work               *)
-(* (src/rt/handshake.rs, src/rt/shard.rs), at the grain of the atomic      *)
+(* (src/rt/handshake.rs; `Shard::begin_park` and the run loop's park in   *)
+(* src/rt/shard/run.rs; `Shared::push_remote` in src/rt/shard.rs), at the *)
+(* grain of the atomic                                                     *)
 (* steps of the handshake.                                                 *)
 (*                                                                          *)
 (* In plain words: a shard runs what is in its inbox. With nothing left it *)

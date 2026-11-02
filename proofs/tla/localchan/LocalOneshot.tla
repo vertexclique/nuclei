@@ -18,7 +18,12 @@
 (*                                                                          *)
 (* The tasks run on one thread and no step runs another step, so each      *)
 (* operation is one atomic step and the model interleaves whole steps in   *)
-(* every order. What must never happen: a value received twice, or lost    *)
+(* every order, save one: a registration clones the poll's waker, which is *)
+(* user code, after it took the old waker out of its cell. With Reentrant  *)
+(* that clone is a step apart, so the other half may send, drop or close   *)
+(* during it (what a clone that touches the channel does), and its wake    *)
+(* finds the cell empty: the poll then looks at the bits again before it   *)
+(* sleeps. What must never happen: a value received twice, or lost         *)
 (* while the receiver can still take it; a send answered Ok past the       *)
 (* close; a task asleep for good with what it waits for there.             *)
 (*                                                                          *)
@@ -31,6 +36,7 @@ EXTENDS Integers, Sequences, TLC
 CONSTANTS
     Prog,      \* the sender's operations: "send", "drop", "park" (one closed() wait)
     RxProg,    \* the receiver's operations: "recv", "try", "close", "drop"
+    Reentrant, \* a registration's clone of its waker is a step of its own (user code)
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Tx == 1
@@ -101,10 +107,14 @@ S_next:
         goto Done;
     end if;
 S_park:
-    \* `poll_closed`: ready once closed, else the waker registered and the task asleep.
+    \* `poll_closed`: ready once closed, else the waker registered and the task asleep. With
+    \* Reentrant the old waker leaves its cell and the clone runs as a step of its own.
     if rxClosed then
         i := i + 1;
         goto S_next;
+    elsif Reentrant then
+        txReg := FALSE;                \* the cell empty while the clone runs
+        goto S_set;
     else
         txReg := TRUE;
     end if;
@@ -112,6 +122,15 @@ S_sleep:
     await txWoken;
     txWoken := FALSE;
     goto S_park;
+S_set:
+    \* The clone is stored; a clone ran, so the poll looks at the bit again (`register` answers
+    \* that it cloned). MUTATION closed_no_relook: it answers Pending without looking.
+    txReg := TRUE;
+    if rxClosed /\ Mutation # "closed_no_relook" then
+        goto S_park;                   \* the look again finds the close
+    else
+        goto S_sleep;
+    end if;
 end process;
 
 fair process receiver = Rx
@@ -153,6 +172,9 @@ R_poll:
     elsif RxProg[ri] = "try" then
         ri := ri + 1;
         goto R_next;
+    elsif Reentrant then
+        rxReg := FALSE;                \* the cell empty while the clone runs
+        goto R_set;
     else
         rxReg := TRUE;
     end if;
@@ -160,6 +182,15 @@ R_sleep:
     await rxWoken;
     rxWoken := FALSE;
     goto R_poll;
+R_set:
+    \* The clone is stored; a clone ran, so the poll looks at the bits again before it sleeps.
+    \* MUTATION no_relook: it answers Pending without looking.
+    rxReg := TRUE;
+    if (valueSent \/ rxClosed \/ txDropped) /\ Mutation # "no_relook" then
+        goto R_poll;                   \* the look again finds a bit up and completes there
+    else
+        goto R_sleep;
+    end if;
 end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.

@@ -1,0 +1,38 @@
+TLC run of every configuration in proofs/tla/teardown, 2026-11-03 06:25 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+T_safe                         1676874     339238     23  pass                                  pass                                  yes
+T_runner                       1676874     339238     25  pass                                  pass                                  yes
+M_snapshot_first                  8905       2873      1  violated:JoinsNoDetached              violated:JoinsNoDetached              yes
+M_snapshot_first_runner        3962710     772003     12  violated:StartedJoined                violated:StartedJoined                yes
+M_no_detached_filter             30029       8534      1  violated:JoinsNoDetached              violated:JoinsNoDetached              yes
+M_self_join                       2516        955      1  violated:NoSelfJoin                   violated:NoSelfJoin                   yes
+M_park_first                    539421     111127      4  deadlock                              deadlock                              yes
+M_dead_spare_drop               408884      91122      3  violated:LastDropInRuntime            violated:LastDropInRuntime            yes
+W_late_take                        117         70      1  violated:NoLateTake                   violated:NoLateTake                   yes
+W_dead_gift                      17814       5353      1  violated:NoDeadGift                   violated:NoDeadGift                   yes
+T_detached_last_ref             833160     188571      9  pass                                  pass                                  yes
+T_close_cancels                1676874     339238     22  pass                                  pass                                  yes
+M_close_abandons                  3760       1326      1  violated:HomeSettled                  violated:HomeSettled                  yes
+M_unlisted                        2731       1036      1  violated:ShardSettled                 violated:ShardSettled                 yes
+M_drop_off_thread               518606     113208      3  violated:DroppedOnHome                violated:DroppedOnHome                yes
+M_detached_unbounded            824811     185571     33  violated:DropReturnsOrBlocked         violated:DropReturnsOrBlocked         yes
+W_told_left                     398636      93856      3  violated:NoToldLeft                   violated:NoToldLeft                   yes
+W_woken_at_walk                  17412       5235      1  violated:NoWokenAtWalk                violated:NoWokenAtWalk                yes
+J_safe                           53606      15010      2  pass                                  pass                                  yes
+MJ_count_messages                23441       8046      1  violated:WaitsForAll                  violated:WaitsForAll                  yes
+MJ_finished_only                 54681      15292      2  violated:Returns                      violated:Returns                      yes
+MJ_forget_exits                  79859      23180      2  violated:Returns                      violated:Returns                      yes
+WJ_message_first                    68         54      1  violated:NoMessageFirst               violated:NoMessageFirst               yes
+G_safe                            1104        456      1  pass                                  pass                                  yes
+MG_no_restop                       996        406      1  violated:DropReturns                  violated:DropReturns                  yes
+MG_publish_unlocked               1192        492      1  violated:DropReturns                  violated:DropReturns                  yes
+MG_start_ignores_close             322        163      1  violated:StartedJoined                violated:StartedJoined                yes
+MG_monitor_ignores_close          1201        490      1  violated:StartedJoined                violated:StartedJoined                yes
+MG_monitor_untaken                 993        409      1  violated:StartedJoined                violated:StartedJoined                yes
+WG_between                          41         30      1  violated:NoBetween                    violated:NoBetween                    yes
+WG_refused                          62         42      0  violated:NoRefused                    violated:NoRefused                    yes
+
+results matching EXPECTED.txt: 31 of 31

@@ -216,6 +216,10 @@ impl<T> Sender<T> {
     /// assert_eq!(err.0, 2);
     /// ```
     pub fn send(&self, value: T) -> impl Future<Output = Result<(), SendError<T>>> + '_ {
+        self.sending(value)
+    }
+
+    fn sending(&self, value: T) -> Sending<'_, T> {
         Sending {
             chan: &self.chan,
             wait: FairWait::new(),
@@ -323,6 +327,11 @@ impl<T> Sender<T> {
     /// runtime's task it blocks that task's thread. It works whether or not
     /// the receiver uses [`Receiver::blocking_recv`].
     ///
+    /// A wait whose frame runs a task that opens another blocking frame gives
+    /// up its place in line and asks again, at the back, once its frame is on
+    /// top again, so nested blocking waits never wait on each other with the
+    /// resource free.
+    ///
     /// # Panics
     ///
     /// On `wasm32`, where no other thread can make room, when the channel is
@@ -337,7 +346,7 @@ impl<T> Sender<T> {
     /// sender.join().unwrap();
     /// ```
     pub fn blocking_send(&self, value: T) -> Result<(), SendError<T>> {
-        internal::blocking(self.send(value))
+        internal::blocking_in_line(self.sending(value))
     }
 
     /// Whether the channel is closed: the receiver was closed or dropped.
@@ -787,6 +796,17 @@ impl<T> Drop for Sending<'_, T> {
     }
 }
 
+impl<T> internal::Withdraw for Sending<'_, T> {
+    fn withdraw(self: Pin<&mut Self>) {
+        // SAFETY: as in `poll`: nothing of the future is pinned in place.
+        let this = unsafe { self.get_unchecked_mut() };
+        // The value stays: only the wait for the slot is given up.
+        if this.value.is_some() {
+            this.let_go();
+        }
+    }
+}
+
 /// A `send` future polled again after it completed, which the `Future`
 /// contract rules out.
 #[cold]
@@ -840,6 +860,7 @@ impl<T> Drop for Reserve<'_, T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use crate::sync::mpsc::error::TryRecvError;
     use crate::sync::test_support::{Polled, hooked, with_budget_spent};
 
     #[test]
@@ -881,15 +902,15 @@ mod tests {
     }
 
     #[test]
-    fn a_send_refused_for_the_budget_wakes_a_receiver_its_give_back_finishes() {
+    fn a_send_refused_for_the_budget_gives_its_slot_back_before_it_wakes() {
         let (tx, rx) = channel::<u32>(1);
         let rx = std::rc::Rc::new(core::cell::RefCell::new(rx));
         let receiver = Polled::new(core::future::pending::<()>());
         let rx_waker = receiver.waker();
         let closes = std::rc::Rc::clone(&rx);
         // The send takes the free slot and is refused for the budget; at the
-        // refusal's wake, the receiver closes and waits for the slot to come
-        // back, which the refusal then gives back.
+        // refusal's wake the slot is back already, so a receiver that closes
+        // there finds the channel idle and ends.
         let waker = hooked(
             None,
             Some(Box::new(move || {
@@ -898,7 +919,7 @@ mod tests {
                 // The receiver's own poll, with a budget of its own.
                 let looked =
                     crate::coop::outside(|| rx.poll_recv(&mut Context::from_waker(&rx_waker)));
-                assert!(looked.is_pending(), "a slot is still out");
+                assert!(matches!(looked, Poll::Ready(None)), "a slot is still out");
             })),
         );
         let mut send = Box::pin(tx.send(1));
@@ -906,11 +927,6 @@ mod tests {
         let polled = with_budget_spent(|| send.as_mut().poll(&mut cx));
         assert!(polled.is_pending(), "the send was refused for the budget");
         assert_eq!(tx.capacity(), 1, "the refused send gave its slot back");
-        assert_eq!(receiver.wakes(), 1, "and the closed receiver was told");
-        let ended = rx
-            .borrow_mut()
-            .poll_recv(&mut Context::from_waker(&receiver.waker()));
-        assert!(matches!(ended, Poll::Ready(None)));
         assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
     }
 
@@ -964,5 +980,131 @@ mod tests {
         drop(rx);
         let SendError(value) = send.ready().unwrap_err();
         assert_eq!(value, "kept");
+    }
+
+    /// A sender queued behind a full buffer whose waker panics when the
+    /// receive frees its slot.
+    fn panicking_sender() -> core::task::Waker {
+        hooked(None, Some(Box::new(|| panic!("a sender's waker panicked"))))
+    }
+
+    fn quiet() -> core::task::Waker {
+        hooked(None, None)
+    }
+
+    #[test]
+    fn a_send_refused_for_the_budget_whose_wake_panics_gives_its_slot_back() {
+        let (tx, _rx) = channel::<u32>(1);
+        let waker = panicking_sender();
+        let mut send = Box::pin(tx.send(1));
+        let mut cx = Context::from_waker(&waker);
+        let caught = with_budget_spent(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| send.as_mut().poll(&mut cx)))
+        });
+        assert!(caught.is_err(), "the panic reaches the caller");
+        assert_eq!(tx.capacity(), 1, "the slot was lost to the panic");
+    }
+
+    #[test]
+    fn a_receive_whose_release_panics_keeps_its_value_for_the_next_one() {
+        let (tx, mut rx) = channel::<u32>(1);
+        tx.try_send(1).unwrap();
+        let waker = panicking_sender();
+        let mut send = Box::pin(tx.send(2));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rx.try_recv()));
+        assert!(caught.is_err(), "the panic reaches the receiver");
+        assert_eq!(rx.len(), 1, "the stashed value counts");
+        assert_eq!(rx.try_recv(), Ok(1), "the value was lost to the panic");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        let quiet = quiet();
+        assert!(matches!(
+            send.as_mut().poll(&mut Context::from_waker(&quiet)),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(rx.try_recv(), Ok(2));
+        assert_eq!(tx.capacity(), 1, "the stash made up an admission");
+        tx.try_send(3).unwrap();
+        assert!(matches!(tx.try_send(4), Err(TrySendError::Full(4))));
+    }
+
+    #[test]
+    fn a_polled_receive_whose_release_panics_keeps_its_value() {
+        let (tx, mut rx) = channel::<u32>(1);
+        tx.try_send(1).unwrap();
+        let waker = panicking_sender();
+        let mut send = Box::pin(tx.send(2));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let mut recv = Polled::new(rx.recv());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recv.poll()));
+        assert!(caught.is_err(), "the panic reaches the poll");
+        drop(recv);
+        assert_eq!(Polled::new(rx.recv()).ready(), Some(1));
+        let quiet = quiet();
+        assert!(matches!(
+            send.as_mut().poll(&mut Context::from_waker(&quiet)),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(Polled::new(rx.recv()).ready(), Some(2));
+    }
+
+    #[test]
+    fn a_batch_receive_takes_a_stashed_value_without_a_release() {
+        let (tx, mut rx) = channel::<u32>(2);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        let waker = panicking_sender();
+        let mut send = Box::pin(tx.send(3));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rx.try_recv()));
+        assert!(caught.is_err());
+        let mut buf = Vec::new();
+        let mut recv = Polled::new(rx.recv_many(&mut buf, 8));
+        assert_eq!(recv.ready(), 2);
+        drop(recv);
+        assert_eq!(buf, [1, 2]);
+        drop(send);
+        assert_eq!(tx.capacity(), 2, "every admission is back, none made up");
+    }
+
+    #[test]
+    fn a_channel_dropped_with_a_stashed_value_drops_it_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = channel::<Counted>(1);
+        assert!(tx.try_send(Counted(Arc::clone(&drops))).is_ok());
+        let waker = panicking_sender();
+        let mut send = Box::pin(tx.send(Counted(Arc::clone(&drops))));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rx.try_recv()));
+        assert!(caught.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "the value is stashed");
+        drop(send);
+        drop(rx);
+        drop(tx);
+        assert_eq!(drops.load(Ordering::SeqCst), 2, "each dropped exactly once");
     }
 }

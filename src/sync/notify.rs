@@ -8,7 +8,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::sync::Arc;
 
-use super::internal::{AtomicUsize, Ordering, UnsafeCell};
+use super::internal::{AtomicU64, AtomicUsize, Ordering, UnsafeCell};
 use super::list::List;
 use super::queue::{Arrivals, FIRST_BIT, Policy, QUEUED, Step, WaitQueue};
 use super::waiter::{Cancel, Wait, WakeList, release_queued};
@@ -25,6 +25,110 @@ const BY_FIRST: usize = usize::MAX;
 /// The same for `notify_last`, which the dropped waiter passes on as a
 /// `notify_last`.
 const BY_LAST: usize = usize::MAX - 1;
+
+/// A count that reaches this stays there, and a pass reads it as "every waiter".
+const FULL: u16 = u16::MAX;
+
+/// One kind of owed wake, counted in one word together with the generation the counts were made
+/// at: the generation's low 32 bits above two 16-bit counts, the current ones (made at that
+/// generation) and the older ones. The model is `Owe`, `CurOf` and `OldOf` of
+/// `proofs/tla/notify/Notify.tla`; the proof is "The owed word" of `proofs/lean/Nuclei/Notify.lean`.
+struct Owed(AtomicU64);
+
+/// The fields of a word [`Owed::take`] cleared.
+struct Taken {
+    tag: u32,
+    cur: u16,
+    old: u16,
+}
+
+impl Taken {
+    fn decode(word: u64) -> Self {
+        Self {
+            tag: (word >> 32) as u32,
+            cur: (word >> 16) as u16,
+            old: word as u16,
+        }
+    }
+
+    fn encode(tag: u32, cur: u16, old: u16) -> u64 {
+        u64::from(tag) << 32 | u64::from(cur) << 16 | u64::from(old)
+    }
+}
+
+/// Whether generation tag `g` is ahead of `t`, as the tag wraps, by less than half its room.
+fn newer(g: u32, t: u32) -> bool {
+    let d = g.wrapping_sub(t);
+    d != 0 && d < 1 << 31
+}
+
+impl Owed {
+    loom_const_fn! {
+        fn new() -> Self {
+            Self(AtomicU64::new(0))
+        }
+    }
+
+    /// Adds one count made at `generation`: current if the word is of that generation, turning
+    /// the word's counts older if it is newer, older if the word is already of a later one.
+    fn owe(&self, generation: usize) {
+        let g = generation as u32;
+        let mut word = self.0.load(Ordering::Acquire);
+        loop {
+            let at = Taken::decode(word);
+            let (tag, cur, old) = if at.tag == g {
+                (g, at.cur.saturating_add(1), at.old)
+            } else if newer(g, at.tag) {
+                (g, 1, at.old.saturating_add(at.cur))
+            } else {
+                (at.tag, at.cur, at.old.saturating_add(1))
+            };
+            let next = Taken::encode(tag, cur, old);
+            match self
+                .0
+                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(seen) => word = seen,
+            }
+        }
+    }
+
+    /// Takes both counts and leaves the generation.
+    fn take(&self) -> Taken {
+        Taken::decode(self.0.fetch_and(!0xFFFF_FFFF, Ordering::AcqRel))
+    }
+
+    /// Adds the counts of `t` back: as they were if the word still has its tag, all as older if a
+    /// newer count came since. The word's tag only moves forward, so a word given back is never
+    /// newer than the word it lands in.
+    fn give_back(&self, t: &Taken) {
+        let mut word = self.0.load(Ordering::Acquire);
+        loop {
+            let at = Taken::decode(word);
+            let next = if at.tag == t.tag {
+                Taken::encode(
+                    at.tag,
+                    at.cur.saturating_add(t.cur),
+                    at.old.saturating_add(t.old),
+                )
+            } else {
+                Taken::encode(
+                    at.tag,
+                    at.cur,
+                    at.old.saturating_add(t.cur).saturating_add(t.old),
+                )
+            };
+            match self
+                .0
+                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(seen) => word = seen,
+            }
+        }
+    }
+}
 
 /// Wakes tasks waiting for an event that carries no value.
 ///
@@ -57,9 +161,9 @@ pub struct Notify {
     queue: WaitQueue,
     waiting: UnsafeCell<List>,
     /// `notify_one` calls a drain pass has yet to serve.
-    pending_first: AtomicUsize,
+    owed_first: Owed,
     /// `notify_last` calls a drain pass has yet to serve.
-    pending_last: AtomicUsize,
+    owed_last: Owed,
     /// How many `notify_waiters` calls there have been.
     generation: AtomicUsize,
 }
@@ -76,8 +180,8 @@ impl Notify {
             Self {
                 queue: WaitQueue::new(0),
                 waiting: UnsafeCell::new(List::new()),
-                pending_first: AtomicUsize::new(0),
-                pending_last: AtomicUsize::new(0),
+                owed_first: Owed::new(),
+                owed_last: Owed::new(),
                 generation: AtomicUsize::new(0),
             }
         }
@@ -116,18 +220,18 @@ impl Notify {
     /// Wakes the oldest waiter, or stores a permit when nobody waits. At
     /// most one permit is stored.
     pub fn notify_one(&self) {
-        self.notify_with(&self.pending_first);
+        self.notify_with(&self.owed_first);
     }
 
     /// Wakes the newest waiter, or stores a permit when nobody waits: as
     /// [`notify_one`](Self::notify_one), but for the waiter that queued last
     /// instead of the one that queued first.
     pub fn notify_last(&self) {
-        self.notify_with(&self.pending_last);
+        self.notify_with(&self.owed_last);
     }
 
     /// One owed wake of `strategy`, or a stored permit if nobody is queued.
-    fn notify_with(&self, owed: &AtomicUsize) {
+    fn notify_with(&self, owed: &Owed) {
         let before = self.transition(|state| {
             if state & QUEUED != 0 {
                 Step::Keep
@@ -138,7 +242,9 @@ impl Notify {
         if before & QUEUED == 0 {
             return;
         }
-        owed.fetch_add(1, Ordering::Release);
+        // Read right before the count is added, so the count is never of an older generation
+        // than one a broadcast made before this call.
+        owed.owe(self.generation());
         self.transition(Step::Drain);
     }
 
@@ -186,12 +292,48 @@ impl Policy for Notify {
 
     fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, _wake_front: bool) -> usize {
         let pool = &self.queue;
-        // Read after the arrivals were taken, so each arrival carries this
-        // generation or an older one.
+        // Read after the arrivals were taken and before the owed words, so each arrival carries
+        // this generation or an older one, and a count of an older one was made before the
+        // broadcast that moved it on, or by a call that overlapped it.
         let generation = self.generation();
+        let first = self.owed_first.take();
+        let last = self.owed_last.take();
+        let tag = generation as u32;
+        // A word ahead of the pass is given back whole for the pass of its own generation.
+        let split = |owed: &Owed, t: &Taken| {
+            if t.tag == tag {
+                (usize::from(t.cur), usize::from(t.old))
+            } else if newer(t.tag, tag) {
+                owed.give_back(t);
+                (0, 0)
+            } else {
+                (0, usize::from(t.old.saturating_add(t.cur)))
+            }
+        };
+        let ((first_cur, mut first_old), (last_cur, mut last_old)) = (
+            split(&self.owed_first, &first),
+            split(&self.owed_last, &last),
+        );
+        // A count at FULL is every waiter: it is never used up, so it is left over below.
+        let full = usize::from(FULL);
         // SAFETY: only the drain role's holder runs a pass.
         self.waiting.with_mut(|waiting| unsafe {
             let waiting = &mut *waiting;
+            // An expired node takes an older `notify_one`, then an older `notify_last`, as its wake.
+            let mut expire = |woken: &mut WakeList<'_>, node| {
+                let (old, by) = if first_old > 0 {
+                    (&mut first_old, BY_FIRST)
+                } else if last_old > 0 {
+                    (&mut last_old, BY_LAST)
+                } else {
+                    woken.grant(node);
+                    return;
+                };
+                node.as_ref().set_payload(by);
+                if woken.grant(node) && *old != full {
+                    *old -= 1;
+                }
+            };
             // Every node a pass leaves queued carries the generation that
             // pass read, so the queued nodes are all of one generation:
             // a `notify_waiters` since then expired every one of them, and
@@ -201,7 +343,7 @@ impl Policy for Notify {
                     break;
                 }
                 waiting.pop_front();
-                woken.grant(node);
+                expire(woken, node);
             }
             // Generation order is not queue order: a waiter can pass its
             // check, stop before it queues, and queue after a newer one.
@@ -211,18 +353,19 @@ impl Policy for Notify {
                 if node.as_ref().is_cancelled() {
                     release_queued(node, pool);
                 } else if node.as_ref().payload() != generation {
-                    woken.grant(node);
+                    expire(woken, node);
                 } else {
                     waiting.push_back(node);
                 }
             }
             waiting.tidy(&self.queue);
-            let mut first = self.pending_first.swap(0, Ordering::AcqRel);
-            let mut last = self.pending_last.swap(0, Ordering::AcqRel);
+            let served = |count: usize| if count == full { usize::MAX } else { count };
+            let mut first = served(first_cur);
+            let mut last = served(last_cur);
             if waiting.front(pool).is_some()
                 && self.queue.state.fetch_and(!PERMIT, Ordering::AcqRel) & PERMIT != 0
             {
-                first += 1;
+                first = first.saturating_add(1);
             }
             while first > 0 {
                 let Some(node) = waiting.front(pool) else {
@@ -244,7 +387,7 @@ impl Policy for Notify {
                     last -= 1;
                 }
             }
-            if first + last > 0 {
+            if first > 0 || last > 0 || first_old > 0 || last_old > 0 {
                 self.queue.state.fetch_or(PERMIT, Ordering::AcqRel);
             }
             if waiting.is_empty() { QUEUED } else { 0 }
@@ -332,7 +475,7 @@ impl Core {
     fn cancel(&mut self, notify: &Notify) {
         match self.wait.cancel(&notify.queue) {
             Cancel::Idle => {}
-            Cancel::Withdrawn(_) => notify.withdrawn(false),
+            Cancel::Withdrawn(_, _shelved) => notify.withdrawn(false),
             Cancel::Granted(BY_FIRST) => notify.notify_one(),
             Cancel::Granted(BY_LAST) => notify.notify_last(),
             Cancel::Granted(_) => {}
@@ -461,6 +604,123 @@ mod tests {
     use super::*;
     use crate::sync::test_support::{Polled, block_on};
     use core::task::Waker;
+
+    fn word(owed: &Owed) -> (u32, u16, u16) {
+        let at = Taken::decode(owed.0.load(Ordering::Acquire));
+        (at.tag, at.cur, at.old)
+    }
+
+    #[test]
+    fn owed_adds_current_turns_old_and_takes_by_generation() {
+        let owed = Owed::new();
+        owed.owe(7);
+        owed.owe(7);
+        assert_eq!(word(&owed), (7, 2, 0));
+        owed.owe(8);
+        assert_eq!(word(&owed), (8, 1, 2), "a newer tag turns the counts old");
+        owed.owe(7);
+        assert_eq!(word(&owed), (8, 1, 3), "an older tag adds an old count");
+        let taken = owed.take();
+        assert_eq!((taken.tag, taken.cur, taken.old), (8, 1, 3));
+        assert_eq!(
+            word(&owed),
+            (8, 0, 0),
+            "take clears the counts, keeps the tag"
+        );
+    }
+
+    #[test]
+    fn give_back_restores_a_word_of_the_same_tag() {
+        let owed = Owed::new();
+        owed.owe(5);
+        owed.owe(5);
+        owed.owe(4);
+        let taken = owed.take();
+        assert_eq!(word(&owed), (5, 0, 0));
+        owed.give_back(&taken);
+        assert_eq!(word(&owed), (5, 2, 1), "the word is as it was");
+        let taken = owed.take();
+        owed.owe(5);
+        owed.give_back(&taken);
+        assert_eq!(word(&owed), (5, 3, 1), "counts add to a new one of the tag");
+    }
+
+    #[test]
+    fn give_back_onto_a_word_that_moved_on_adds_older() {
+        let owed = Owed::new();
+        owed.owe(5);
+        owed.owe(5);
+        owed.owe(4);
+        let taken = owed.take();
+        owed.owe(6);
+        owed.give_back(&taken);
+        assert_eq!(word(&owed), (6, 1, 3), "all three come back as older");
+    }
+
+    #[test]
+    fn give_back_counts_stay_at_full() {
+        let owed = Owed::new();
+        for _ in 0..usize::from(FULL) + 5 {
+            owed.owe(3);
+        }
+        let taken = owed.take();
+        owed.owe(3);
+        owed.give_back(&taken);
+        assert_eq!(word(&owed), (3, FULL, 0));
+        let taken = owed.take();
+        owed.owe(4);
+        owed.give_back(&taken);
+        assert_eq!(word(&owed), (4, 1, FULL));
+    }
+
+    #[test]
+    fn owed_orders_tags_across_the_wrap() {
+        let owed = Owed::new();
+        owed.owe(1);
+        owed.owe(u32::MAX as usize);
+        assert_eq!(word(&owed), (1, 1, 1), "tag 1 is older than u32::MAX");
+        let owed = Owed::new();
+        owed.owe(u32::MAX as usize);
+        owed.owe(1);
+        assert_eq!(word(&owed), (1, 1, 1), "tag u32::MAX is older than 1");
+    }
+
+    #[test]
+    fn owed_counts_stay_at_full() {
+        let owed = Owed::new();
+        for _ in 0..usize::from(FULL) + 5 {
+            owed.owe(3);
+        }
+        assert_eq!(word(&owed), (3, FULL, 0));
+        owed.owe(4);
+        assert_eq!(word(&owed), (4, 1, FULL));
+        for _ in 0..usize::from(FULL) + 5 {
+            owed.owe(3);
+        }
+        assert_eq!(word(&owed), (4, 1, FULL));
+    }
+
+    #[test]
+    fn a_notify_one_after_a_broadcast_leaves_the_permit_for_a_later_waiter() {
+        let notify = Notify::new();
+        let mut old = Polled::new(notify.notified());
+        old.pending();
+        notify.notify_waiters();
+        notify.notify_one();
+        old.ready();
+        Polled::new(notify.notified()).ready();
+    }
+
+    #[test]
+    fn a_notify_one_before_a_broadcast_leaves_no_permit() {
+        let notify = Notify::new();
+        let mut old = Polled::new(notify.notified());
+        old.pending();
+        notify.notify_one();
+        notify.notify_waiters();
+        old.ready();
+        Polled::new(notify.notified()).pending();
+    }
 
     #[test]
     fn a_notification_before_the_wait_is_kept_once() {

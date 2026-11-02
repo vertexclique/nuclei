@@ -23,10 +23,20 @@
 (* task of n, whose own `blocking_*` opens a frame on top of o's; a frame  *)
 (* polls only its own future, so o is polled only once n has ended.        *)
 (*                                                                          *)
+(* A frame that opens freezes the `blocking_*` waits of the frames under   *)
+(* it on its thread (src/sync/internal.rs: `blocking` and its frames;      *)
+(* src/rt/shard/run.rs: `Shard::block_on`, which freezes them as it        *)
+(* opens): each frozen wait leaves the line as a dropped wait does,        *)
+(* passing on the lock if it was handed it, so the lock goes to a waiter   *)
+(* whose frame can run. When its frame is on top again it asks again, at   *)
+(* the back of the line (the `no_freeze` mutation is the code before).     *)
+(*                                                                          *)
 (* What must never happen, for the queue to be live: a waiter that is      *)
-(* polled again waiting for good. A stalled front, or a nested frame       *)
-(* under the waiter behind it, makes that happen: the two witnesses show   *)
-(* it, as the problem for the operator to decide.                          *)
+(* polled again waiting for good. A stalled front makes that happen: the   *)
+(* witness `W_never_polled` shows it, and it is the documented contract: a *)
+(* future its user stops polling keeps its place in a fair queue until it  *)
+(* is polled again or dropped (the sync primitives' docs,                  *)
+(* `site/src/learn/sync.html`). A nested frame no longer does.             *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -53,6 +63,7 @@ variables
     line = <<>>,                        \* the waiters in line, oldest first
     handed = [w \in W |-> FALSE],       \* the lock was handed to w, not taken up yet
     queued = [w \in W |-> FALSE],       \* w has queued (or taken the lock at once)
+    frozen = [w \in W |-> FALSE],       \* w's wait was withdrawn by a frame opened over it
     done = [w \in W |-> FALSE];         \* w held the lock and let it go
 
 define
@@ -72,6 +83,22 @@ macro Release() begin
     holder := Nobody;                   \* the one who let go holds nothing now
 end macro;
 
+\* A frame opening over o's freezes o's wait: o leaves the line, or, handed the lock already,
+\* hands it on to the front of the line (or leaves it free), as a dropped wait does.
+macro Freeze(o) begin
+    if handed[o] then
+        if line # <<>> then
+            handed := [handed EXCEPT ![o] = FALSE, ![Head(line)] = TRUE];
+            line := Tail(line);
+        else
+            handed[o] := FALSE;
+        end if;
+    else
+        line := SelectSeq(line, LAMBDA x : x # o);
+    end if;
+    frozen[o] := TRUE;
+end macro;
+
 \* The holder of the start: it lets the lock go once.
 fair process first = H
 begin
@@ -83,10 +110,23 @@ end process;
 \* A waiter: it queues for the lock, takes it up once handed over, holds it, and lets it go.
 fair process waiter \in W
 begin
-W_arrive:
-    \* It starts once whoever's frame runs it has queued; it takes a free lock with nobody in
-    \* line at once, else it queues at the back.
+W_open:
+    \* It starts once whoever's frame runs it has queued; its own frame opens on top of that
+    \* one and freezes the wait under it. MUTATION no_freeze: the wait under it stays queued.
     await MayStart(self, queued);
+    if Mutation # "no_freeze" then
+        with under = {p[1] : p \in {q \in Nest : q[2] = self}} do
+            if under # {} then
+                with o \in under do
+                    if ~done[o] /\ ~frozen[o] then
+                        Freeze(o);
+                    end if;
+                end with;
+            end if;
+        end with;
+    end if;
+W_arrive:
+    \* It takes a free lock with nobody in line at once, else it queues at the back.
     queued[self] := TRUE;               \* (record) it has asked
     if holder = Nobody /\ line = <<>> /\ \A v \in W : ~handed[v] then
         holder := self;                 \* free, and nobody waits: taken at once
@@ -95,10 +135,16 @@ W_arrive:
         line := Append(line, self);     \* it waits in line
     end if;
 W_take:
-    \* It is polled again only if it can run; then it takes up the lock handed to it.
-    await handed[self] /\ CanRun(self, done);
-    handed[self] := FALSE;              \* taken up ...
-    holder := self;                     \* ... it holds the lock
+    \* It is polled again only if it can run; then it takes up the lock handed to it, or, its
+    \* wait frozen while a frame sat over it, asks again.
+    await (handed[self] \/ frozen[self]) /\ CanRun(self, done);
+    if frozen[self] then
+        frozen[self] := FALSE;          \* its frame is on top again ...
+        goto W_arrive;                  \* ... and its wait asks again
+    else
+        handed[self] := FALSE;          \* taken up ...
+        holder := self;                 \* ... it holds the lock
+    end if;
 W_release:
     \* It lets the lock go, to the next in line.
     Release();
@@ -111,5 +157,121 @@ end algorithm; *)
 \* proofs/tla/run_tlc.sh runs it on a temporary copy before every check, so the tree never
 \* holds a translation that could fall out of date with the algorithm above.
 \* BEGIN TRANSLATION
+VARIABLES holder, line, handed, queued, frozen, done, pc
+
+(* define statement *)
+Exclusion == Cardinality({w \in W : handed[w]}) + (IF holder = Nobody THEN 0 ELSE 1) <= 1
+
+OthersEnd == <>(\A w \in W \ Stalls : done[w])
+
+
+vars == << holder, line, handed, queued, frozen, done, pc >>
+
+ProcSet == {H} \cup (W)
+
+Init == (* Global variables *)
+        /\ holder = H
+        /\ line = <<>>
+        /\ handed = [w \in W |-> FALSE]
+        /\ queued = [w \in W |-> FALSE]
+        /\ frozen = [w \in W |-> FALSE]
+        /\ done = [w \in W |-> FALSE]
+        /\ pc = [self \in ProcSet |-> CASE self = H -> "H_release"
+                                        [] self \in W -> "W_open"]
+
+H_release == /\ pc[H] = "H_release"
+             /\ IF line # <<>> /\ Mutation # "release_no_grant"
+                   THEN /\ handed' = [handed EXCEPT ![Head(line)] = TRUE]
+                        /\ line' = Tail(line)
+                   ELSE /\ TRUE
+                        /\ UNCHANGED << line, handed >>
+             /\ holder' = Nobody
+             /\ pc' = [pc EXCEPT ![H] = "Done"]
+             /\ UNCHANGED << queued, frozen, done >>
+
+first == H_release
+
+W_open(self) == /\ pc[self] = "W_open"
+                /\ MayStart(self, queued)
+                /\ IF Mutation # "no_freeze"
+                      THEN /\ LET under == {p[1] : p \in {q \in Nest : q[2] = self}} IN
+                                IF under # {}
+                                   THEN /\ \E o \in under:
+                                             IF ~done[o] /\ ~frozen[o]
+                                                THEN /\ IF handed[o]
+                                                           THEN /\ IF line # <<>>
+                                                                      THEN /\ handed' = [handed EXCEPT ![o] = FALSE, ![Head(line)] = TRUE]
+                                                                           /\ line' = Tail(line)
+                                                                      ELSE /\ handed' = [handed EXCEPT ![o] = FALSE]
+                                                                           /\ line' = line
+                                                           ELSE /\ line' = SelectSeq(line, LAMBDA x : x # o)
+                                                                /\ UNCHANGED handed
+                                                     /\ frozen' = [frozen EXCEPT ![o] = TRUE]
+                                                ELSE /\ TRUE
+                                                     /\ UNCHANGED << line, 
+                                                                     handed, 
+                                                                     frozen >>
+                                   ELSE /\ TRUE
+                                        /\ UNCHANGED << line, handed, frozen >>
+                      ELSE /\ TRUE
+                           /\ UNCHANGED << line, handed, frozen >>
+                /\ pc' = [pc EXCEPT ![self] = "W_arrive"]
+                /\ UNCHANGED << holder, queued, done >>
+
+W_arrive(self) == /\ pc[self] = "W_arrive"
+                  /\ queued' = [queued EXCEPT ![self] = TRUE]
+                  /\ IF holder = Nobody /\ line = <<>> /\ \A v \in W : ~handed[v]
+                        THEN /\ holder' = self
+                             /\ pc' = [pc EXCEPT ![self] = "W_release"]
+                             /\ line' = line
+                        ELSE /\ line' = Append(line, self)
+                             /\ pc' = [pc EXCEPT ![self] = "W_take"]
+                             /\ UNCHANGED holder
+                  /\ UNCHANGED << handed, frozen, done >>
+
+W_take(self) == /\ pc[self] = "W_take"
+                /\ (handed[self] \/ frozen[self]) /\ CanRun(self, done)
+                /\ IF frozen[self]
+                      THEN /\ frozen' = [frozen EXCEPT ![self] = FALSE]
+                           /\ pc' = [pc EXCEPT ![self] = "W_arrive"]
+                           /\ UNCHANGED << holder, handed >>
+                      ELSE /\ handed' = [handed EXCEPT ![self] = FALSE]
+                           /\ holder' = self
+                           /\ pc' = [pc EXCEPT ![self] = "W_release"]
+                           /\ UNCHANGED frozen
+                /\ UNCHANGED << line, queued, done >>
+
+W_release(self) == /\ pc[self] = "W_release"
+                   /\ IF line # <<>> /\ Mutation # "release_no_grant"
+                         THEN /\ handed' = [handed EXCEPT ![Head(line)] = TRUE]
+                              /\ line' = Tail(line)
+                         ELSE /\ TRUE
+                              /\ UNCHANGED << line, handed >>
+                   /\ holder' = Nobody
+                   /\ pc' = [pc EXCEPT ![self] = "W_done"]
+                   /\ UNCHANGED << queued, frozen, done >>
+
+W_done(self) == /\ pc[self] = "W_done"
+                /\ done' = [done EXCEPT ![self] = TRUE]
+                /\ pc' = [pc EXCEPT ![self] = "Done"]
+                /\ UNCHANGED << holder, line, handed, queued, frozen >>
+
+waiter(self) == W_open(self) \/ W_arrive(self) \/ W_take(self)
+                   \/ W_release(self) \/ W_done(self)
+
+(* Allow infinite stuttering to prevent deadlock on termination. *)
+Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
+               /\ UNCHANGED vars
+
+Next == first
+           \/ (\E self \in W: waiter(self))
+           \/ Terminating
+
+Spec == /\ Init /\ [][Next]_vars
+        /\ WF_vars(first)
+        /\ \A self \in W : WF_vars(waiter(self))
+
+Termination == <>(\A self \in ProcSet: pc[self] = "Done")
+
 \* END TRANSLATION
 =============================================================================

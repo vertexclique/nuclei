@@ -20,6 +20,9 @@
 //!    timers are due;
 //! 5. it lets go of the advance.
 //!
+//! A sleep armed from a thread outside the runtime counts itself in flight
+//! from its look at the clock to its post (`ForeignArm.tla`).
+//!
 //! A shard that wakes while an advance is claimed waits for it to be let go
 //! before it reads the clock, so no timer is armed against the time before
 //! the jump and found late after it. All of this runs only while a clock is
@@ -90,10 +93,10 @@ pub(crate) fn try_advance(inner: &Inner, me: Option<&Shared>) -> bool {
     due
 }
 
-/// Work in flight on no shard a paused clock looks at: a blocking job, or a
-/// poll the handoff took from its thread.
+/// Work in flight on no shard a paused clock looks at: a blocking job, a
+/// poll the handoff took from its thread, or a remote arm about to post.
 fn in_flight(inner: &Inner) -> bool {
-    inner.pool.jobs() != 0 || inner.workers.detached() != 0
+    inner.pool.jobs() != 0 || inner.workers.detached() != 0 || inner.clock.arms() != 0
 }
 
 fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {

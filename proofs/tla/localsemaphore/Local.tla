@@ -20,6 +20,14 @@
 (* anybody waits. The tasks run on one thread, so a poll or a drop is one  *)
 (* step: the model interleaves whole steps in every order.                 *)
 (*                                                                         *)
+(* Two steps run user code, a waker. An acquire that joins the line       *)
+(* clones its waker first: with Reentrant that clone is a step of its own, *)
+(* so a release (another task's, run by a clone that drops a permit) may   *)
+(* come between its look and its join; it then looks again before it      *)
+(* joins. A serve wakes each waiter it grants; a waker in WakePanics       *)
+(* panics, and a guard serves the rest of the line before the panic goes   *)
+(* on to the releaser's caller.                                            *)
+(*                                                                         *)
 (* What must never happen: a permit lost or made up, a task served ahead   *)
 (* of one that was already waiting when it asked, a waiter left asleep     *)
 (* with its permits free at the front of the line, or a task never served. *)
@@ -34,6 +42,8 @@ CONSTANTS
     Needs,     \* each task's need: a function from {"a", "b", "c"}
     Cancels,   \* the tasks whose acquire may be dropped
     Tries,     \* the tasks that try once without waiting
+    Reentrant, \* an acquire's clone of its waker, before it joins the line, is a step of its own
+    WakePanics,\* the tasks whose waker panics when a serve grants them
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Tasks == {"a", "b", "c"}
@@ -48,9 +58,17 @@ RECURSIVE Sum(_)
 Sum(l) == IF l = <<>> THEN 0 ELSE Needs[Head(l)] + Sum(Tail(l))
 \* The pass (`serve`) with `p` free permits over line `l`: who is granted, what line is left,
 \* and what stays free.
-Granted(l, p) == {l[i] : i \in 1..Fit(l, p)}
-LineAfter(l, p) == SubSeq(l, Fit(l, p) + 1, Len(l))
-FreeAfter(l, p) == p - Sum(SubSeq(l, 1, Fit(l, p)))
+\* How many of the first `n` waiters of line `l` a serve reaches when it stops at the first one
+\* whose waker panics (that one granted, the rest not).
+RECURSIVE Reached(_, _)
+Reached(l, n) == IF n = 0 THEN 0 ELSE IF Head(l) \in WakePanics THEN 1 ELSE 1 + Reached(Tail(l), n - 1)
+\* The fit of a serve: every waiter that fits, or, with MUTATION serve_stops_at_panic, those up to
+\* the first panicking waker.
+Served(l, p) == IF Mutation = "serve_stops_at_panic" THEN Reached(l, Fit(l, p)) ELSE Fit(l, p)
+\* Who the serve grants.
+Granted(l, p) == {l[i] : i \in 1..Served(l, p)}
+LineAfter(l, p) == SubSeq(l, Served(l, p) + 1, Len(l))
+FreeAfter(l, p) == p - Sum(SubSeq(l, 1, Served(l, p)))
 \* The line without task `t`.
 Without(l, t) == SelectSeq(l, LAMBDA x : x # t)
 
@@ -106,8 +124,29 @@ T_ask:
         state[self] := "holding";
         got[self] := clock;
         goto T_release;
+    elsif Reentrant then
+        \* It clones its waker to join with: a step of its own.
+        goto T_join;
     else
         \* Otherwise the task joins the back of the line and sleeps.
+        setAside := setAside \/ permits > 0;
+        line := Append(line, self);
+        state[self] := "waiting";
+        goto T_wait;
+    end if;
+T_join:
+    \* After the clone it looks again: permits a release freed meanwhile, with nobody waiting,
+    \* are taken at once. MUTATION join_after_clone: it joins without looking.
+    if line = <<>> /\ permits >= Needs[self] /\ Mutation # "join_after_clone" then
+        permits := permits - Needs[self];
+        state[self] := "holding";
+        got[self] := clock;
+        goto T_release;
+    else
+        \* Its place in line is its join: a task that came during the clone and found the line
+        \* empty took nothing from it.
+        began[self] := clock;
+        clock := clock + 1;
         setAside := setAside \/ permits > 0;
         line := Append(line, self);
         state[self] := "waiting";

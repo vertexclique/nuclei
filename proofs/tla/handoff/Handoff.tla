@@ -49,7 +49,8 @@
 (* pending, and the monitor hands the shard on with a fresh slot           *)
 (* (`Monitor::slot` in `monitor::take`) and never claims the old one       *)
 (* again; so each such call backs out and stays out. The detached runner   *)
-(* then drains the bound tasks it created and waits as a spare itself.     *)
+(* then runs its bound tasks on its own shard until each one ended, or the *)
+(* runtime shuts down (`finish_home`, `home_done`), and waits as a spare.  *)
 (*                                                                          *)
 (* With `Nested`, a call may run a nested `block_on` on the same shard and *)
 (* slot (`Shard::block_on` in src/rt/shard/run.rs, from `block_on_here` in *)
@@ -73,6 +74,27 @@
 (* its guard ends it as its normal end does (`Bracket`'s drop in           *)
 (* src/rt/context.rs; `After`'s drop in src/io/side/after.rs, through      *)
 (* `context::unmark_unwound`).                                             *)
+(*                                                                          *)
+(* With `Mode = "wait"` the monitor takes a blocked poll's shard whether a *)
+(* spare waits or not (`take`, `give` and `waiting` in `monitor::run`,     *)
+(* src/rt/handoff/monitor.rs): `give` hands it to a spare that waits, else *)
+(* starts a thread for it (`Workers::spawn_runner`), and a start may fail. *)
+(* A gift no thread took stays with the monitor, the shard its own, and   *)
+(* goes at the next tick to a spare that came by then or to a thread      *)
+(* started then. Thread 2 is the one a start makes: it runs nothing until *)
+(* started. Under "wait" a start fails at most once, then one succeeds;    *)
+(* under "wait_no_start" every start fails, and the gift waits for the     *)
+(* taken thread itself to come back as a spare.                            *)
+(*                                                                          *)
+(* Two limits of the rescue are stated as configurations that break       *)
+(* `Rescued`: user code the runtime runs inside the shard (a waker of a    *)
+(* timer `fire_timers` wakes, a park hook, a `ShardLocal::with` closure,   *)
+(* a nested `block_on` future dropped inside it) that blocks is never      *)
+(* taken, for the runner's word says it is in the loop                    *)
+(* (`Mode = "inside_block"`); and user code on the monitor's thread (the   *)
+(* long-poll hook told of another place's poll in the same pass, a task's *)
+(* destructor in `let_go`, `Spare::drop` or a hand-over into a stopped    *)
+(* shard) that blocks stops every rescue after it (`Mode = "hook_blocks"`).*)
 (*                                                                          *)
 (* What is modelled step by step: each thread's store buffer (in order),   *)
 (* the flush of a buffer's oldest store at any time, the heavy fence as    *)
@@ -151,7 +173,9 @@ variables
     ownerDetached = 0,                   \* (record) a detached thread's IO owner step went the foreign way
     markNoSlot = FALSE,                  \* an IO owner's mark read a thread's own slot the detach cleared
     stopped = {},                        \* threads whose worker loop answered "stopped"
-    fenceFails = 0;                      \* (record) a heavy fence failed and the take was cancelled
+    fenceFails = 0,                      \* (record) a heavy fence failed and the take was cancelled
+    startFails = 0,                      \* (wait) thread starts that failed, at most one counted
+    waited = 0;                          \* (record, wait) a gift waited with the monitor for a thread
 
 define
     \* At most one actor is inside the shard's owned part.
@@ -179,6 +203,8 @@ define
     \* An IO owner's mark (`mark_call`) is made only by a thread that runs its shard, through its own slot.
     NoMarkWithoutSlot == ~markNoSlot
     NoFenceFailed == fenceFails = 0
+    \* The monitor takes with no spare waiting, a start of a thread for the gift that may fail.
+    Wait == Mode \in {"wait", "wait_no_start", "start_drops_gift"}
     \* The leaf push is part of the algorithm under these modes: the leaf and its mutations.
     Leaf == Mode \in {"leaf", "leaf_no_check", "leaf_keeps_mark", "taken_cleared", "no_leaf_fence"}
     \* Whether runner `a` may look at its claim now. With no heavy fence (`Fence = "full"`) the
@@ -234,7 +260,17 @@ begin
 T_begin:
     if self = 1 then
         sl := 1;
-        goto R_loop;
+        \* With `Mode = "inside_block"`, user code the loop runs inside the shard at its first turn (a
+        \* timer's waker as `fire_timers` wakes it, a park hook) blocks for good: the runner's word
+        \* says loop, so the monitor never sees a poll to take, and the runner never leaves (a limit).
+        if Mode = "inside_block" then
+            goto Blocked_in;
+        else
+            goto R_loop;
+        end if;
+    elsif Wait then
+        \* With `Wait`, thread 2 is the thread a start makes: it runs nothing until started.
+        goto Unstarted;
     end if;
 Spare:
     \* Waits to be handed a shard; the monitor left it, with every store it made.
@@ -505,6 +541,20 @@ L_back:
     goto B_store;
 Blocked:
     await FALSE;
+Blocked_in:
+    \* (inside_block) Blocked for good inside the shard, in user code the runtime runs there.
+    await FALSE;
+Unstarted:
+    \* (wait) Not started yet: a start the monitor makes for a gift hands it the shard, with a
+    \* fresh slot, and the thread runs it from its first look at its queues.
+    await assign[self] # 0;
+    sl := assign[self];
+    assign[self] := 0;
+    runs := runs \cup {self};
+    e := 0;
+    polls := 0;
+    inS := inS \cup {self};
+    goto R_loop;
 D_unwind:
     \* Detached: the rest of the stack unwinds, and its code may call into the runtime again on the
     \* slot it was taken from (`Bracket`'s drop put it back): a leaf push, a bracket or an IO owner's
@@ -556,10 +606,17 @@ variables ms = 0, mv = 0;
 begin
 M_tick:
     while handoffs < MaxHandoffs do
-        \* A runner in one poll, and a spare to hand its shard to.
-        await word[runnerSlot] > 0 /\ \E t \in Threads : pc[t] = "Spare";
+        \* A runner in one poll, and a spare to hand its shard to; with `Wait`, a spare or not.
+        await word[runnerSlot] > 0 /\ (Wait \/ \E t \in Threads : pc[t] = "Spare");
         ms := runnerSlot;
         mv := word[ms];
+        \* With `Mode = "hook_blocks"`, user code the monitor runs on its thread before this take
+        \* (the long-poll hook of another place's poll in the same pass, a task's destructor as
+        \* `let_go`, `Spare::drop` or a hand-over into a stopped shard drops it) blocks for good:
+        \* the monitor takes nothing again (a limit).
+        if Mode = "hook_blocks" then
+            goto M_hook;
+        end if;
 M_claim:
         await Len(buf[Mon]) < BufCap;
         buf[Mon] := Append(buf[Mon], <<"claim", ms, PENDING>>);
@@ -622,21 +679,57 @@ M_take:
             goto M_tick;
         end if;
 M_give:
-        with t \in {u \in Threads : pc[u] = "Spare"} do
-            if Mode = "slot_reuse" then
-                \* The spare is handed the old slot, its claim cleared, in memory.
-                claim[ms] := NONE;
-                assign[t] := ms;
-                runnerSlot := ms;
-            else
-                assign[t] := nextSlot;
+        if Wait /\ ~\E u \in Threads : pc[u] = "Spare" then
+            \* (wait) No spare waits: `give` starts a thread for the gift (`spawn_runner`).
+            either
+                \* The start fails (at most once under "wait", always under "wait_no_start"):
+                \* `give` answers the gift back, which waits with the monitor, the shard its own.
+                await Mode = "wait_no_start" \/ startFails < 1;
+                startFails := 1;
+                waited := 1;
+                \* (MUTATION start_drops_gift: the failed start lets the gift go, as if `give`
+                \* dropped it: the shard is nobody's, and its work never runs.)
+                if Mode = "start_drops_gift" then
+                    inS := inS \ {Mon};
+                    handoffs := MaxHandoffs;
+                    goto M_tick;
+                else
+                    goto M_waits;
+                end if;
+            or
+                \* The start succeeds: thread 2 runs the shard, with a fresh slot.
+                await Mode # "wait_no_start" /\ pc[2] = "Unstarted";
+                assign[2] := nextSlot;
                 runnerSlot := nextSlot;
                 nextSlot := nextSlot + 1;
-            end if;
-            inS := inS \ {Mon};
-            handoffs := handoffs + 1;
-        end with;
+                inS := inS \ {Mon};
+                handoffs := handoffs + 1;
+            end either;
+        else
+            with t \in {u \in Threads : pc[u] = "Spare"} do
+                if Mode = "slot_reuse" then
+                    \* The spare is handed the old slot, its claim cleared, in memory.
+                    claim[ms] := NONE;
+                    assign[t] := ms;
+                    runnerSlot := ms;
+                else
+                    assign[t] := nextSlot;
+                    runnerSlot := nextSlot;
+                    nextSlot := nextSlot + 1;
+                end if;
+                inS := inS \ {Mon};
+                handoffs := handoffs + 1;
+            end with;
+        end if;
     end while;
+    goto Done;
+M_waits:
+    \* (wait) The next tick: the waiting gift goes to a spare that came, or a thread started now
+    \* (`waiting` at the head of `monitor::run`); no other take is made meanwhile.
+    goto M_give;
+M_hook:
+    \* (hook_blocks) Blocked for good in user code on the monitor's thread.
+    await FALSE;
 end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.

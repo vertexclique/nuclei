@@ -1,8 +1,9 @@
 ----------------------------- MODULE AtomicWaker -----------------------------
 (***************************************************************************)
 (* The waker cell (src/sync/atomic_waker.rs: `register`,                   *)
-(* `register_displacing`, `register_returning`, `take`, `wake`), at the    *)
-(* grain of each atomic access to its state word and its slot.             *)
+(* `register_displacing`, `register_returning` and its `Abandon` guard,    *)
+(* `woken_while_registering`, `take`, `wake`), at the grain of each atomic *)
+(* access to its state word and its slot.                                  *)
 (*                                                                          *)
 (* In plain words: one state word says whether a registration (REGISTERING) *)
 (* or a wake (WAKING) holds the slot. A registration claims the word from  *)
@@ -23,6 +24,14 @@
 (* a take touching the slot at once; a task asleep for good with its event *)
 (* set.                                                                    *)
 (*                                                                          *)
+(* A waker's clone is user code, and may panic. A task in ClonePanics has   *)
+(* its first clone panic while it holds REGISTERING, before the slot is    *)
+(* written: a guard then gives the word back as the failure path does (a   *)
+(* wake that met the registration has the slot's waker woken), and the    *)
+(* panic goes on to the poll's caller, which polls again. Without the      *)
+(* guard REGISTERING stays up for good: every later registration finds the *)
+(* cell in use and wakes itself at once, and every take takes nothing.     *)
+(*                                                                          *)
 (* What is abstract: a waker is its task's name, and calling it marks the  *)
 (* task woken; the event is one flag.                                      *)
 (***************************************************************************)
@@ -32,6 +41,7 @@ CONSTANTS
     Tasks,       \* the tasks that wait on the cell
     Wakers,      \* the threads that set the event and wake the cell, once each
     Displacing,  \* the tasks register with `register_displacing`
+    ClonePanics, \* the tasks whose first clone of their waker panics
     Mutation     \* "none", or the name of the one rule this run takes away
 
 None == "none"
@@ -43,7 +53,8 @@ variables
     slot = None,               \* the waker in the slot
     ready = FALSE,             \* the event the tasks wait for
     woken = [t \in Tasks |-> FALSE],  \* each task's waker was called, not yet seen
-    owed = [t \in Tasks |-> FALSE];   \* (record) the cell owes the task its own wake
+    owed = [t \in Tasks |-> FALSE],   \* (record) the cell owes the task its own wake
+    panicked = [t \in Tasks |-> FALSE]; \* the task's one panicking clone happened
 
 define
     \* The labels where a party reads or writes the slot.
@@ -60,6 +71,8 @@ define
     SelfWoken == \A t \in Tasks : pc[t] = "P_check" /\ owed[t] => woken[t]
     \* Every task ends once the event is set.
     AllEnd == <>(\A t \in Tasks : pc[t] = "Done")
+    \* REGISTERING, once raised, is always lowered again: the cell recovers from every panic.
+    Recovers == registering ~> ~registering
 end define;
 
 \* A waker is called: its task is told.
@@ -89,11 +102,17 @@ A_claim:
         registering := TRUE;
     end if;
 A_store:
-    \* The slot: kept as it is if it wakes this task, else replaced (the different one
-    \* it held kept aside).
+    \* The slot: kept as it is if it wakes this task, else replaced by a clone of the task's
+    \* waker (the different one it held kept aside). The clone is user code: for a task in
+    \* ClonePanics the first one panics, before the slot is written.
     if slot # self then
-        displaced := slot;
-        slot := self;
+        if self \in ClonePanics /\ ~panicked[self] then
+            panicked[self] := TRUE;         \* the clone panics, REGISTERING held
+            goto A_unwind;
+        else
+            displaced := slot;              \* the different waker, kept aside
+            slot := self;                   \* the clone, stored
+        end if;
     end if;
 A_release:
     \* The second compare-and-swap, REGISTERING to WAITING: it fails only with WAKING up.
@@ -134,6 +153,21 @@ P_sleep:
     \* Asleep until its waker is called; then it polls again.
     await woken[self];
     woken[self] := FALSE;
+    goto P_look;
+A_unwind:
+    \* The guard of the panicking clone gives the word back as the failure path does: with no
+    \* wake met, one compare-and-swap lowers REGISTERING; with WAKING up, the slot's waker
+    \* (the one registered before) is taken out and woken, and the word freed. The slot keeps
+    \* what it held. Then the panic reaches the poll's caller, which polls again.
+    \* MUTATION clone_unguarded: no guard; REGISTERING stays up for good.
+    if Mutation # "clone_unguarded" then
+        if waking then
+            fire(slot);                     \* the wake that met the registration reaches its task
+            slot := None;                   \* the slot handed back empty
+            waking := FALSE;                \* the word freed ...
+        end if;
+        registering := FALSE;               \* ... REGISTERING lowered
+    end if;
     goto P_look;
 end process;
 

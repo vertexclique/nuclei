@@ -18,7 +18,7 @@ use crate::syscore::linux::iouring::ring::RingConfig;
 
 /// A shard on a ring whose table holds `files` fixed files, or `None` where
 /// the kernel gives no ring.
-fn ring_shard(files: u32) -> Option<Shard> {
+pub(super) fn ring_shard(files: u32) -> Option<Shard> {
     TABLE_FOR_TEST.with(|t| t.set(Some(files)));
     let shard = Shard::new(Limits {
         max_nesting: 8,
@@ -267,6 +267,129 @@ fn a_file_call_its_shard_gives_up_on_ends_with_an_error() {
         matches!(job.poll(waker), core::task::Poll::Ready((Err(_), _))),
         "the call given up on left its slot empty"
     );
+}
+
+/// A file's read on a pipe, out on the ring of `shard` and left in the kernel when the shard
+/// goes (the cancel is skipped, as for a call that ignores it). The pipe's write end comes
+/// back with the job and the source, to keep them alive.
+pub(super) fn pipe_read_out(shard: &Shard) -> PipeRead {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let _current = context::enter(shard);
+    let mut fds = [0; 2];
+    // SAFETY: the kernel fills the two descriptors of our array, owned at once below.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: just made, owned once each.
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let file = Source::new(read_end.as_raw_fd(), Kind::File);
+    let lease = file.lease().unwrap();
+    let mut held = Some(crate::buf::owned::OwnedBuf::Vec(Vec::with_capacity(4096)));
+    let job = crate::fs::ring::read_lent(&lease, u64::MAX, &mut held, std::task::Waker::noop())
+        .expect("the call goes on the ring");
+    // The shard's next look hands the read to the kernel, where it waits for the pipe's bytes.
+    shard.block_on(async {});
+    assert!(
+        shard.ring().unwrap().in_flight() > 0,
+        "the read is not in the kernel"
+    );
+    PipeRead {
+        job,
+        write_end,
+        _read_end: read_end,
+        _file: file,
+        _lease: lease,
+    }
+}
+
+pub(super) struct PipeRead {
+    pub(super) job: crate::fs::call::SlotJob<crate::fs::call::LentReadEnd>,
+    pub(super) write_end: std::os::fd::OwnedFd,
+    _read_end: std::os::fd::OwnedFd,
+    _file: Arc<Source>,
+    _lease: super::Lease,
+}
+
+/// A file's call out when the short wait ends is not given up on: the shard keeps reaping it up
+/// to the linger time, so a read the kernel ends after 1.5 s is applied, with every byte, and
+/// nothing is given up or counted (`proofs/tla/keeper/Forgot.tla`).
+#[test]
+fn a_file_call_that_outlasts_the_short_wait_is_reaped_before_its_shard_goes() {
+    if !crate::alone::alone(
+        "rt::shard::ring::tests::a_file_call_that_outlasts_the_short_wait_is_reaped_before_its_shard_goes",
+    ) {
+        return;
+    }
+    let Some(shard) = ring_shard(4) else { return };
+    if !shard.ring().is_some_and(|ring| !ring.reapable()) {
+        eprintln!("skipping: a keeper can take this ring");
+        return;
+    }
+    let mut pipe = pipe_read_out(&shard);
+    let pattern: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+    let writer = {
+        let pattern = pattern.clone();
+        let write_end = pipe.write_end.try_clone().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            std::fs::File::from(write_end).write_all(&pattern).unwrap();
+        })
+    };
+    let leaked = super::leaked();
+    let given_up = crate::stats().operations_given_up;
+    super::keeper::SKIP_CANCEL_FOR_TEST.with(|skip| skip.set(true));
+    drop(shard);
+    super::keeper::SKIP_CANCEL_FOR_TEST.with(|skip| skip.set(false));
+    writer.join().unwrap();
+    let end = pipe.job.poll(std::task::Waker::noop());
+    let core::task::Poll::Ready((Ok(n), crate::buf::owned::OwnedBuf::Vec(got))) = end else {
+        panic!(
+            "the read did not end with its bytes: {:?}",
+            end.map(|(r, _)| r)
+        );
+    };
+    assert_eq!(n, pattern.len());
+    assert_eq!(got, pattern, "the bytes read differ");
+    assert_eq!(super::leaked(), leaked, "a file call was given up on");
+    assert_eq!(crate::stats().operations_given_up, given_up);
+}
+
+/// A file's call the kernel still holds when the linger time ran out is given up on: its slot
+/// gets an error, it is counted, and the drop returns by the linger time, not later.
+#[test]
+fn a_file_call_past_the_linger_time_is_given_up_said_and_counted() {
+    if !crate::alone::alone(
+        "rt::shard::ring::tests::a_file_call_past_the_linger_time_is_given_up_said_and_counted",
+    ) {
+        return;
+    }
+    let Some(shard) = ring_shard(4) else { return };
+    if !shard.ring().is_some_and(|ring| !ring.reapable()) {
+        eprintln!("skipping: a keeper can take this ring");
+        return;
+    }
+    let mut pipe = pipe_read_out(&shard);
+    let leaked = super::leaked();
+    let given_up = crate::stats().operations_given_up;
+    super::keeper::SKIP_CANCEL_FOR_TEST.with(|skip| skip.set(true));
+    super::keeper::FILE_WAIT_FOR_TEST.with(|wait| wait.set(Some(Duration::from_millis(200))));
+    let started = std::time::Instant::now();
+    drop(shard);
+    let took = started.elapsed();
+    super::keeper::SKIP_CANCEL_FOR_TEST.with(|skip| skip.set(false));
+    super::keeper::FILE_WAIT_FOR_TEST.with(|wait| wait.set(None));
+    assert!(
+        took < Duration::from_secs(5),
+        "the drop ignored the linger time: {took:?}"
+    );
+    assert!(
+        matches!(
+            pipe.job.poll(std::task::Waker::noop()),
+            core::task::Poll::Ready((Err(_), _))
+        ),
+        "the call given up on left its slot without an error"
+    );
+    assert_eq!(super::leaked(), leaked + 1);
+    assert!(crate::stats().operations_given_up > given_up);
 }
 
 /// A shard that goes with a read out on its ring cancels it and waits for

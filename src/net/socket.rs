@@ -107,7 +107,7 @@ impl TcpSocket {
 
     /// Sets `SO_LINGER` to zero: the close drops unsent data and resets the connection.
     ///
-    /// A stream connected from this socket, or accepted from a listener made of it, waits as
+    /// A stream connected from this socket, or accepted from a listener made of it, closes as
     /// [`TcpStream::set_zero_linger`](crate::net::TcpStream::set_zero_linger) says.
     pub fn set_zero_linger(&self) -> io::Result<()> {
         self.set_linger(Some(Duration::ZERO))

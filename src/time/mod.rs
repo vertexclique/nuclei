@@ -46,6 +46,16 @@ use core::time::Duration;
 /// idle with a timer armed, no blocking job runs and no poll the handoff took
 /// from its worker still runs (it jumps to the earliest timer). A paused clock
 /// stays paused, and never reads earlier than a time it gave before the pause.
+/// A nested `block_on` of another runtime on the same thread keeps its own
+/// clock and timers, and its paused clock does not count that shard.
+///
+/// The shards counted are the runtime's workers and the shards of the threads
+/// that entered its `block_on` while the clock was already paused. A thread
+/// inside `block_on` from before a pause made elsewhere (in a spawned task on a
+/// worker, say) is not counted: a sleep it waits on is no jump target, and
+/// waits until something else wakes the thread, which may be never. Pause in
+/// the `block_on` future itself, before it, or with
+/// [`start_paused`](crate::Builder::start_paused).
 ///
 /// ```
 /// use std::time::Duration;

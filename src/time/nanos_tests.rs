@@ -55,6 +55,7 @@ fn a_sleep_past_the_clocks_range_ends_as_far_off_as_before() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "starts a runtime, whose shards need the kernel poller")]
 fn an_expired_deadline_is_ready_at_its_first_poll() {
     let mut cx = Context::from_waker(Waker::noop());
     crate::block_on(async {

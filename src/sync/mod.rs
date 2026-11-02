@@ -56,6 +56,9 @@
 //!   serve to compete again. One that loses [`MAX_BYPASS`](crate::sync::MAX_BYPASS) times is owed a
 //!   handoff: nobody gets in ahead of it, and the next release hands it
 //!   what it waits for directly. Fairness is counted, never timed.
+//!   A waiting future that its user never polls again (kept but not polled,
+//!   or passed to `std::mem::forget`) keeps its place, and the waiters
+//!   behind it wait until it is polled again or dropped.
 //! - **Cancellation-safe.** Dropping a pending future withdraws its
 //!   waiter. If something was handed to it concurrently, the drop passes
 //!   it on. No wakeup is lost. (A [`Barrier`](crate::sync::Barrier) wait is the one exception: an
@@ -154,6 +157,8 @@ mod cancellation;
 mod contend;
 mod event;
 mod fair_semaphore;
+#[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
+mod frames;
 pub(crate) mod internal;
 mod latch;
 mod lazy;
@@ -179,6 +184,7 @@ mod reentrant_rwlock;
 mod rwlock;
 mod semaphore;
 mod set_once;
+mod siblings;
 mod spin;
 #[cfg(all(test, not(loom)))]
 pub(crate) mod test_support;

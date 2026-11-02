@@ -154,3 +154,9 @@ RH_recv_interruptible          MC_RingHandoff       pass
 RH_recv_ends                   MC_RingHandoff       pass
 MRH_recv_no_adopt              MC_RingHandoff       violated:IoRescued
 MRH_zombie_drops_data          MC_RingHandoff       violated:IoRescued
+RR_port_udp_short              MC_RingRecv          pass
+RR_port_udp_starved_short      MC_RingRecv          pass
+RR_ring_udp_short              MC_RingRecv          pass
+RR_epoll_udp_short             MC_RingRecv          pass
+MRR_port_cut_ok                MC_RingRecv          violated:AsStd
+MRR_port_starved_cut_ok        MC_RingRecv          violated:AsStd

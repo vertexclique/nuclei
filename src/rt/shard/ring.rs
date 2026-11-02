@@ -100,6 +100,8 @@ pub(crate) struct ShardRing {
     waitid: bool,
     /// The kernel has `IORING_OP_SEND_ZC` (Linux 6.0).
     send_zc: bool,
+    /// The recovery from dropped completions (see `recover`).
+    recover: recover::Recover,
     /// A zero-copy send was refused for lack of lockable memory: the ring sends with copies from
     /// then on.
     zc_denied: Cell<bool>,
@@ -214,6 +216,7 @@ impl ShardRing {
             exit_ops: RefCell::new(Ops::new((1 << 30) - 256)),
             waitid,
             send_zc,
+            recover: recover::Recover::default(),
             zc_denied: Cell::new(false),
             zero_copy_min: Cell::new(crate::io::source::ring::SEND_ZC_MIN),
             reapable: cfg.multi_issuer,
@@ -378,12 +381,24 @@ impl ShardRing {
             self.polls_armed.set(self.polls_armed.get() + 1);
         }
         let write = counts_as_write(&op);
-        let inserted = self.ops.borrow_mut().insert(op);
+        #[cfg(test)]
+        let full = REFUSE_INSERT_FOR_TEST.with(|n| n.replace(n.get().saturating_sub(1))) > 0;
+        #[cfg(not(test))]
+        let full = false;
+        let inserted = if full {
+            Err(op)
+        } else {
+            self.ops.borrow_mut().insert(op)
+        };
         let user_data = match inserted {
             Ok(user_data) => user_data,
-            // Past 2^32 - 2 operations at once (two per source at most).
+            // The table holds (1 << 31) - 1 operations (two per source at most) and is full: the
+            // resource ran out, which is ENOMEM. Not ENOBUFS, which a multishot receive reads as
+            // its group running dry (it would arm again at once and meet the full table) and a
+            // zero-copy send as the kernel refusing zero copy. A zero-copy send that ends here
+            // ends for its caller with ENOMEM, as a copied send of the same full table would.
             Err(op) => {
-                self.end(None, op, -libc::ENOBUFS);
+                self.end(None, op, -libc::ENOMEM);
                 return IGNORED;
             }
         };
@@ -447,7 +462,7 @@ impl ShardRing {
     /// is left for its task.
     fn complete_file(&self, user_data: u64, res: i32) {
         let Some(op) = self.file_ops.borrow_mut().remove(user_data & !FILE_TAG) else {
-            return;
+            return self.swept_file_ended(user_data);
         };
         self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
         self.admit_waiting();
@@ -669,9 +684,13 @@ impl ShardRing {
     /// build: the cost the inliner weighs it at sits near its limit, so the code around it decides.
     #[inline(always)]
     fn complete(&self, shard: Option<&Shard>, cqe: IoUringCqe) {
+        #[cfg(test)]
+        if self.drops_for_test(&cqe) {
+            return;
+        }
         if cqe.user_data & FILE_TAG != 0 {
             if cqe.user_data & EXIT_TAG != 0 {
-                self.complete_exit(cqe.user_data, cqe.res);
+                self.complete_exit(shard, cqe.user_data, cqe.res);
             } else {
                 self.complete_file(cqe.user_data, cqe.res);
             }
@@ -714,7 +733,7 @@ impl ShardRing {
             return;
         }
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
-            return;
+            return self.recover.late(cqe.user_data);
         };
         if let RingMem::Zombie | RingMem::RecvZombie { .. } = op.mem {
             return self.bury(cqe.user_data, op);
@@ -815,7 +834,7 @@ impl ShardRing {
     }
 
     /// A zombie's end (see [`adopt`](Self::adopt)): its slot is named once less and its source
-    /// counts it no more; its side is told nothing.
+    /// counts it no more, its side told nothing.
     #[cold]
     #[inline(never)]
     fn bury(&self, user_data: u64, op: RingOp) {
@@ -1113,6 +1132,18 @@ const ACCEPT_CAP: usize = 256;
 /// slab never hands out), and it is not the wake's.
 const IGNORED: u64 = u32::MAX as u64;
 
+/// The user data of the poller's request for a recovery from dropped completions, and of the
+/// timeout that runs its sweep: [`IGNORED`]'s index with a generation of their own, which no
+/// slab hands out (see `recover`).
+pub(crate) const RECOVER: u64 = IGNORED | (1 << 32);
+const SWEEP: u64 = IGNORED | (2 << 32);
+
+impl Drop for ShardRing {
+    fn drop(&mut self) {
+        self.recover.keep_leftovers();
+    }
+}
+
 /// How long a ring waits before it tries again to take a file out of its
 /// table, once the kernel refused: static, as the kernel reads it after the
 /// entry is queued.
@@ -1126,6 +1157,13 @@ thread_local! {
     /// How many of the next take-outs from a table the kernel refuses on
     /// this thread, for a test of a kernel with no memory for the update.
     pub(crate) static REFUSE_TAKE_OUT_FOR_TEST: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many of the next inserts into the operation table `submit` makes on this
+    /// thread act as a full table, for a test.
+    pub(crate) static REFUSE_INSERT_FOR_TEST: Cell<u32> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1284,6 +1322,7 @@ pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
 
 pub(crate) mod exits;
 pub(crate) mod keeper;
+mod recover;
 #[cfg(test)]
 pub(crate) use keeper::leaked;
 mod arrivals;
@@ -1301,5 +1340,7 @@ mod tests_inc;
 mod tests_recv;
 #[cfg(test)]
 mod tests_reserve;
+#[cfg(test)]
+mod tests_slab;
 #[cfg(test)]
 mod tests_zc;

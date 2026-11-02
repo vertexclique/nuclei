@@ -28,17 +28,30 @@
 (* fired and the turn never returns. Between two looks at most 2N tasks    *)
 (* run: the end of one turn and the start of the next.                     *)
 (*                                                                          *)
-(* What is modelled: the three kinds of turn, in any order the environment  *)
+(* An idle pass may look at no driver at all: the park backs out (work    *)
+(* came after the last look) with the spin cold. Such a pass keeps the     *)
+(* count of runs where it was, and counts like a turn in which the future  *)
+(* woke itself: every `N` of them bring a look without waiting. Before, it *)
+(* started the count over: work posted at that moment, again and again,   *)
+(* kept the poller from ever being looked at. A warm spin that finds the   *)
+(* future woken at its very first look, before it asked the poller, still  *)
+(* starts the count over (`SpinWoken`, a stated limit: counting it too     *)
+(* adds a look every `N` such passes, about 70 instructions a round trip   *)
+(* on the socket rows, for a race a few instructions wide).                *)
+(*                                                                          *)
+(* What is modelled: the four kinds of turn, in any order the environment   *)
 (* picks, and the two counts (`Shard::since_drive`, which the code keeps   *)
 (* as a count down to the next run that weighs a look, and the turns the    *)
-(* future woke itself). What is abstract: what a task or the future does,  *)
-(* and the look itself (one step, which completes all the IO that is       *)
-(* ready).                                                                  *)
+(* future woke itself, which idle passes with no look share). What is      *)
+(* abstract: what a task or the future does, and the look itself (one      *)
+(* step, which completes all the IO that is ready).                        *)
 (***************************************************************************)
 EXTENDS Integers
 
 CONSTANTS
     N,         \* DRIVER_INTERVAL
+    BackOut,   \* an idle pass may look at no driver: a park that backs out with the spin cold
+    SpinWoken, \* a warm spin may find the future woken at its first look, before it asks the poller
     Mode,      \* "loop": the run loop; "turn": turns driven by hand
     Mutation   \* "none", or the name of the one rule this run takes away
 
@@ -48,6 +61,7 @@ variables
     selfWoken = 0,          \* turns in which no task ran and the future woke itself
     gap = 0,                \* turns since the last look
     lookedSelfWoken = FALSE, \* record: a look came from the future's turns
+    lookedUnlooked = FALSE, \* record: a look came from the idle passes that looked at no driver
     runs = 0;               \* (turn) tasks the current `run_ready` ran
 
 define
@@ -55,6 +69,8 @@ define
     BoundedGap == gap < 2 * N
     \* Witnesses.
     NoSelfWokenLook == ~lookedSelfWoken
+    \* Witness: idle passes that looked at no driver bring a look of their own.
+    NoUnlookedLook == ~lookedUnlooked
     GapBelowItsBound == gap < 2 * N - 2
     \* (turn) Between two looks of turns driven by hand, at most 2N tasks run.
     TurnGap == gap <= 2 * N
@@ -99,7 +115,10 @@ T_return:
 L_turn:
         either
             \* A task runs.
-            if since + 1 >= N then
+            \* MUTATION no_run_count: a task's run is not counted (`drive_left` not counted down).
+            if Mutation = "no_run_count" then
+                gap := gap + 1;                                 \* a turn without a look
+            elsif since + 1 >= N then
                 since := 0;
                 gap := 0;
             else
@@ -120,9 +139,50 @@ L_turn:
                 gap := gap + 1;
             end if;
         or
-            \* Nothing to run, the future not woken: the spin and the park look.
+            \* Nothing to run, the future not woken, and the pass looks: the park parks (its
+            \* drive waits on the poller), or the spin asked the poller (it found work, or none
+            \* and the park backed out after it). The count starts over (`count_again`).
             since := 0;
             gap := 0;
+        or
+            \* Nothing to run, the future not woken, and the pass looks at no driver: the park
+            \* backs out (`begin_park` found work posted after the last look) with the spin
+            \* cold (src/rt/shard/run.rs, `run_loop`, its idle pass).
+            await BackOut;
+            if Mutation = "backout_resets" then
+                \* MUTATION backout_resets: counted like the future's own turn, but the count of
+                \* runs started over, as the code did before: runs and such passes take turns,
+                \* each count kept below its bound, and the driver waits for good.
+                since := 0;                                     \* the count of runs started over
+                if selfWoken + 1 >= N then                      \* the Nth such pass in all:
+                    selfWoken := 0;                             \* a look without waiting
+                    gap := 0;                                   \* the driver was looked at
+                else                                            \* else counted only
+                    selfWoken := selfWoken + 1;                 \* one more
+                    gap := gap + 1;                             \* a turn without a look
+                end if;
+            elsif Mutation = "backout_uncounted" then
+                \* MUTATION backout_uncounted: the count of runs kept, but the pass not counted:
+                \* such passes, again and again, never bring a look.
+                gap := gap + 1;                                 \* a turn without a look
+            elsif selfWoken + 1 >= N then
+                \* The fix: the count of runs kept where it was, and every Nth such pass (the
+                \* future's own turns counted with them) looks without waiting.
+                selfWoken := 0;                                 \* that count starts over
+                since := 0;                                     \* the look starts the count of runs over
+                gap := 0;                                       \* the driver was looked at
+                lookedUnlooked := TRUE;                         \* (record) a look from such passes
+            else
+                \* The fix, below the Nth: the count of runs kept, the pass counted.
+                selfWoken := selfWoken + 1;                     \* one more
+                gap := gap + 1;                                 \* a turn without a look
+            end if;
+        or
+            \* The stated limit: a warm spin finds the future woken at its first look, before it
+            \* asks the poller, and the code counts the pass as a look: the count starts over.
+            await SpinWoken;                                    \* only where the limit is checked
+            since := 0;                                         \* the count of runs started over
+            gap := gap + 1;                                     \* a turn without a look
         end either;
         end if;
     end while;

@@ -276,7 +276,8 @@ impl Monitor {
             return;
         }
         core::future::poll_fn(|cx| {
-            if home.poll_drained(cx).is_ready() {
+            // SAFETY: this runs on the home's thread, in `finish_home`'s `block_on`.
+            if unsafe { home.poll_drained(cx) }.is_ready() {
                 return core::task::Poll::Ready(());
             }
             closing.as_mut().poll(cx)

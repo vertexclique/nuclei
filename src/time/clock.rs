@@ -170,6 +170,9 @@ pub(crate) struct Clock {
     advancing: AtomicBool,
     /// Bumped each time a shard joins or leaves the runtime's guests.
     members: AtomicU64,
+    /// Remote arms between their look at the clock and their post, which a
+    /// paused clock counts as work in flight.
+    arms: AtomicUsize,
 }
 
 impl Clock {
@@ -182,6 +185,7 @@ impl Clock {
             altered: AtomicBool::new(false),
             advancing: AtomicBool::new(false),
             members: AtomicU64::new(0),
+            arms: AtomicUsize::new(0),
         };
         if start_paused {
             clock.pause();
@@ -256,6 +260,21 @@ impl Clock {
         while self.advancing.load(Ordering::SeqCst) {
             core::hint::spin_loop();
         }
+    }
+
+    /// A remote arm begins its look at the clock and its post.
+    pub(crate) fn arm_began(&self) {
+        self.arms.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A remote arm posted, or gave up.
+    pub(crate) fn arm_ended(&self) {
+        self.arms.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Remote arms in flight.
+    pub(crate) fn arms(&self) -> usize {
+        self.arms.load(Ordering::SeqCst)
     }
 
     pub(crate) fn members(&self) -> u64 {
@@ -374,6 +393,15 @@ pub(crate) fn to_nanos(at: Instant) -> u64 {
 /// The system's time is read before the look at [`ALTERED`], as in
 /// [`Clock::now`]: a reading that finds no clock altered took it before any
 /// pause marked its clock.
+///
+/// That order is the hardware's, not the language's: the system's counter is
+/// read through the vDSO, which on x86 reads it with `rdtsc_ordered` (an
+/// `lfence` before `rdtsc`, or `rdtscp`) and on arm64 behind an `isb` with
+/// `arch_counter_enforce_ordering`, so the read is not moved past the later
+/// load. Program order between a non-atomic read and a relaxed load is no such
+/// order in the Rust memory model, which is why the Miri run of
+/// `reads_never_go_backwards_across_pauses_on_many_threads` disables
+/// weak-memory emulation (`-Zmiri-disable-weak-memory-emulation`).
 #[inline]
 pub(crate) fn now_nanos() -> u64 {
     let system = system_nanos();
@@ -489,7 +517,7 @@ mod tests {
                 let clock = std::sync::Arc::clone(&clock);
                 std::thread::spawn(move || {
                     let mut last = clock.now();
-                    for _ in 0..20_000 {
+                    for _ in 0..if cfg!(miri) { 200 } else { 20_000 } {
                         let now = clock.now();
                         assert!(now >= last, "the clock went back");
                         last = now;

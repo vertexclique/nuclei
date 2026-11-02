@@ -34,6 +34,12 @@
 (* A drain of the table lets the generations go on, so a stale token names *)
 (* nothing in it again.                                                    *)
 (*                                                                          *)
+(* A's wait is bounded: it yields, then sleeps a little longer each look,  *)
+(* and gives up at a deadline (a second, far past any holder that lets go  *)
+(* of its side, which it does a driver call later), saying so: a holder    *)
+(* that never lets go (`Stalls`, its thread stopped for good) no longer     *)
+(* holds A, and so the thread that runs it, for good (WaitEnds).           *)
+(*                                                                          *)
 (* What must never happen: a release that came late removing S2's          *)
 (* registration (NoForeignRelease), and a lease waiting in A's mailbox     *)
 (* while A is away, which keeps S's descriptor open for as long            *)
@@ -49,6 +55,7 @@ EXTENDS Integers, FiniteSets, TLC
 CONSTANTS
     Early,     \* the attach names its shard before it takes the ask (a ring); else only once registered
     Fails,     \* the attach fails: the handle closed before the holder performed it
+    Stalls,    \* the holder may stop for good while it holds its side (its thread never runs again)
     Mutation   \* "none", or the name of the one rule this run takes away
 
 VARIABLES
@@ -65,10 +72,11 @@ VARIABLES
     mail,      \* what waits in A's mailbox: records of a kind ("install" or "release") and a token
     held,      \* the holder holds a side (both, while it performs)
     bits,      \* the requests the holder took for this perform
-    foreign    \* (record) a release removed S2's registration
+    foreign,   \* (record) a release removed S2's registration
+    gaveUp     \* (record) A's wait reached its deadline and went on, saying so
 
 vars == <<apc, hpc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, home, token, mail, held,
-          bits, foreign>>   \* every variable
+          bits, foreign, gaveUp>>   \* every variable
 
 TokS == 0                  \* S's token: the slot's first generation
 
@@ -102,6 +110,7 @@ Init ==
     /\ held = TRUE              \* the holder holds
     /\ bits = {}                \* and took nothing yet
     /\ foreign = FALSE          \* no release removed S2's
+    /\ gaveUp = FALSE           \* the wait has not given up
 
 (***************************************************************************)
 (* Shard A, on its own thread.                                             *)
@@ -115,7 +124,7 @@ ADrain ==
     /\ slotOf' = "none"                                       \* the table is emptied
     /\ slotGen' = IF Mutation = "gen_reset" THEN TokS ELSE slotGen + 1  \* past every token, or over
     /\ apc' = "evict"                                         \* then the eviction
-    /\ UNCHANGED <<hpc, ask, reqAttach, reqEvict, regS, home, token, mail, held, bits, foreign>>
+    /\ UNCHANGED <<hpc, ask, reqAttach, reqEvict, regS, home, token, mail, held, bits, foreign, gaveUp>>
 
 \* `Source::evict`: left to the holder while it holds; else A performs it now, on its own thread,
 \* where the ring's detach and the slot's release need no post.
@@ -129,7 +138,7 @@ AEvict ==
             /\ token' = -1                                    \* and no token
             /\ UNCHANGED reqEvict
     /\ apc' = "waitAsk"                                       \* then A waits
-    /\ UNCHANGED <<hpc, slotGen, slotOf, ask, reqAttach, mail, held, bits, foreign>>
+    /\ UNCHANGED <<hpc, slotGen, slotOf, ask, reqAttach, mail, held, bits, foreign, gaveUp>>
 
 \* `wait_for_evictions`, first look: an attach still asked of A is waited for.
 \* MUTATION no_attach_wait: A does not look at the attach still asked of it (the code before).
@@ -138,7 +147,7 @@ AWaitAsk ==
     /\ ask # "A" \/ Mutation = "no_attach_wait"               \* until no attach is asked of it
     /\ apc' = "waitReg"                                       \* then it looks at the registration
     /\ UNCHANGED <<hpc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, home, token, mail, held,
-                   bits, foreign>>
+                   bits, foreign, gaveUp>>
 
 \* `wait_for_evictions`, second look: S still registered with A under S's token is waited for.
 AWaitReg ==
@@ -147,6 +156,19 @@ AWaitReg ==
               THEN "waitAsk"                                  \* look again
               ELSE "look"                                     \* gone: on to the mailbox
     /\ UNCHANGED <<hpc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, home, token, mail, held,
+                   bits, foreign, gaveUp>>
+
+\* `wait_for_evictions`' deadline: a holder that stopped for good while it holds its side never
+\* performs the attach or the eviction, and A goes on, saying so. The deadline is taken to pass
+\* only then: a holder that lets go does so long before it.
+\* MUTATION wait_unbounded: no deadline, as before the fix: A spins on its look for good.
+AGiveUp ==
+    /\ apc \in {"waitAsk", "waitReg"}                          \* A waits
+    /\ hpc = "stalled"                                        \* for a holder that never lets go
+    /\ Mutation # "wait_unbounded"                            \* the deadline
+    /\ apc' = "look"                                          \* A goes on to its mailbox
+    /\ gaveUp' = TRUE                                         \* (record) told
+    /\ UNCHANGED <<hpc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, home, token, mail, held,
                    bits, foreign>>
 
 \* `let_go_of_the_rest`: A applies its mailbox once, and is away until its next block_on.
@@ -154,7 +176,7 @@ ALook ==
     /\ apc = "look"                                           \* the evictions ended
     /\ ApplyMail                                              \* what waits is applied
     /\ apc' = "away"                                          \* A leaves
-    /\ UNCHANGED <<hpc, ask, reqAttach, reqEvict, regS, home, token, held, bits>>
+    /\ UNCHANGED <<hpc, ask, reqAttach, reqEvict, regS, home, token, held, bits, gaveUp>>
 
 \* A's next block_on: its first poll registers S2 in the slot, under the slot's generation.
 AAgain ==
@@ -162,14 +184,14 @@ AAgain ==
     /\ slotOf' = "S2"                                         \* S2 takes the slot
     /\ apc' = "apply2"                                        \* then the loop applies the mailbox
     /\ UNCHANGED <<hpc, slotGen, ask, reqAttach, reqEvict, regS, home, token, mail, held, bits,
-                   foreign>>
+                   foreign, gaveUp>>
 
 \* The loop applies what waited in the mailbox meanwhile.
 AApply ==
     /\ apc = "apply2"                                         \* S2 is registered
     /\ ApplyMail                                              \* the mailbox is applied
     /\ apc' = "done"                                          \* A runs on
-    /\ UNCHANGED <<hpc, ask, reqAttach, reqEvict, regS, home, token, held, bits>>
+    /\ UNCHANGED <<hpc, ask, reqAttach, reqEvict, regS, home, token, held, bits, gaveUp>>
 
 (***************************************************************************)
 (* The holder H, on another thread: it performs as it lets go.             *)
@@ -187,7 +209,15 @@ HTake ==
     /\ hpc' = IF ~reqAttach THEN "next"                       \* no attach: on to the eviction
               ELSE IF Early /\ Mutation # "take_first" THEN "pub"  \* a ring names its shard first
               ELSE "take"                                     \* else the ask is taken first
-    /\ UNCHANGED <<apc, slotGen, slotOf, ask, regS, home, token, mail, held, foreign>>
+    /\ UNCHANGED <<apc, slotGen, slotOf, ask, regS, home, token, mail, held, foreign, gaveUp>>
+
+\* The holder's thread stops for good while it holds its side (`Stalls`): it never performs.
+HStall ==
+    /\ Stalls                                                 \* this run lets it
+    /\ hpc = "hold"                                           \* holding, about to perform
+    /\ hpc' = "stalled"                                       \* and never again
+    /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, home, token, mail, held,
+                   bits, foreign, gaveUp>>
 
 \* `attach_now` on a ring: the registration names A and S's token before the ask goes.
 HPub ==
@@ -196,7 +226,7 @@ HPub ==
     /\ token' = TokS                                          \* and S's token
     /\ hpc' = IF Mutation = "take_first" THEN "attach" ELSE "take"  \* the ask next (or already)
     /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, mail, held, bits,
-                   foreign>>
+                   foreign, gaveUp>>
 
 \* The attach takes the ask (`Ask::attach`'s swap).
 HTakeAsk ==
@@ -204,7 +234,7 @@ HTakeAsk ==
     /\ ask' = "none"                                          \* nothing is asked of A any more
     /\ hpc' = IF Early /\ Mutation = "take_first" THEN "pub" ELSE "attach"  \* the bug names later
     /\ UNCHANGED <<apc, slotGen, slotOf, reqAttach, reqEvict, regS, home, token, mail, held, bits,
-                   foreign>>
+                   foreign, gaveUp>>
 
 \* The attach itself. Failed (the handle closed): the registration goes back to none, and a
 \* release of the token is posted to A. On a ring, off A's thread: the install goes to A's mailbox
@@ -225,7 +255,7 @@ HAttach ==
             /\ token' = TokS                                  \* under S's token
             /\ hpc' = "next"
             /\ UNCHANGED mail
-    /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, held, bits, foreign>>
+    /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, held, bits, foreign, gaveUp>>
 
 \* A failed attach's name goes, after its release was posted.
 HClear ==
@@ -233,14 +263,14 @@ HClear ==
     /\ home' = "none"                                         \* the name goes
     /\ hpc' = "next"                                          \* on to the eviction
     /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, token, mail, held, bits,
-                   foreign>>
+                   foreign, gaveUp>>
 
 \* The eviction comes after the attach, if it was taken too.
 HNext ==
     /\ hpc = "next"                                           \* the attach is done
     /\ hpc' = IF "evict" \in bits THEN "evict" ELSE "end"     \* the eviction, or the end
     /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, home, token, mail, held,
-                   bits, foreign>>
+                   bits, foreign, gaveUp>>
 
 \* `evict_now`: a ring attach under way is abandoned (a release of the token to A); a
 \* registration in place ends (a readiness poller's needs no post); none is left alone.
@@ -257,7 +287,7 @@ HEvict ==
        ELSE /\ hpc' = "end"                                   \* nothing to end
             /\ UNCHANGED <<regS, mail>>
     /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, home, token, held, bits,
-                   foreign>>
+                   foreign, gaveUp>>
 
 \* `registration_gone`: the token and the shard go last.
 HGone ==
@@ -266,7 +296,7 @@ HGone ==
     /\ token' = -1                                            \* and no token
     /\ hpc' = "end"                                           \* done performing
     /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, mail, held, bits,
-                   foreign>>
+                   foreign, gaveUp>>
 
 \* The holder lets go of both sides; a bit raised meanwhile it performs as well, still holding.
 HEnd ==
@@ -277,19 +307,20 @@ HEnd ==
        ELSE /\ held' = FALSE                                  \* else it lets go
             /\ hpc' = "done"                                  \* for good
     /\ UNCHANGED <<apc, slotGen, slotOf, ask, reqAttach, reqEvict, regS, home, token, mail, bits,
-                   foreign>>
+                   foreign, gaveUp>>
 
 (***************************************************************************)
 (* The whole system.                                                       *)
 (***************************************************************************)
 
 Next ==
-    \/ ADrain \/ AEvict \/ AWaitAsk \/ AWaitReg \/ ALook \/ AAgain \/ AApply   \* shard A
-    \/ HTake \/ HPub \/ HTakeAsk \/ HAttach \/ HClear \/ HNext \/ HEvict \/ HGone \/ HEnd  \* H
+    \/ ADrain \/ AEvict \/ AWaitAsk \/ AWaitReg \/ AGiveUp \/ ALook \/ AAgain \/ AApply  \* shard A
+    \/ HTake \/ HStall \/ HPub \/ HTakeAsk \/ HAttach \/ HClear \/ HNext \/ HEvict \/ HGone  \* H
+    \/ HEnd                                                   \* H lets go
 
 \* Every step that must happen does, if it stays possible.
 Fairness ==
-    /\ WF_vars(ADrain) /\ WF_vars(AEvict) /\ WF_vars(AWaitAsk) /\ WF_vars(AWaitReg)
+    /\ WF_vars(ADrain) /\ WF_vars(AEvict) /\ WF_vars(AWaitAsk) /\ WF_vars(AWaitReg) /\ WF_vars(AGiveUp)
     /\ WF_vars(ALook) /\ WF_vars(AAgain) /\ WF_vars(AApply)
     /\ WF_vars(HTake) /\ WF_vars(HPub) /\ WF_vars(HTakeAsk) /\ WF_vars(HAttach)
     /\ WF_vars(HClear) /\ WF_vars(HNext) /\ WF_vars(HEvict) /\ WF_vars(HGone) /\ WF_vars(HEnd)
@@ -308,6 +339,9 @@ NoLeaseLeft == apc = "away" => ~(\E m \in mail : m.kind = "install")
 
 \* Everything ends: A runs again and the holder let go.
 AllEnd == <>(apc = "done" /\ hpc = "done")
+
+\* A's wait ends, even for a holder that never lets go: the thread that runs A moves on.
+WaitEnds == <>(apc \in {"look", "away", "apply2", "done"})
 
 (***************************************************************************)
 (* Witness: claims an interesting case never happens and must be proved     *)

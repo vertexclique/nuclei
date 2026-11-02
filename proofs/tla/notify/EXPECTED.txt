@@ -20,5 +20,11 @@ M_arrivals_unchecked           MC_Notify            violated:QueuedOneGeneration
 M_permit_not_converted         MC_Notify            violated:EveryAwaiterEnds
 M_leftover_lost                MC_Notify            violated:OneIsKept
 M_count_withdrawn_grant        MC_Notify            violated:EveryAwaiterEnds
-W_owed_to_woken                MC_Notify            violated:LateAwaiterEnds
 S_two_broadcasts               MC_Notify            pass
+L_two_broadcasts_then_one      MC_Notify            pass
+S_one_then_broadcast_queued    MC_Notify            pass
+ML_split_word                  MC_Notify            violated:LateAwaiterEnds
+ML_newer_as_old                MC_Notify            violated:LateAwaiterEnds
+M_owed_before_generation       MC_Notify            violated:NoSparePermit
+M_old_to_permit                MC_Notify            violated:NoSparePermit
+ML_no_recheck                  MC_Notify            violated:LateAwaiterEnds

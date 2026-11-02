@@ -235,7 +235,7 @@ impl Future for BarrierWait<'_> {
 impl Drop for BarrierWait<'_> {
     fn drop(&mut self) {
         // The arrival stays counted (see `Barrier`); only the node goes.
-        if let Cancel::Withdrawn(_) = self.wait.cancel(&self.barrier.queue) {
+        if let Cancel::Withdrawn(_, _shelved) = self.wait.cancel(&self.barrier.queue) {
             self.barrier.withdrawn(false);
         }
     }

@@ -149,19 +149,24 @@ impl Proactor {
     }
 
     /// The backend the calling thread's shard runs its IO on; on a thread
-    /// that runs none, the one of every runtime that names none (the
+    /// that runs none, the backend of the shard its poll lost to the handoff
+    /// if it lost one, else the one of every runtime that names none (the
     /// platform's poller when the backend named cannot be had: the shards
     /// then fail with the reason).
     pub fn backend() -> IoBackend {
         match context::current(|shard| shard.map(|s| s.io_backend())) {
             Some(running) => running,
-            None => crate::rt::backend::chosen().map_or(POLLER, |b| {
-                if b.rings() {
-                    IoBackend::IoUring
-                } else {
-                    POLLER
-                }
-            }),
+            None => context::lost_shared(|lost| lost.map(|s| s.counters.backend())).unwrap_or_else(
+                || {
+                    crate::rt::backend::chosen().map_or(POLLER, |b| {
+                        if b.rings() {
+                            IoBackend::IoUring
+                        } else {
+                            POLLER
+                        }
+                    })
+                },
+            ),
         }
     }
 }

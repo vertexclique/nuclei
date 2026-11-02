@@ -234,6 +234,90 @@ fn a_sync_beside_one_whose_call_fails_fails_too() {
     });
 }
 
+/// A clone's sync beside the handle's whose call fails fails too, and only
+/// one call is made across the two: they share their record, calls included.
+/// Before that, the clone made a call of its own beside the handle's, which
+/// the hook (standing for the kernel's one report) did not fail, and answered
+/// Ok for writes the device lost.
+#[test]
+fn a_clone_s_sync_beside_the_handle_s_failing_one_fails_too() {
+    let rt = one_blocking_thread();
+    let tmp = Temp::new("sync-clone-beside");
+    let path = tmp.file("data");
+    rt.block_on(async {
+        let mut file = Handle::new(read_write(&path)).unwrap();
+        within(write_all(&mut file, b"durable")).await.unwrap();
+        within(flush(&mut file)).await.unwrap();
+        let clone = within(file.try_clone()).await.unwrap();
+        let io = file.file().unwrap();
+        let clone_io = clone.file().unwrap();
+        io.keep_on_pool();
+        clone_io.keep_on_pool();
+        let (release, busy) = hold_the_pool();
+        io.fail_next_syncs(1);
+        let mut first = Box::pin(file.sync_all());
+        let mut second = Box::pin(clone.sync_data());
+        let _ = pend_flagged(&mut first, "the handle's sync on the held pool");
+        let woke = pend_flagged(&mut second, "the clone's sync on the held pool");
+        release.send(()).unwrap();
+        within(busy).await;
+        woken(&woke, "the clone's sync was never woken").await;
+        let err = within(second).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
+        let err = within(first).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
+        assert_eq!(io.sync_calls_made(), 1, "more than one call across the two");
+        for later in [
+            within(file.sync_data()).await,
+            within(clone.sync_all()).await,
+        ] {
+            let err = later.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
+        }
+        assert_eq!(io.sync_calls_made(), 1, "a later sync made a call");
+    });
+}
+
+/// A sync whose clone's call is out (the clone's future went away with it)
+/// waits for that call's end, takes it, and only then makes its own: two
+/// calls in all, and the bytes written before are in the file.
+#[test]
+fn a_handle_s_sync_waits_for_its_clone_s_call_and_takes_its_end() {
+    let rt = one_blocking_thread();
+    let tmp = Temp::new("sync-clone-takes");
+    let path = tmp.file("data");
+    rt.block_on(async {
+        let mut file = Handle::new(read_write(&path)).unwrap();
+        within(write_all(&mut file, b"durable")).await.unwrap();
+        within(flush(&mut file)).await.unwrap();
+        let clone = within(file.try_clone()).await.unwrap();
+        let io = file.file().unwrap();
+        io.keep_on_pool();
+        clone.file().unwrap().keep_on_pool();
+        let (release, busy) = hold_the_pool();
+        let mut gone = Box::pin(clone.sync_all());
+        let _ = pend_flagged(&mut gone, "the clone's sync on the held pool");
+        drop(gone);
+        let mut mine = Box::pin(file.sync_data());
+        let woke = pend_flagged(&mut mine, "the handle's sync beside the clone's call");
+        assert_eq!(
+            io.sync_calls_made(),
+            1,
+            "the handle made a call beside the clone's"
+        );
+        release.send(()).unwrap();
+        within(busy).await;
+        woken(&woke, "the handle's sync was never woken").await;
+        within(mine).await.unwrap();
+        assert_eq!(
+            io.sync_calls_made(),
+            2,
+            "the handle did not make its own call"
+        );
+        assert!(std::fs::read(&path).unwrap() == b"durable");
+    });
+}
+
 /// On the ring as on the pool: a sync dropped after its call failed (procfs
 /// has no sync) leaves its failure, and the next sync answers it with no call
 /// of its own.

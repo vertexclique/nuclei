@@ -36,8 +36,12 @@ fn a_datagram_comes_whole_after_a_look_at_its_sender_or_a_short_peek() {
             .await;
             assert_eq!((sender.unwrap(), wrote.unwrap()), (from, len));
             let mut short = [0u8; 16];
-            let peeked = within(b.peek_from(&mut short)).await.unwrap();
-            assert_eq!(peeked, (16, from));
+            let peeked = within(b.peek_from(&mut short)).await;
+            #[cfg(unix)]
+            assert_eq!(peeked.unwrap(), (16, from));
+            // Windows answers a longer datagram `WSAEMSGSIZE`, as std's peek does.
+            #[cfg(windows)]
+            assert_eq!(peeked.unwrap_err().raw_os_error(), Some(10040));
             assert_eq!(short, sent[..16]);
             let (n, sender) = within(b.recv_from(&mut got)).await.unwrap();
             assert_eq!((n, sender), (len, from), "a datagram of {len} bytes");

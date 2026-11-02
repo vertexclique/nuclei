@@ -82,3 +82,65 @@ fn a_timer_removed_off_its_parked_shard_lets_the_clock_jump() {
         "the clock never jumped to the next sleep: the worker sleeps on, holding the removal"
     );
 }
+
+/// A waker that notes the clock at the moment it is woken.
+struct Stamp {
+    inner: Arc<crate::rt::runtime::Inner>,
+    at: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl std::task::Wake for Stamp {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let now = self.inner.clock.now();
+        *self.at.lock().unwrap() = Some(now);
+    }
+}
+
+/// A sleep armed from a plain thread on a paused clock, found pending by its
+/// poll, is woken with the clock at its deadline: a worker parked with a
+/// later timer does not jump past it between the poll's look at the clock
+/// and its post (`proofs/tla/clock/ForeignArm.tla`).
+#[test]
+fn a_foreign_arm_is_never_jumped_past() {
+    let rt = paused(1);
+    rt.spawn(async {
+        loop {
+            time::sleep(Duration::from_secs(10 * 3600)).await;
+        }
+    })
+    .detach();
+    let _inside = rt.enter();
+    let stamp = Arc::new(Stamp {
+        inner: Arc::clone(rt.inner()),
+        at: std::sync::Mutex::new(None),
+    });
+    let waker = core::task::Waker::from(Arc::clone(&stamp));
+    let mut cx = core::task::Context::from_waker(&waker);
+    let mut armed = 0;
+    for round in 0..400 {
+        let mut sleep = time::sleep(Duration::from_millis(1));
+        let deadline = sleep.deadline();
+        *stamp.at.lock().unwrap() = None;
+        if Pin::new(&mut sleep).poll(&mut cx).is_ready() {
+            // Its deadline passed before the poll: a jump of the worker alone.
+            continue;
+        }
+        armed += 1;
+        let mut woken_at = None;
+        eventually(&format!("the foreign sleep woken in round {round}"), || {
+            woken_at = *stamp.at.lock().unwrap();
+            woken_at.is_some()
+        });
+        let at = time::Instant::from_std(woken_at.unwrap());
+        assert!(
+            at <= deadline + Duration::from_millis(1),
+            "round {round}: the clock jumped past the foreign sleep"
+        );
+        assert!(Pin::new(&mut sleep).poll(&mut cx).is_ready());
+    }
+    assert!(armed > 0, "every sleep ended before its first poll");
+}

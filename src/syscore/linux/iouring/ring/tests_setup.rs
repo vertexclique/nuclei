@@ -179,6 +179,7 @@ fn config_maps_from_the_public_configuration() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "makes an io_uring ring")]
 fn ring_is_created_with_the_floor_flags_and_features() {
     let Some(ring) = ring_or_skip() else { return };
     let flags = ring.flags();
@@ -192,6 +193,7 @@ fn ring_is_created_with_the_floor_flags_and_features() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "makes an io_uring ring")]
 fn ring_works_with_the_submission_index_array() {
     // A kernel older than 6.6 rejects NO_SQARRAY: the fallback ring keeps the identity index array.
     let cfg = RingConfig::new(8);
@@ -219,6 +221,7 @@ fn ring_works_with_the_submission_index_array() {
 // Ring options.
 
 #[test]
+#[cfg_attr(miri, ignore = "makes an io_uring ring")]
 fn probe_reports_every_opcode_the_builders_use() {
     let Some(ring) = ring_or_skip() else { return };
     let set = ring.register_probe().unwrap();
@@ -267,6 +270,7 @@ fn opcode_set_tracks_raw_opcodes() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "makes an io_uring ring")]
 fn iowq_worker_limits_round_trip() {
     let Some(ring) = ring_or_skip() else { return };
     let before = ring.register_iowq_max_workers([0, 0]).unwrap();
@@ -276,6 +280,7 @@ fn iowq_worker_limits_round_trip() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "makes an io_uring ring")]
 fn configured_worker_limits_apply_at_creation() {
     let mut cfg = RingConfig::new(8);
     cfg.iowq_max_workers = Some([2, 5]);
@@ -286,6 +291,7 @@ fn configured_worker_limits_apply_at_creation() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "makes an io_uring ring")]
 fn disabled_ring_refuses_work_until_enabled() {
     let mut cfg = RingConfig::new(8);
     cfg.start_disabled = true;
@@ -305,6 +311,7 @@ fn disabled_ring_refuses_work_until_enabled() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "makes an io_uring ring")]
 fn polled_ring_can_be_created() {
     let mut cfg = RingConfig::new(8);
     cfg.iopoll = true;
@@ -315,6 +322,7 @@ fn polled_ring_can_be_created() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "makes an io_uring ring")]
 fn submission_thread_ring_round_trips_and_wakes() {
     let mut cfg = RingConfig::new(8);
     cfg.sqpoll_idle_ms = Some(2);

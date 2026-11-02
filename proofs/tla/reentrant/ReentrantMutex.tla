@@ -19,8 +19,16 @@
 (* queued or not, so the younger, polled after the older entered, leaves   *)
 (* the queue and enters at once. A younger request polled before the older *)
 (* entered (the join polls it first, or it is in another task of the same  *)
-(* owner) is polled again only when it is woken, and nothing wakes it: the *)
-(* owner waits on itself (the witness of a gap the code leaves open).      *)
+(* owner) is polled again only when it is woken: the owner's entry wakes   *)
+(* every other request of that owner still queued on the lock, which then  *)
+(* finds the id and enters (without that wake the owner waits on itself:   *)
+(* the `no_sibling_wake` mutation).                                        *)
+(*                                                                          *)
+(* A thread's own token (`Owner::thread`, `SharedIds`) is one id for every *)
+(* task of that thread: one task's lock is another's lock again, so two    *)
+(* tasks of the thread hold the lock at once, interleaved at their awaits. *)
+(* Sound (they run on one thread, so no `&T` crosses threads), but no     *)
+(* exclusion between them: the witness of a documented limit, not a bug.   *)
 (*                                                                          *)
 (* What is modelled step by step: the holder's loads and stores, the       *)
 (* depth, and the permit's take, wait and release. What is abstract: the  *)
@@ -33,10 +41,14 @@ CONSTANTS
     Progs,     \* per owner, its steps in order: "L" locks (again, or for the first time), "U" unlocks,
                \* "J" joins two locks polled older first, "JR" the same polled younger first
                \* (each leaves the owner holding two guards)
+    SharedIds, \* TRUE: the programs are tasks of one thread, each locking with that thread's one
+               \* token (`Owner::thread`), so every one of them has the same id
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Owners == 1..Len(Progs)
 NoOwner == 0
+\* The id program `t` locks with: its own token's, or with SharedIds its thread's, the same for all.
+Id(t) == IF SharedIds THEN 1 ELSE t
 
 (* --algorithm ReentrantMutex
 variables
@@ -44,11 +56,12 @@ variables
     holder = NoOwner,
     depth = 0,
     guards = [o \in Owners |-> 0],   \* the guards each owner holds
-    falseReenter = FALSE;            \* (record) an owner holding no guard found its own id
+    falseReenter = FALSE,            \* (record) an owner holding no guard found its own id
+    siblingWoken = [o \in Owners |-> FALSE]; \* the owner's queued younger request was woken
 
 define
     Holders == {o \in Owners : guards[o] > 0}
-    \* One owner holds the lock at a time.
+    \* One owner holds the lock at a time (one program: with SharedIds, one task of the thread).
     Exclusion == Cardinality(Holders) <= 1
     \* While an owner holds the lock with its id stored, the depth is its guards.
     DepthMatches == \A o \in Holders : holder = o => depth = guards[o]
@@ -81,7 +94,7 @@ J_look:
             end if;
 J_storeNow:
             \* The older stores the owner's id ...
-            holder := self;                         \* the older's store of the id
+            holder := Id(self);                         \* the older's store of the id
 J_youngNow:
             \* ... and the same pass then polls the younger, which finds that id and enters at
             \* once, one level deeper.
@@ -106,31 +119,41 @@ J_enter:
             depth := 1;                             \* one level
             guards[self] := guards[self] + 1;       \* and the older's guard
 J_store:
-            \* ... then the id.
-            holder := self;                         \* the owner holds the lock now
+            \* ... then the id; the entry wakes the owner's other requests still queued on the
+            \* lock. MUTATION no_sibling_wake: nobody is woken.
+            holder := Id(self);                         \* the owner holds the lock now
             if Progs[self][i] = "JR" then
-                goto J_youngWait;                   \* the younger was polled already: it sleeps on
+                siblingWoken[self] := Mutation # "no_sibling_wake";
+                goto J_youngWait;                   \* the younger was polled already
             end if;
 J_young:
             \* The same pass polls the younger: queued, it still looks for its own id first and,
             \* finding it, leaves the queue and enters. MUTATION queued_skips_reenter: a queued
             \* request only looks at its node, and sleeps on.
-            if holder = self /\ Mutation # "queued_skips_reenter" then
+            if holder = Id(self) /\ Mutation # "queued_skips_reenter" then
                 depth := depth + 1;                 \* one level deeper
                 guards[self] := guards[self] + 1;   \* the younger's guard
                 goto O_next;
             end if;
 J_youngWait:
-            \* The younger waits for the permit to be handed to it, which only the owner's last
-            \* unlock does; the join keeps the older's guard until the younger ends.
-            await permit;                           \* never, while the owner holds it
-            permit := FALSE;                        \* (unreachable) the younger's grant
-            depth := 1;                             \* (unreachable) its depth
-            guards[self] := guards[self] + 1;       \* (unreachable) its guard
+            \* The younger sleeps until it is woken: by the owner's entry, which has it poll again,
+            \* find its own id and enter one level deeper; else only by the permit handed to it,
+            \* which only the owner's last unlock does, and the join keeps the older's guard
+            \* until the younger ends.
+            await siblingWoken[self] \/ permit;
+            if siblingWoken[self] /\ holder = Id(self) then
+                siblingWoken[self] := FALSE;        \* the wake seen
+                depth := depth + 1;                 \* the younger's level
+                guards[self] := guards[self] + 1;   \* and its guard
+            else
+                permit := FALSE;                    \* (unreachable) the younger's grant
+                depth := 1;                         \* (unreachable) its depth
+                guards[self] := guards[self] + 1;   \* (unreachable) its guard
+            end if;
         elsif Progs[self][i] = "L" then
 O_look:
             \* `reenter`: a relaxed load of the holder.
-            if holder = self then
+            if holder = Id(self) then
                 falseReenter := falseReenter \/ guards[self] = 0;
                 depth := depth + (IF Mutation = "reenter_skips_depth" THEN 0 ELSE 1);
                 guards[self] := guards[self] + 1;
@@ -142,7 +165,7 @@ O_enter:
                 depth := 1;
                 guards[self] := guards[self] + 1;
 O_store:
-                holder := self;
+                holder := Id(self);
             end if;
         else
 O_down:

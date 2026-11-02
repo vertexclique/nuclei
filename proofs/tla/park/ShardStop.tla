@@ -1,7 +1,8 @@
 ----------------------------- MODULE ShardStop -----------------------------
 (***************************************************************************)
 (* A shard that stops, and the runnables pushed to it meanwhile           *)
-(* (src/rt/shard.rs: `Shared::push_remote`, `Drop for Shard`), at the     *)
+(* (src/rt/shard.rs: `Shared::push_remote`; src/rt/shard/going.rs: `Drop  *)
+(* for Shard` and `Shard::go`), at the                                    *)
 (* grain of the queues' pushes and pops and the flag's accesses.          *)
 (*                                                                          *)
 (* In plain words: other threads push runnables of `Send` tasks into the  *)

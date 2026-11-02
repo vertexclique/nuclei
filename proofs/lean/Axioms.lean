@@ -158,6 +158,21 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Notify.served_le_waiting
 #print axioms Nuclei.Notify.left_only_when_all_served
 #print axioms Nuclei.Notify.a_generation_is_never_a_marker
+-- Notify's owed word: its fields come back as they went in and fit 64 bits, a count made below
+-- its room is never lost, the pass's split loses none, the expired take no more than there are and
+-- leave something only once each took one, and a full count serves every waiter and the permit.
+#print axioms Nuclei.Notify.decode_encode
+#print axioms Nuclei.Notify.encode_lt
+#print axioms Nuclei.Notify.owe_ok
+#print axioms Nuclei.Notify.owe_counts
+#print axioms Nuclei.Notify.split_counts
+#print axioms Nuclei.Notify.newer_takes_nothing
+#print axioms Nuclei.Notify.giveBack_counts
+#print axioms Nuclei.Notify.absorbed_and_left
+#print axioms Nuclei.Notify.absorbed_le_expired
+#print axioms Nuclei.Notify.left_only_when_all_absorbed
+#print axioms Nuclei.Notify.serve_more_than_line
+#print axioms Nuclei.Notify.full_serves_every_waiter
 
 -- The barrier's generations: a generation is exactly n arrivals, its last leads it and only it,
 -- the leader's arrival completes it, and a waiter released for a generation behind the count goes

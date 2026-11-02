@@ -312,6 +312,7 @@ pub(crate) const FILE_MODE_INFORMATION: u32 = 16;
 pub(crate) const FILE_ACCESS_INFORMATION: u32 = 8;
 pub(crate) const FILE_WRITE_DATA: ULONG = 0x2;
 pub(crate) const FILE_APPEND_DATA: ULONG = 0x4;
+pub(crate) const FILE_WRITE_THROUGH: ULONG = 0x2;
 pub(crate) const FILE_NO_INTERMEDIATE_BUFFERING: ULONG = 0x8;
 pub(crate) const FILE_SYNCHRONOUS_IO_ALERT: ULONG = 0x10;
 pub(crate) const FILE_SYNCHRONOUS_IO_NONALERT: ULONG = 0x20;

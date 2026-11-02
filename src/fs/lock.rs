@@ -1,73 +1,40 @@
-//! Advisory locks on a whole file, without blocking the worker.
+//! Advisory locks on a whole file, without blocking a thread.
 //!
-//! `lock_file` waits in the kernel until the file is free, so it is a job of the
-//! blocking pool. A future dropped while the job waits must not leave the file
-//! locked with nobody to give it back, so the future and the job share one
-//! state word per call: WAITING, HELD or GONE. After the job got the lock it
-//! moves the word from WAITING to HELD, and if it finds GONE it unlocks the
-//! file itself. A future dropped before it returned its result swaps GONE in,
-//! and if the word was HELD it unlocks the file; then its job, if it has not
-//! started, is cancelled and never locks.
+//! `lock_file` never waits in the kernel and never takes a thread of the
+//! blocking pool. It makes the call that never waits (`try_lock_file`'s) on the
+//! calling thread, and while another holder has the lock the future sleeps on a
+//! timer and asks again. A future dropped while it sleeps holds nothing, since
+//! the ask and the return of the lock are one step.
 //! `proofs/tla/flock/FileLock.tla` checks the protocol.
 
-use core::future::{Future, poll_fn};
+use core::future::poll_fn;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU8, Ordering};
-use core::task::{Context, Poll};
+use core::time::Duration;
 use std::fs::{File, TryLockError};
 use std::io;
-use std::sync::Arc;
 
 use futures_io::AsyncWrite;
 
 use crate::io::Handle;
-use crate::io::source::requests::Lease;
-use crate::rt::task::Join;
 
-/// The job has not got the lock yet.
-const WAITING: u8 = 0;
-/// The job got the lock and its future is still there to take it.
-const HELD: u8 = 1;
-/// The future was dropped before it took the result.
-const GONE: u8 = 2;
-
-/// A `lock_file` call: the future of the pool's job, and what it must give back.
-struct LockCall {
-    state: Arc<AtomicU8>,
-    lease: Lease,
-    job: Join<io::Result<()>>,
-    /// The result was taken: the lock is the caller's.
-    settled: bool,
-}
-
-impl Future for LockCall {
-    type Output = io::Result<()>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let ended = core::task::ready!(Pin::new(&mut self.job).poll(cx));
-        self.settled = true;
-        Poll::Ready(ended.unwrap_or_else(|lost| Err(lost.into())))
-    }
-}
-
-impl Drop for LockCall {
-    fn drop(&mut self) {
-        if !self.settled && self.state.swap(GONE, Ordering::AcqRel) == HELD {
-            let _ = self.lease.file().unlock();
-        }
-    }
-}
+/// The pause before the first new ask for a lock another holder has.
+const FIRST: Duration = Duration::from_micros(50);
+/// The longest pause between two asks.
+const LAST: Duration = Duration::from_millis(20);
 
 impl Handle<File> {
     /// Locks the whole file, shared for any number of holders if `shared`,
     /// else exclusively for one, as std's `File::lock_shared` and
-    /// `File::lock` do, waiting for the lock on the blocking pool so the
-    /// worker is free meanwhile. The lock is advisory, and it is released by
+    /// `File::lock` do. The lock is advisory, and it is released by
     /// [`unlock_file`](Self::unlock_file) or when the file is closed.
     ///
-    /// If the future is dropped while it waits, the lock is never left held
-    /// with nobody to release it: a job that had not started is cancelled,
-    /// and one that got the lock gives it back.
+    /// The call never waits in the kernel and never takes a thread of the
+    /// blocking pool. While another holder has the lock the future sleeps on a
+    /// timer, from 50 microseconds doubling to 20 milliseconds, and asks again,
+    /// so a lock that comes free is taken within that pause. It takes no place
+    /// in the kernel's line of waiters: a holder that takes the lock again at
+    /// once may keep it from this one. A future dropped while it waits holds
+    /// nothing. See `proofs/tla/flock/FileLock.tla`.
     ///
     /// std's own `File::lock`, reached through `Deref`, blocks the worker
     /// thread that makes it.
@@ -76,33 +43,28 @@ impl Handle<File> {
     ///
     /// The system's own, as std's.
     pub async fn lock_file(&self, shared: bool) -> io::Result<()> {
-        let lease = self.source().lease()?;
-        let state = Arc::new(AtomicU8::new(WAITING));
-        let (job_lease, job_state) = (lease.clone(), Arc::clone(&state));
-        let job = crate::runtime::spawn_blocking(move || {
-            let file = job_lease.file();
-            let locked = if shared {
-                file.lock_shared()
-            } else {
-                file.lock()
-            };
-            if locked.is_ok()
-                && job_state
-                    .compare_exchange(WAITING, HELD, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-            {
-                let _ = file.unlock();
+        let mut pause = FIRST;
+        loop {
+            match self.try_lock_once(shared) {
+                Ok(()) => return Ok(()),
+                Err(TryLockError::Error(err)) => return Err(err),
+                Err(TryLockError::WouldBlock) => {
+                    crate::time::sleep(pause).await;
+                    pause = (pause * 2).min(LAST);
+                }
             }
-            locked
-        })
-        .join();
-        LockCall {
-            state,
-            lease,
-            job,
-            settled: false,
         }
-        .await
+    }
+
+    /// The one call that never waits, for `lock_file` and `try_lock_file`.
+    fn try_lock_once(&self, shared: bool) -> Result<(), TryLockError> {
+        let lease = self.source().lease().map_err(TryLockError::Error)?;
+        let file = lease.file();
+        if shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        }
     }
 
     /// Locks the whole file if it is free now, shared if `shared`, else
@@ -114,13 +76,7 @@ impl Handle<File> {
     /// `WouldBlock` when another holder has the lock, else the system's own
     /// error, as std's.
     pub async fn try_lock_file(&self, shared: bool) -> Result<(), TryLockError> {
-        let lease = self.source().lease().map_err(TryLockError::Error)?;
-        let file = lease.file();
-        if shared {
-            file.try_lock_shared()
-        } else {
-            file.try_lock()
-        }
+        self.try_lock_once(shared)
     }
 
     /// Releases the lock this file holds, as std's `File::unlock` does, once

@@ -11,7 +11,11 @@
 //! - **Admission before push.** A value is pushed only after the limit
 //!   admitted it, and the limit gets it back (`release`) when the receiver
 //!   takes the value or the reservation is dropped unused. So the limit is
-//!   idle exactly when no value is queued, in flight or reserved.
+//!   idle exactly when no value is queued, in flight or reserved. A receive
+//!   that popped a value and then unwound while giving the admission back (a
+//!   sender's waker panicked) puts the value in the queue's stash, receiver
+//!   owned, with its admission back: the next receive answers it first, and
+//!   it counts in `len`.
 //! - **Close, then drain.** The receiver closing the channel closes the limit
 //!   first, so nothing new is admitted, and sets the `rx_closed` event so
 //!   `Sender::closed` completes. A value admitted before the close is still
@@ -56,7 +60,7 @@ use core::task::{Context, Poll};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use super::error::TryRecvError;
-use super::queue::MessageQueue;
+use super::queue::{MessageQueue, Popped};
 use crate::sync::Event;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering, seq_cst_handshake};
@@ -87,11 +91,35 @@ pub(super) trait Limit {
 /// What looking at the queue found.
 enum Pop<T> {
     Value(T),
+    /// A value put back by a receive a panic cut short: its admission came
+    /// back already.
+    Stashed(T),
     /// Empty, and every sender is gone: nothing will ever come.
     Closed,
     /// Nothing for now (or the next value is still being written: its
     /// sender wakes the receiver once its push returned).
     Empty,
+}
+
+/// A popped value whose admission is being given back: dropped by an unwind,
+/// it goes to the queue's stash, where the next receive finds it. Nothing
+/// here runs user code.
+struct Held<'a, T, L: Limit> {
+    chan: &'a Chan<T, L>,
+    value: core::mem::ManuallyDrop<T>,
+}
+
+impl<T, L: Limit> Drop for Held<'_, T, L> {
+    #[cold]
+    fn drop(&mut self) {
+        // SAFETY: dropped only by an unwind, the value still here; the
+        // receive that made the guard is the channel's one receiver, and
+        // runs nothing else meanwhile.
+        unsafe {
+            let value = core::mem::ManuallyDrop::take(&mut self.value);
+            self.chan.queue.put_back(value);
+        }
+    }
 }
 
 /// The shared state of one channel.
@@ -112,8 +140,10 @@ pub(super) struct Chan<T, L: Limit> {
 }
 
 // A channel holds no invariant that a panic in a caller's closure could break
-// half way: every shared word is an atomic and every step is complete before
-// the next, so a panic leaves it usable.
+// half way: every shared word is an atomic, the waker cell gives itself back
+// when a waker's clone panics (see `AtomicWaker`), and a value a receive
+// popped goes to the receiver's stash when a sender's waker panics, so a
+// panic leaves it usable.
 impl<T, L: Limit> UnwindSafe for Chan<T, L> {}
 impl<T, L: Limit> RefUnwindSafe for Chan<T, L> {}
 
@@ -279,8 +309,10 @@ impl<T, L: Limit> Chan<T, L> {
     #[inline(always)]
     unsafe fn pop(&self) -> Pop<T> {
         // SAFETY: the caller's contract.
-        if let Some(value) = unsafe { self.queue.try_pop() } {
-            return Pop::Value(value);
+        match unsafe { self.queue.try_pop() } {
+            Popped::Value(value) => return Pop::Value(value),
+            Popped::Stashed(value) => return Pop::Stashed(value),
+            Popped::Nothing => {}
         }
         // Count first, then look again: the count reads zero only after every
         // sender's pushes, so an empty queue behind a zero count is final. A
@@ -290,9 +322,29 @@ impl<T, L: Limit> Chan<T, L> {
         }
         // SAFETY: the caller's contract.
         match unsafe { self.queue.try_pop() } {
-            Some(value) => Pop::Value(value),
-            None => Pop::Closed,
+            Popped::Value(value) => Pop::Value(value),
+            Popped::Stashed(value) => Pop::Stashed(value),
+            Popped::Nothing => Pop::Closed,
         }
+    }
+
+    /// Gives back the admission of a popped `value`. If that unwinds (the
+    /// pass wakes a sender's waker), the value goes to the receiver's stash
+    /// and the panic goes on: the next receive answers it.
+    ///
+    /// # Safety
+    ///
+    /// As for [`pop`](Self::pop).
+    #[inline(always)]
+    unsafe fn received(&self, value: T) -> T {
+        let held = Held {
+            chan: self,
+            value: core::mem::ManuallyDrop::new(value),
+        };
+        self.limit.release(1);
+        let mut held = core::mem::ManuallyDrop::new(held);
+        // SAFETY: taken once, and the guard is never dropped after.
+        unsafe { core::mem::ManuallyDrop::take(&mut held.value) }
     }
 
     /// One value, or the end of the channel, if either is there. A value
@@ -305,10 +357,9 @@ impl<T, L: Limit> Chan<T, L> {
     unsafe fn next(&self) -> Option<Option<T>> {
         // SAFETY: the caller's contract.
         match unsafe { self.pop() } {
-            Pop::Value(value) => {
-                self.limit.release(1);
-                Some(Some(value))
-            }
+            // SAFETY: the caller's contract.
+            Pop::Value(value) => Some(Some(unsafe { self.received(value) })),
+            Pop::Stashed(value) => Some(Some(value)),
             Pop::Closed => Some(None),
             Pop::Empty => None,
         }
@@ -363,9 +414,12 @@ impl<T, L: Limit> Chan<T, L> {
     ///
     /// As for [`pop`](Self::pop).
     unsafe fn take_many(&self, buf: &mut Vec<T>, limit: usize) -> Option<usize> {
+        // `taken` values owe the limit an admission; `moved` also counts a
+        // stashed one, whose admission is back.
         let mut taken = 0;
+        let mut moved = 0;
         let ended = loop {
-            if taken == limit {
+            if moved == limit {
                 break false;
             }
             // SAFETY: the caller's contract.
@@ -373,6 +427,11 @@ impl<T, L: Limit> Chan<T, L> {
                 Pop::Value(value) => {
                     buf.push(value);
                     taken += 1;
+                    moved += 1;
+                }
+                Pop::Stashed(value) => {
+                    buf.push(value);
+                    moved += 1;
                 }
                 Pop::Closed => break true,
                 Pop::Empty => break false,
@@ -381,7 +440,7 @@ impl<T, L: Limit> Chan<T, L> {
         if taken > 0 {
             self.limit.release(taken);
         }
-        (taken > 0 || ended).then_some(taken)
+        (moved > 0 || ended).then_some(moved)
     }
 
     /// The receiver's batch poll; see [`take_many`](Self::take_many). The
@@ -435,10 +494,9 @@ impl<T, L: Limit> Chan<T, L> {
     pub(super) unsafe fn try_recv(&self) -> Result<T, TryRecvError> {
         // SAFETY: the caller's contract.
         match unsafe { self.pop() } {
-            Pop::Value(value) => {
-                self.limit.release(1);
-                Ok(value)
-            }
+            // SAFETY: the caller's contract.
+            Pop::Value(value) => Ok(unsafe { self.received(value) }),
+            Pop::Stashed(value) => Ok(value),
             Pop::Closed => Err(TryRecvError::Disconnected),
             Pop::Empty if self.finished() => Err(TryRecvError::Disconnected),
             Pop::Empty => Err(TryRecvError::Empty),
@@ -465,9 +523,16 @@ impl<T, L: Limit> Chan<T, L> {
     /// As for [`pop`](Self::pop).
     unsafe fn drain(&self) {
         // SAFETY: the caller's contract.
-        while let Some(value) = unsafe { self.queue.try_pop() } {
-            self.limit.release(1);
-            drop(value);
+        loop {
+            // SAFETY: the caller's contract.
+            match unsafe { self.queue.try_pop() } {
+                Popped::Value(value) => {
+                    self.limit.release(1);
+                    drop(value);
+                }
+                Popped::Stashed(value) => drop(value),
+                Popped::Nothing => break,
+            }
         }
     }
 

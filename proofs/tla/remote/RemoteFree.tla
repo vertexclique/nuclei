@@ -14,7 +14,14 @@
 (* for and frees the rest. As its thread ends it swaps the list out and   *)
 (* the head to closed in one step, frees all it holds, then lets the      *)
 (* record go; the next thread to claim the record opens it again. A block *)
-(* given up on goes back to the system.                                   *)
+(* given up on goes back to the system. With `Late`, a task of the owner's *)
+(* may end on the owner's own thread after its cache went (a thread-local *)
+(* dropped after the cache's, as the thread ends): its free finds no      *)
+(* cache and takes the freeing threads' path to the block's record, its   *)
+(* own (`keep_slow`, `give_back`): refused while closed, pushed onto the  *)
+(* list of the next owner once that one opened it. The push is the same   *)
+(* steps whichever thread runs them and none of them looks at who that    *)
+(* is, so the model hands the block to a freeing thread to run them.      *)
 (*                                                                          *)
 (* What is abstract: a block's memory is its place (`where`); the walk of *)
 (* a list swapped out is one step, since no other thread can reach it.    *)
@@ -26,6 +33,7 @@ CONSTANTS
     Foreign,   \* threads that free blocks they did not allocate
     Kept,      \* the bound of a cache and of a list
     Allocs,    \* allocations of each owner
+    Late,      \* TRUE: an owner's task may end on its thread after the owner's cache went
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Null == "null"
@@ -51,7 +59,9 @@ variables
     ownersDone = 0,
     refusedClosed = FALSE,              \* (record) a push found the list closed
     refusedFull = FALSE,                \* (record) a push found the list at its bound
-    reclaimed = FALSE;                  \* (record) "n" took back a block "o" allocated
+    reclaimed = FALSE,                  \* (record) "n" took back a block "o" allocated
+    lateBlk = Null,                     \* (Late) the block whose free comes after its owner's cache went
+    lateRefused = FALSE;                \* (record) that late free found its list closed
 
 define
     Held(t) == {b \in Blocks : where[b] = t}
@@ -59,7 +69,8 @@ define
 end define;
 
 fair process owner \in Owners
-variables blk = Null, allocs = 0;
+variables blk = Null, allocs = 0,
+          late = Null;   \* (Late) a block whose task ends on this thread after the cache went
 begin
 O_claim:
     if self = "n" then
@@ -105,6 +116,12 @@ O_end:
                 \* The task ends on another thread.
                 with f \in Foreign do where[blk] := f; end with;
             or
+                \* (Late) It ends on this thread, after this thread's cache went: it is still
+                \* in use until then.
+                await Late /\ late = Null /\ lateBlk = Null;
+                late := blk;
+                lateBlk := blk;
+            or
                 \* It ends here.
                 if Cardinality(Held(self)) < Kept then
                     where[blk] := self;
@@ -140,6 +157,12 @@ O_drop:
     where := [x \in Blocks |-> IF where[x] = self THEN "sys" ELSE where[x]];
 O_release:
     claimed := FALSE;
+    \* (Late) Then the late task's free: no cache any more, so the block goes to its record, by
+    \* the freeing threads' path (`keep_slow`'s `give_back`), which a freeing thread runs here.
+    if late # Null then
+        with f \in Foreign do where[late] := f; end with;
+        late := Null;
+    end if;
     ownersDone := ownersDone + 1;
 end process;
 
@@ -172,6 +195,7 @@ F_load:
         h := head;
 F_check:
         if h = Closed then
+            if fb = lateBlk then lateRefused := TRUE; end if;   \* (record)
             count := count - 1;
             where[fb] := "sys";
             fb := Null;
@@ -235,4 +259,6 @@ Terminates == <>(\A p \in Owners \cup Foreign : pc[p] = "Done")
 NoRefusedClosed == ~refusedClosed
 NoRefusedFull == ~refusedFull
 NoReclaimed == ~reclaimed
+\* An owner's own late free finds its list closed, and the block goes back to the system.
+NoLateRefused == ~lateRefused
 =============================================================================

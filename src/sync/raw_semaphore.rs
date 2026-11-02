@@ -395,6 +395,11 @@ impl PermitWait {
         }
     }
 
+    /// Whether the wait holds a place in the queue.
+    pub(super) fn is_queued(&self) -> bool {
+        self.contend.is_queued()
+    }
+
     pub(super) fn poll(&mut self, sem: &RawSemaphore, n: usize, waker: &Waker) -> Poll<()> {
         self.contend.poll(sem, n, waker)
     }

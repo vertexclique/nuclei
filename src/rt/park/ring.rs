@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::Notifier;
+use crate::rt::shard::ring::RECOVER;
 use crate::syscore::linux::iouring::ops::{NOT_AN_OP, WAKE_LOW};
 use crate::syscore::linux::iouring::ring::sys::{IORING_SETUP_SINGLE_ISSUER, IORING_SETUP_SQPOLL};
 use crate::syscore::linux::iouring::ring::{IoUringCqe, Ring, RingConfig, SqFull, Sqe};
@@ -109,10 +110,15 @@ pub(crate) struct RingPoller {
     waiting: VecDeque<Sqe>,
     /// The shard's thread made itself the issuer.
     enabled: bool,
+    /// The next wait has a cold chore: the ring is not enabled yet, or a look found the kernel
+    /// starting or stopping to hold completions, so the drop count is read.
+    attend: bool,
     /// The kernel held completions the queue had no room for, at the last
     /// look; how many times that began.
     overflowed: bool,
     overflows: u64,
+    /// The kernel's count of dropped completions at the last report of a loss.
+    dropped_seen: u32,
     /// The last look that entered the kernel brought completions: the kernel may run only part of
     /// its task work in one enter, so the next look enters too.
     entered_with_more: bool,
@@ -152,8 +158,10 @@ impl RingPoller {
             wake_id: NOT_AN_OP,
             waiting: VecDeque::new(),
             enabled: false,
+            attend: true,
             overflowed: false,
             overflows: 0,
+            dropped_seen: 0,
             entered_with_more: false,
         })
     }
@@ -201,6 +209,7 @@ impl RingPoller {
             match self.ring.submit() {
                 Ok(_) => {}
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if self.dropped_reported(&err) => continue,
                 Err(err) if matches!(err.raw_os_error(), Some(libc::EBUSY | libc::EAGAIN)) => {
                     return Ok(false);
                 }
@@ -281,8 +290,8 @@ impl RingPoller {
         timeout: Option<Duration>,
         out: &mut impl CqeSink,
     ) -> io::Result<bool> {
-        if !self.enabled {
-            self.enable()?;
+        if self.attend {
+            self.attend()?;
         }
         self.arm_wake();
         self.flush_waiting();
@@ -298,7 +307,13 @@ impl RingPoller {
         let looking =
             timeout == Some(Duration::ZERO) || (!self.waiting.is_empty() && !self.submit_now()?);
         let mut entered = false;
-        let result = if looking {
+        #[cfg(test)]
+        let report = ENTER_EBADR_FOR_TEST.with(|n| n.replace(n.get().saturating_sub(1))) > 0;
+        #[cfg(not(test))]
+        let report = false;
+        let result = if report {
+            Err(io::Error::from_raw_os_error(libc::EBADR))
+        } else if looking {
             self.ring
                 .submit_or_look(self.entered_with_more)
                 .map(|e| entered = e)
@@ -311,7 +326,7 @@ impl RingPoller {
                 if matches!(
                     err.raw_os_error(),
                     Some(libc::EINTR) | Some(libc::EBUSY) | Some(libc::EAGAIN)
-                ) => {}
+                ) || self.dropped_reported(&err) => {}
             Err(err) => return Err(err),
         }
         let (woken, got) = self.reap(out);
@@ -320,6 +335,68 @@ impl RingPoller {
         // Completions freed room: entries that waited for it go in now.
         self.flush_waiting();
         Ok(woken)
+    }
+
+    /// The cold chores a wait starts with: enables the ring, and reads the drop count. The flag
+    /// stays set when the enable fails.
+    #[cold]
+    #[inline(never)]
+    fn attend(&mut self) -> io::Result<()> {
+        if !self.enabled {
+            self.enable()?;
+        }
+        self.dropped(false);
+        self.attend = false;
+        Ok(())
+    }
+
+    /// Whether `err`, an enter's error, is the kernel's report that it dropped completions: its
+    /// queue was full and it had no memory for an overflow entry. The ring works after, so the
+    /// loss is counted and said once, the shard's ring is asked to recover, and the caller goes
+    /// on as after an interrupted enter.
+    fn dropped_reported(&mut self, err: &io::Error) -> bool {
+        err.raw_os_error() == Some(libc::EBADR) && self.dropped(true)
+    }
+
+    /// Counts and says the completions the kernel dropped since the last report, and asks the
+    /// ring to recover from them. A drop is seen at the kernel's `EBADR` at the next wait that
+    /// sleeps, and by the count, read at the start of the wait after a look finds the kernel
+    /// starting or stopping to hold completions past the queue (`look_for_overflow`); a shard
+    /// that never sleeps sees it then. `reported`: the kernel just said so (`EBADR`), which is a
+    /// loss even when its count did not move. Whether there was one. On the cold paths only.
+    #[cold]
+    #[inline(never)]
+    fn dropped(&mut self, reported: bool) -> bool {
+        let now = self.ring.completions_dropped();
+        let mut lost = now.wrapping_sub(self.dropped_seen);
+        if lost == 0 {
+            if !reported {
+                return false;
+            }
+            // The kernel reports only after it dropped one, so a count that did not move still means one.
+            lost = 1;
+        }
+        self.dropped_seen = now;
+        crate::rt::counters::completions_dropped(u64::from(lost));
+        log::error!(
+            "the kernel dropped {lost} io_uring completions for want of memory, so the shard cancels its operations and ends those that do not end with an error; give the process more memory"
+        );
+        self.ask_recovery();
+        true
+    }
+
+    /// Asks the shard's ring to recover from dropped completions: a no-op entry whose completion
+    /// reaches the ring as a request (see `shard::ring::recover`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn ask_recovery(&mut self) {
+        self.push(Sqe::nop().user_data(RECOVER));
+    }
+
+    /// As the kernel's report of a drop, for a test: counted, said, and the ring asked.
+    #[cfg(test)]
+    pub(crate) fn drop_for_test(&mut self) {
+        self.dropped(true);
     }
 
     /// Takes the completions that have arrived into `out`, as many as it has room for, without
@@ -352,6 +429,7 @@ impl RingPoller {
         if overflowed != self.overflowed {
             self.overflows += u64::from(overflowed);
             self.overflowed = overflowed;
+            self.attend = true;
         }
     }
 
@@ -376,6 +454,13 @@ impl RingPoller {
     pub(crate) fn ring(&self) -> &Ring {
         &self.ring
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many of the next waits on this thread get `EBADR` from their enter, as when the kernel
+    /// dropped completions, for a test.
+    pub(crate) static ENTER_EBADR_FOR_TEST: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

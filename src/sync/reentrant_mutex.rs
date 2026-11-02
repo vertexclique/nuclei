@@ -13,6 +13,7 @@ use core::task::{Context, Poll};
 use super::internal::{AtomicU64, Ordering, UnsafeCell};
 use super::owner::Owner;
 use super::raw_semaphore::{PermitWait, RawSemaphore};
+use super::siblings::{Ticket, wake_siblings};
 
 /// A mutex the owner holding it can lock again without waiting.
 ///
@@ -77,7 +78,7 @@ impl<T: ?Sized> ReentrantMutex<T> {
     /// Locks the mutex if `owner` holds it, or if it is free and no
     /// handoff is owed.
     pub fn try_lock<'a>(&'a self, owner: &'a Owner) -> Option<ReentrantMutexGuard<'a, T>> {
-        if self.reenter(owner) || self.sem.try_acquire(1) && self.enter(owner) {
+        if self.reenter(owner) || self.sem.try_acquire(1) && self.enter(owner, 0) {
             return Some(ReentrantMutexGuard::new(self));
         }
         None
@@ -87,18 +88,16 @@ impl<T: ?Sized> ReentrantMutex<T> {
     /// contended wait is lock-free, not wait-free: see
     /// [Progress](super#progress).
     ///
-    /// Every poll looks for `owner` first, so a wait that queued before
+    /// Every poll looks for `owner` first, and a wait that queued before
     /// `owner` took the lock through another of its requests (two locks in
-    /// one `join!`) leaves the queue and enters at its next poll. Nothing
-    /// wakes it for that: a wait last polled before the other request
-    /// entered (the `join!` polls it first, or it is in another task of the
-    /// same owner) waits as another owner's would, so holding the lock until
-    /// it completes waits on itself.
+    /// one `join!`, or in two tasks of one owner) is woken by that entry, so
+    /// it leaves the queue and enters at once.
     pub fn lock<'a>(&'a self, owner: &'a Owner) -> ReentrantMutexLock<'a, T> {
         ReentrantMutexLock {
             mutex: self,
             owner,
             wait: PermitWait::new(),
+            ticket: Ticket::new(),
         }
     }
 
@@ -125,12 +124,19 @@ impl<T: ?Sized> ReentrantMutex<T> {
         true
     }
 
-    /// Records `owner` as the holder after the permit was taken.
-    fn enter(&self, owner: &Owner) -> bool {
+    /// Records `owner` as the holder after the permit was taken, and wakes
+    /// its other queued requests on this lock (all but ticket `except`).
+    fn enter(&self, owner: &Owner, except: u64) -> bool {
         // SAFETY: the permit makes this caller the only holder.
         self.depth.with_mut(|depth| unsafe { *depth = 1 });
         self.holder.store(owner.id(), Ordering::Relaxed);
+        wake_siblings(self.address(), owner.id(), except);
         true
+    }
+
+    /// The lock's identity in the registry of queued requests.
+    fn address(&self) -> usize {
+        core::ptr::from_ref(self).cast::<()>() as usize
     }
 
     fn unlock(&self) {
@@ -209,6 +215,8 @@ pub struct ReentrantMutexLock<'a, T: ?Sized> {
     mutex: &'a ReentrantMutex<T>,
     owner: &'a Owner,
     wait: PermitWait,
+    /// Its place among the owner's queued requests.
+    ticket: Ticket,
 }
 
 impl<'a, T: ?Sized> Future for ReentrantMutexLock<'a, T> {
@@ -220,20 +228,33 @@ impl<'a, T: ?Sized> Future for ReentrantMutexLock<'a, T> {
             // The owner took the lock through another request since this one
             // queued: this one leaves the queue, which cannot have granted it
             // the permit the owner holds.
+            // The guard first: the cancel and the budget's refusal run user
+            // code, and a panic there gives the level back.
+            let guard = ReentrantMutexGuard::new(this.mutex);
             this.wait.cancel(&this.mutex.sem, 1);
+            this.ticket.unregister();
             // Completed at once: it spends one operation of the poll's
             // budget, or, the budget spent, the level goes and it yields.
-            let guard = ReentrantMutexGuard::new(this.mutex);
             if crate::coop::spend(cx.waker()) {
                 return Poll::Ready(guard);
             }
             drop(guard);
             return Poll::Pending;
         }
-        this.wait.poll(&this.mutex.sem, 1, cx.waker()).map(|()| {
-            this.mutex.enter(this.owner);
-            ReentrantMutexGuard::new(this.mutex)
-        })
+        match this.wait.poll(&this.mutex.sem, 1, cx.waker()) {
+            Poll::Ready(()) => {
+                this.mutex.enter(this.owner, this.ticket.number());
+                this.ticket.unregister();
+                Poll::Ready(ReentrantMutexGuard::new(this.mutex))
+            }
+            Poll::Pending => {
+                if this.wait.is_queued() {
+                    this.ticket
+                        .register(this.mutex.address(), this.owner.id(), cx.waker());
+                }
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -324,5 +345,88 @@ mod tests {
         Polled::new(lock.lock(&other)).pending();
         drop(held);
         assert!(lock.try_lock(&other).is_some());
+    }
+
+    #[test]
+    fn a_reenter_whose_cancel_panics_keeps_no_level() {
+        let lock = ReentrantMutex::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_lock(&other).expect("free");
+        let mut first = Polled::new(lock.lock(&me));
+        let waker = crate::sync::test_support::drop_panics();
+        let mut second = Box::pin(lock.lock(&me));
+        let mut cx = Context::from_waker(&waker);
+        first.pending();
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        drop(theirs);
+        let first = first.ready();
+        // The owner holds the lock through `first`, so the second request
+        // re-enters; leaving the queue drops its waker, which panics.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            second.as_mut().poll(&mut cx)
+        }));
+        assert!(caught.is_err(), "the panic reaches the caller");
+        drop(first);
+        drop(second);
+        assert!(lock.try_lock(&other).is_some(), "a level was kept");
+    }
+
+    #[test]
+    fn an_entry_wakes_the_younger_request_of_its_owner_that_was_polled_first() {
+        let lock = ReentrantMutex::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_lock(&other).expect("free");
+        let mut elder = Polled::new(lock.lock(&me));
+        let mut younger = Polled::new(lock.lock(&me));
+        elder.pending();
+        younger.pending();
+        drop(theirs);
+        // A `join!` polls the younger first: the elder holds the grant.
+        younger.pending();
+        assert_eq!(younger.wakes(), 0);
+        let held = elder.ready();
+        assert_eq!(
+            younger.wakes(),
+            1,
+            "the owner's entry woke its other request"
+        );
+        let again = younger.ready();
+        assert!(lock.try_lock(&other).is_none());
+        drop((held, again));
+        assert!(lock.try_lock(&other).is_some(), "both levels went");
+    }
+
+    #[test]
+    fn two_requests_of_a_thread_owner_do_not_wait_on_each_other() {
+        let lock = ReentrantMutex::new(());
+        let (me, same, other) = (Owner::thread(), Owner::thread(), Owner::new());
+        let theirs = lock.try_lock(&other).expect("free");
+        let mut first = Polled::new(lock.lock(&me));
+        let mut second = Polled::new(lock.lock(&same));
+        first.pending();
+        second.pending();
+        drop(theirs);
+        second.pending();
+        let held = first.ready();
+        assert_eq!(second.wakes(), 1);
+        let again = second.ready();
+        drop((held, again));
+        assert!(lock.try_lock(&other).is_some());
+    }
+
+    #[test]
+    fn a_dropped_request_leaves_the_registry() {
+        let lock = ReentrantMutex::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_lock(&other).expect("free");
+        let mut waiting = Polled::new(lock.lock(&me));
+        waiting.pending();
+        let mut sibling = Polled::new(lock.lock(&me));
+        sibling.pending();
+        drop(waiting);
+        drop(theirs);
+        let held = sibling.ready();
+        assert_eq!(crate::sync::siblings::queued_here(), 0);
+        drop(held);
     }
 }

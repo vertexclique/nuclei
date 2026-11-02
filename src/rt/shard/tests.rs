@@ -12,16 +12,20 @@ fn sleep_on(shard: &Shard, at: Instant) -> impl core::future::Future<Output = ()
         let mut wheel = shard.wheel().borrow_mut();
         match key {
             None => {
-                key = Some(wheel.insert(
+                let armed = wheel.insert(
                     shard.time_of(false, crate::time::clock::nanos(at)),
-                    cx.waker(),
-                ));
+                    cx.waker().clone(),
+                );
+                match armed {
+                    Ok(k) => key = Some(k),
+                    Err(_) => return core::task::Poll::Ready(()),
+                }
             }
             Some(k) if wheel.is_fired(k) => {
-                wheel.remove(k);
+                drop(wheel.remove(k));
                 return core::task::Poll::Ready(());
             }
-            Some(k) => wheel.set_waker(k, cx.waker()),
+            Some(k) => drop(wheel.replace_waker(k, cx.waker().clone())),
         }
         let fired = key.is_some_and(|k| wheel.is_fired(k));
         if fired {
@@ -179,11 +183,10 @@ fn a_failed_notification_is_tried_again() {
 }
 
 /// The tasks bound to the thread that runs a shard are taken while other
-/// threads keep its inbox full. Today the home is looked at only once the
-/// inbox is empty (proofs/tla/sched/Sched.tla `home_after_empty`), and the
-/// fix waits for a decision on its op-count cost: ignored until it lands.
+/// threads keep its inbox full: every other interval's turn looks at the
+/// home first, where before the home was looked at only once the inbox was
+/// empty (proofs/tla/sched/Sched.tla `home_after_empty`).
 #[test]
-#[ignore = "fails until the home's turn lands: a bound task waits behind a full inbox"]
 fn a_home_is_served_while_the_inbox_stays_full() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -205,7 +208,7 @@ fn a_home_is_served_while_the_inbox_stays_full() {
         let (runnable, task) = unsafe {
             crate::rt::task::spawn_unchecked(
                 async {},
-                Sched::counted(Arc::clone(&shard.shared), None, None),
+                Sched::<false>::counted(Arc::clone(&shard.shared), None, None),
             )
         };
         shard.shared.push_remote(runnable);
@@ -219,9 +222,11 @@ fn a_home_is_served_while_the_inbox_stays_full() {
         let (runnable, task) = unsafe {
             crate::rt::task::spawn_unchecked(
                 async move { ran.store(true, Ordering::SeqCst) },
-                Sched::counted(Arc::clone(&shard.shared), Some(Arc::clone(&home)), None),
+                Sched::<true>::counted(Arc::clone(&shard.shared), Some(Arc::clone(&home)), None),
             )
         };
+        // SAFETY: this thread is the home's, and the new task is on no list.
+        unsafe { home.push_task(runnable.links()) };
         // A wake of the bound task from another thread.
         home.push(runnable);
         task
@@ -483,22 +488,72 @@ fn an_advance_of_a_running_clock_moves_the_pollers_precise_timer() {
     .unwrap();
     let _runtime = context::set_runtime(inner);
     let _current = context::enter(&shard);
-    let at = inner.clock.now_nanos() + 10_000_000_000;
+    // On a top-level slot boundary of the microsecond wheel, so its next
+    // work is this deadline and not a move down on the way to it.
+    let at = (inner.clock.now_nanos() / 1_000 + 6_000_000)
+        .next_multiple_of(crate::time::wheel::TOP_SLOT)
+        * 1_000;
+    let lead = Duration::from_nanos(at - inner.clock.now_nanos());
     let key = shard
         .wheel_of(true)
         .borrow_mut()
-        .insert(shard.time_of(true, at), Waker::noop());
+        .insert(shard.time_of(true, at), Waker::noop().clone())
+        .unwrap();
     assert!(shard.timer_wait(true).is_some());
     let first = precise_armed_in(&shard).expect("the poller armed its timer");
-    assert!(first <= Duration::from_secs(10), "{first:?}");
-    inner.clock.advance(Duration::from_secs(5));
+    assert!(first <= lead, "{first:?}");
+    let by = lead - Duration::from_secs(5);
+    inner.clock.advance(by);
     assert!(shard.timer_wait(true).is_some());
     let second = precise_armed_in(&shard).expect("the poller's timer is armed");
-    // Moved by the advance it is five seconds nearer than it was, less the
-    // time between the two looks, however long that took on a loaded host.
+    assert!(second <= Duration::from_secs(5), "{second:?}");
+    // Moved by the advance it is `by` nearer than it was, less the time
+    // between the two looks, however long that took on a loaded host.
     assert!(
-        second + Duration::from_secs(4) < first,
+        second + by - Duration::from_secs(1) < first,
         "the poller's timer stayed at the deadline as the system saw it before the advance: {first:?} left before, {second:?} after"
     );
-    shard.wheel_of(true).borrow_mut().remove(key);
+    drop(shard.wheel_of(true).borrow_mut().remove(key));
+}
+
+#[test]
+fn a_park_that_backs_out_again_and_again_still_looks_at_the_driver() {
+    use core::cell::RefCell;
+    use core::task::{Poll, Waker};
+    use std::rc::Rc;
+
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let _current = context::enter(&shard);
+    shard.spin.spend();
+    let before = shard.looks.get();
+    let stored: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+    let hook_stored = Rc::clone(&stored);
+    super::run::BEFORE_PARK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            if let Some(waker) = hook_stored.borrow().as_ref() {
+                waker.wake_by_ref();
+            }
+        }));
+    });
+    let polls = 3 * super::DRIVER_INTERVAL;
+    let mut seen = 0u32;
+    shard.block_on(core::future::poll_fn(|cx| {
+        *stored.borrow_mut() = Some(cx.waker().clone());
+        seen += 1;
+        if seen >= polls {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }));
+    super::run::BEFORE_PARK.with(|hook| *hook.borrow_mut() = None);
+    assert!(
+        shard.looks.get() - before >= 2,
+        "the driver was never looked at while the park kept backing out"
+    );
 }

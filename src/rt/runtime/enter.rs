@@ -134,8 +134,13 @@ impl RuntimeHandle {
 
 /// The index of the worker this code runs on (0, 1, ... among the workers
 /// of its runtime), `None` off the workers (in `block_on`'s own thread, on
-/// the blocking pool, outside any runtime).
+/// the blocking pool, outside any runtime). The rest of a poll whose
+/// worker's shard the handoff moved to another thread still answers that
+/// worker.
 pub fn worker_index() -> Option<usize> {
     let runtime = context::runtime()?;
-    context::current(|shard| shard.and_then(|shard| shard.worker_index(runtime.id)))
+    context::current(|shard| match shard {
+        Some(shard) => shard.worker_index(runtime.id),
+        None => context::lost_shared(|lost| lost.and_then(|s| s.counters.worker_of(runtime.id))),
+    })
 }

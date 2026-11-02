@@ -21,10 +21,24 @@
 (*                                                                          *)
 (* The tasks run on one thread and every channel step runs no user code   *)
 (* between its look and its write, so a step is one atomic step here: the *)
-(* model interleaves whole steps in every order. What must never happen:  *)
-(* the receiver answers the end while a value it was owed is not received; *)
-(* a slot lost or made up; a task asleep for good with what it waits for   *)
-(* there.                                                                  *)
+(* model interleaves whole steps in every order, save where a step runs a  *)
+(* waker, which is user code:                                              *)
+(*  - a registration clones the poll's waker after it looked. With         *)
+(*    Reentrant the clone is a step apart (the receiver's old waker out of *)
+(*    its cell meanwhile), so the other tasks may send, drop or close      *)
+(*    during it, as a clone that touches the channel does; the poll then   *)
+(*    looks again before it sleeps. A `closed()` wait clones, then looks,  *)
+(*    then joins the list.                                                 *)
+(*  - the close wakes the `closed()` waits one at a time; a waker in       *)
+(*    WakePanics panics, and a guard wakes the rest before the panic goes  *)
+(*    on to the closer's caller.                                           *)
+(*  - with RecvPanics the first value received gives its slot back to a   *)
+(*    waiting send whose waker panics: the value in hand goes back to the  *)
+(*    front of the queue and its slot is taken back as a debt (the count   *)
+(*    may go below zero), and the receiver's caller receives again.        *)
+(* What must never happen: the receiver answers the end while a value it   *)
+(* was owed is not received; a value lost; a slot lost or made up; a task  *)
+(* asleep for good with what it waits for there.                           *)
 (*                                                                          *)
 (* What is abstract: the slots' semaphore is a count and a wait for a free *)
 (* slot (its line and its fairness are the localsemaphore family's); a     *)
@@ -36,6 +50,9 @@ CONSTANTS
     Cap,       \* the channel's slots
     Progs,     \* per sender, its operations: "send", "reserve_drop", "closed", "hold"
     RxProg,    \* the receiver's operations: "recv", "try", "close", "drop"
+    Reentrant, \* a registration's clone of its waker is a step of its own (user code)
+    WakePanics,\* the senders whose closed() waker panics when the close wakes it
+    RecvPanics,\* the first value received gives its slot to a send whose waker panics
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Senders == 1..Len(Progs)
@@ -55,7 +72,10 @@ variables
     sent = 0,                 \* (record) values pushed
     received = 0,             \* (record) values the receiver took
     rxDropped = 0,            \* (record) values the receiver's drop threw away
-    ended = FALSE;            \* (record) the receiver answered the end
+    ended = FALSE,            \* (record) the receiver answered the end
+    closeStopped = FALSE,     \* the close's loop gave up at a panicking waker
+    recvPanicked = FALSE,     \* the one panicking receive happened
+    lost = 0;                 \* (record) values taken and dropped
 
 define
     \* `finished`: closed by either side, nothing queued, no slot reserved.
@@ -64,6 +84,8 @@ define
     SlotsConserved == free + queued + reserved = Cap
     \* The end is answered only with every value pushed received.
     EndAfterAll == ended => received = sent
+    \* No value is ever taken and dropped.
+    NoValueLost == lost = 0
 end define;
 
 \* `wake_rx`: the receiver's waker leaves its cell and is called.
@@ -115,8 +137,20 @@ S_use:
     end if;
     goto S_op_done;
 S_closed:
-    \* `ClosedWait::poll`: ready once the receiver closed, else in the list.
+    \* `ClosedWait::poll`: ready once the receiver closed, else in the list. With Reentrant the
+    \* clone of the waker it joins with runs first, as a step of its own.
     if rxClosed then
+        goto S_op_done;
+    elsif Reentrant then
+        goto S_closed_join;
+    else
+        closedWaiting := closedWaiting \cup {self};
+        goto S_closed_sleep;
+    end if;
+S_closed_join:
+    \* After the clone it looks again, then joins. MUTATION closed_no_relook: it joins without
+    \* looking, after a close the clone ran.
+    if rxClosed /\ Mutation # "closed_no_relook" then
         goto S_op_done;
     else
         closedWaiting := closedWaiting \cup {self};
@@ -156,15 +190,23 @@ R_poll:
     \* MUTATION finish_ignores_reserved: the end does not wait for reserved slots.
     if queued > 0 then
         queued := queued - 1;
-        free := free + 1;
-        received := received + 1;
-        goto R_op_done;
+        free := free + 1;              \* the slot given back: a waiting send may take it
+        if RecvPanics /\ ~recvPanicked then
+            recvPanicked := TRUE;      \* that send's waker panics, the value in hand
+            goto R_unwind;
+        else
+            received := received + 1;
+            goto R_op_done;
+        end if;
     elsif Finished \/ (Mutation = "finish_ignores_reserved" /\ (rxClosed \/ senders = 0)
                        /\ queued = 0) then
         ended := TRUE;
         goto Done;
     elsif RxProg[ri] = "try" then
         goto R_op_done;            \* Empty
+    elsif Reentrant then
+        rxRegistered := FALSE;     \* the cell empty while the clone runs
+        goto R_set;
     else
         rxRegistered := TRUE;
     end if;
@@ -172,16 +214,51 @@ R_sleep:
     await rxWoken;
     rxWoken := FALSE;
     goto R_poll;
+R_set:
+    \* The clone is stored; a clone ran, so the poll looks again before it sleeps.
+    \* MUTATION no_relook: it answers Pending without looking.
+    rxRegistered := TRUE;
+    if (queued > 0 \/ Finished) /\ Mutation # "no_relook" then
+        goto R_poll;               \* the look again finds a value or the end
+    else
+        goto R_sleep;
+    end if;
+R_unwind:
+    \* The receive's guard puts the value back at the front of the queue and takes its slot back
+    \* as a debt, then the panic reaches the receiver's caller, which receives again.
+    \* MUTATION pop_lost: no guard; the value is dropped.
+    if Mutation = "pop_lost" then
+        lost := lost + 1;
+    else
+        queued := queued + 1;
+        free := free - 1;
+    end if;
+    goto R_poll;
 R_close:
-    \* `close_rx`: the semaphore closed, every `closed()` wait woken.
+    \* `close_rx`: the semaphore closed, then every `closed()` wait woken.
     \* MUTATION close_no_wake: the waits are left asleep.
     if ~rxClosed then
         rxClosed := TRUE;
-        if Mutation # "close_no_wake" then
-            closedWoken := closedWoken \cup closedWaiting;
-            closedWaiting := {};
+        if Mutation = "close_no_wake" then
+            goto R_op_done;
         end if;
+    else
+        goto R_op_done;
     end if;
+R_close_wake:
+    \* The close's loop: one wait at a time. A waker in WakePanics panics; the guard wakes the
+    \* rest, then the panic reaches the closer's caller, which goes on.
+    \* MUTATION close_stops_at_panic: the loop ends at the panic, the rest asleep for good.
+    while closedWaiting # {} /\ ~closeStopped do
+        with w \in closedWaiting do
+            closedWaiting := closedWaiting \ {w};
+            if w \in WakePanics then
+                closeStopped := Mutation = "close_stops_at_panic";
+            else
+                closedWoken := closedWoken \cup {w};
+            end if;
+        end with;
+    end while;
     goto R_op_done;
 R_drop:
     \* `drop_rx`: close (as `close_rx`), let go of the waker, drop every queued value giving
@@ -211,4 +288,6 @@ end algorithm; *)
 
 \* Every task's program finishes: nobody sleeps for good with what it waits for there.
 AllEnd == <>(\A p \in Senders \cup {ReceiverT} : pc[p] = "Done")
+\* Every task whose waker works finishes: a panicking waker strands nobody but its own task.
+OthersEnd == <>(\A p \in (Senders \ WakePanics) \cup {ReceiverT} : pc[p] = "Done")
 =============================================================================

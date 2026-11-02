@@ -3,10 +3,12 @@
 //! handed it, the inbox's and the home's.
 //!
 //! Every `tuning.inbox_interval` runs the remote work comes first, so a busy
-//! local queue does not starve it. The home is looked at only once the
-//! inbox is empty, so other threads that keep the inbox full hold the bound
-//! tasks off: `proofs/tla/sched/Sched.tla` checks the order, today's as its
-//! `home_after_empty` mutation, which breaks `Served`.
+//! local queue does not starve it; every other such run the home's comes
+//! before the inbox's, so neither starves the other: a home looked at only
+//! when the inbox is empty never runs while other threads keep the inbox
+//! full. `proofs/tla/sched/Sched.tla` checks that every place that holds
+//! work is served within a bound of runs. The interval's turn is out of
+//! line, so the runs between pay nothing for it.
 
 use super::Shard;
 use crate::rt::inbox::Pop;
@@ -18,13 +20,26 @@ impl Shard {
     pub(super) fn next(&self) -> Option<Runnable> {
         let left = self.until_inbox.get().wrapping_sub(1);
         if left == 0 {
-            self.until_inbox.set(self.tuning.inbox_interval);
-            if let Some(r) = self.pop_inbox() {
-                return Some(r);
-            }
-        } else {
-            self.until_inbox.set(left);
+            return self.interval_turn();
         }
+        self.until_inbox.set(left);
+        self.next_local()
+    }
+
+    /// The interval's turn: the remote work first, else the rest of the order.
+    #[cold]
+    #[inline(never)]
+    fn interval_turn(&self) -> Option<Runnable> {
+        self.until_inbox.set(self.tuning.inbox_interval);
+        if let Some(r) = self.pop_remote() {
+            return Some(r);
+        }
+        self.next_local()
+    }
+
+    /// The slot, the local queue, then the inbox and the home.
+    #[inline(always)]
+    fn next_local(&self) -> Option<Runnable> {
         if let Some(r) = self.lifo.take() {
             if self.lifo_streak.get() < super::LIFO_MAX {
                 self.lifo_streak.set(self.lifo_streak.get() + 1);
@@ -49,18 +64,50 @@ impl Shard {
         }
     }
 
+    /// The interval's look at the remote work: the inbox first, or every
+    /// other time the home first.
+    #[inline(always)]
+    fn pop_remote(&self) -> Option<Runnable> {
+        let homes_first = !self.homes_first.get();
+        self.homes_first.set(homes_first);
+        if !homes_first {
+            return self.pop_inbox();
+        }
+        if let Some(runnable) = self.pop_home() {
+            self.remote_wakes.set(self.remote_wakes.get() + 1);
+            return Some(runnable);
+        }
+        // The home was just looked at: the inbox does not look again.
+        self.pop_inbox_only()
+    }
+
     // Inlined into the run loop's `next`, whichever codegen unit holds it: it is looked at on
     // every run that finds the local queue empty.
     #[inline(always)]
     pub(super) fn pop_inbox(&self) -> Option<Runnable> {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
-        let popped = match unsafe { self.shared.inbox.pop() } {
+        self.counted(match unsafe { self.shared.inbox.pop() } {
             Pop::Item(runnable) => Some(runnable),
             // A push under way counts as work: the loop comes back. Then the
             // bound tasks of the thread that runs the shard.
             Pop::Empty | Pop::Busy => self.pop_home(),
-        };
+        })
+    }
+
+    /// The inbox alone, for a turn that has just looked at the home.
+    #[inline(always)]
+    fn pop_inbox_only(&self) -> Option<Runnable> {
+        // SAFETY: as in `pop_inbox`.
+        self.counted(match unsafe { self.shared.inbox.pop() } {
+            Pop::Item(runnable) => Some(runnable),
+            Pop::Empty | Pop::Busy => None,
+        })
+    }
+
+    /// A remote wake counted when `popped` is one.
+    #[inline(always)]
+    fn counted(&self, popped: Option<Runnable>) -> Option<Runnable> {
         let runnable = popped?;
         self.remote_wakes.set(self.remote_wakes.get() + 1);
         Some(runnable)

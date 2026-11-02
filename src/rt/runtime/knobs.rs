@@ -104,7 +104,9 @@ impl Builder {
     }
 
     /// Task runs between the times a worker takes from its inbox (tasks
-    /// woken by other threads) before its own queue (default 31). At least 1;
+    /// woken by other threads) before its own queue (default 31); every
+    /// other such time it takes first from its thread's bound tasks, so a
+    /// full inbox does not hold them off. At least 1;
     /// [`build`](Builder::build) fails with `InvalidInput` at 0.
     pub fn global_queue_interval(mut self, runs: u32) -> Self {
         self.tuning.inbox_interval = runs;

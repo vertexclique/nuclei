@@ -19,6 +19,10 @@ OneSend == <<<<"send">>>>
 ReserveDropHold == <<<<"reserve_drop", "hold">>>>
 \* One sender that waits in closed().
 OneClosed == <<<<"closed">>>>
+\* Two senders that each wait in closed().
+TwoClosed == <<<<"closed">>, <<"closed">>>>
+\* One sender that sends twice.
+SendTwice == <<<<"send", "send">>>>
 \* ---- the receivers' and the one-shot sender's programs ----
 \* The operations <<"close">>.
 P_close == <<"close">>

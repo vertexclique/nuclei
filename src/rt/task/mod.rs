@@ -35,6 +35,7 @@
 
 mod header;
 mod join;
+pub(crate) mod list;
 #[cfg(all(test, loom))]
 mod loom_tests;
 pub(crate) mod names;
@@ -98,14 +99,26 @@ pub(crate) unsafe trait Schedule {
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo);
 
     /// Drops the task's future (`drop` does), where and as the schedule
-    /// wants it dropped.
-    fn drop_future(&self, drop: impl FnOnce()) {
+    /// wants it dropped. `links` is the task's place in its list, if it is
+    /// on one.
+    fn drop_future(&self, _links: &list::Links, drop: impl FnOnce()) {
         drop();
     }
+
+    /// A poll of the task returned pending, the run's reference still held:
+    /// a schedule that lists its tasks lists it now, if it is not.
+    fn pending(&self, _links: &list::Links) {}
 
     /// Just before each poll of the task's future, inside the poll's catch:
     /// a panic here is the poll's.
     fn before_poll(&self, _id: Id) {}
+
+    /// Whether [`after_poll`](Self::after_poll) or
+    /// [`terminated`](Self::terminated) do anything: the one test the normal
+    /// path makes.
+    fn has_hooks(&self) -> bool {
+        false
+    }
 
     /// Just after each poll of the task's future; the panic it caught, which
     /// the task then completes with.
@@ -150,6 +163,11 @@ impl Runnable {
     /// makes the runnable again.
     pub(crate) fn into_raw(self) -> NonNull<()> {
         ManuallyDrop::new(self).ptr
+    }
+
+    #[inline(always)]
+    pub(crate) fn links(&self) -> &list::Links {
+        &self.header().links
     }
 
     fn header(&self) -> &Header {
@@ -218,6 +236,25 @@ impl core::fmt::Debug for Runnable {
     }
 }
 
+/// Closes a listed task for a walk at shutdown: one idle (its future owned by nobody) gets the
+/// right to drop its future, as a runnable the caller drops at once, here; one scheduled or
+/// running is only closed, and its runnable's owner drops the future.
+///
+/// # Safety
+///
+/// `links` is the `links` of a live task's header, and the caller is its list's owner.
+pub(crate) unsafe fn close_listed(links: &list::Links) -> Option<Runnable> {
+    let offset = core::mem::offset_of!(Header, links);
+    // SAFETY: the links are the `links` field of a task's header, which is the start of its cell.
+    let ptr = unsafe { core::ptr::from_ref(links).cast::<u8>().sub(offset) };
+    // SAFETY: as above, and a listed task's future is live, so the task is.
+    let closed = join::close(unsafe { &*ptr.cast::<Header>() })?;
+    // SAFETY: `close` added a reference for the runnable of an idle task.
+    closed
+        .idle
+        .then(|| unsafe { Runnable::from_raw(NonNull::new_unchecked(ptr.cast_mut().cast())) })
+}
+
 /// Spawns `future` as a task that `schedule` places when it is woken.
 /// Returns the task's runnable, scheduled once and not yet handed to
 /// `schedule`, and its handle.
@@ -252,9 +289,9 @@ where
     unsafe { (Runnable::from_raw(ptr), Task::from_raw(ptr)) }
 }
 
-/// Runs `f`, aborting the process if it panics: what a waker that panics
-/// inside a task transition gets, as unwinding there would leave the state
-/// word half done.
+/// Runs `f`, aborting the process if it panics: what a panic inside a run
+/// loop's bookkeeping gets, as unwinding there would leave its state half
+/// done.
 #[inline]
 pub(crate) fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
     struct Abort;

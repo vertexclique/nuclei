@@ -1,17 +1,42 @@
-TLC run of every configuration in proofs/tla/timer, 2026-10-24 14:48 UTC.
+TLC run of every configuration in proofs/tla/timer, 2026-11-02 23:45 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-T_await                             26         18      0  pass                                  pass                                  yes
-T_drop                             178         93      1  pass                                  pass                                  yes
-T_live_await                        26         18      1  pass                                  pass                                  yes
-T_live_drop                        178         93      1  pass                                  pass                                  yes
-M_fire_keeps_entry                  25         18      1  violated:NothingLeft                  violated:NothingLeft                  yes
-M_cancel_keeps_entry               172         94      1  violated:NothingLeft                  violated:NothingLeft                  yes
-M_drop_keeps_waker                 145         74      0  violated:NoWakeAfterDrop              violated:NoWakeAfterDrop              yes
-W_cancel_armed                      62         34      0  violated:NoCancelOfArmed              violated:NoCancelOfArmed              yes
-W_cancel_before_arm                 17         13      1  violated:NoCancelBeforeArm            violated:NoCancelBeforeArm            yes
-W_fire_wake                         15         12      1  violated:NoFireWake                   violated:NoFireWake                   yes
+T_await                             61         35      1  pass                                  pass                                  yes
+T_drop                             349        164      1  pass                                  pass                                  yes
+T_live_await                        61         35      2  pass                                  pass                                  yes
+T_live_drop                        349        164      1  pass                                  pass                                  yes
+M_fire_keeps_entry                  54         34      1  violated:NothingLeft                  violated:NothingLeft                  yes
+M_cancel_keeps_entry               344        169      1  violated:NothingLeft                  violated:NothingLeft                  yes
+M_drop_keeps_waker                 230        116      1  violated:NoWakeAfterDrop              violated:NoWakeAfterDrop              yes
+W_cancel_armed                      87         46      1  violated:NoCancelOfArmed              violated:NoCancelOfArmed              yes
+W_cancel_before_arm                 79         43      1  violated:NoCancelBeforeArm            violated:NoCancelBeforeArm            yes
+W_fire_wake                         31         19      1  violated:NoFireWake                   violated:NoFireWake                   yes
+T_goes                             407        192      2  pass                                  pass                                  yes
+T_goes_drop                       2443        929      1  pass                                  pass                                  yes
+T_live_goes                        407        192      1  pass                                  pass                                  yes
+T_live_goes_drop                  2443        929      2  pass                                  pass                                  yes
+M_no_orphan                         87         52      1  violated:NoStrandedWaker              violated:NoStrandedWaker              yes
+M_no_rearm                         290        141      1  violated:Termination                  violated:Termination                  yes
+W_orphan_rearm                     166         86      1  violated:NoRearm                      violated:NoRearm                      yes
+T_live_move_goes                  1406        594      2  pass                                  pass                                  yes
+T_move_goes_drop                  7142       2607      1  pass                                  pass                                  yes
+M_recheck_fired_only               625        294      1  violated:Termination                  violated:Termination                  yes
+MT_post_no_stop_check               93         51      1  violated:NoStrandedWaker              violated:NoStrandedWaker              yes
+MT_post_check_first                 83         50      2  violated:NoStrandedWaker              violated:NoStrandedWaker              yes
+MT_orphan_ignores_cancel           456        216      1  violated:NoWakeAfterDrop              violated:NoWakeAfterDrop              yes
+TL_move                            149         73      1  pass                                  pass                                  yes
+TL_drop                             88         47      1  pass                                  pass                                  yes
+MTL_remove_not_posted               45         29      1  violated:NothingLeft                  violated:NothingLeft                  yes
+MTL_going_keeps_wakers             105         54      1  violated:Completes                    violated:Completes                    yes
+FL_loop                              8          7      1  pass                                  pass                                  yes
+FL_task                              8          7      1  pass                                  pass                                  yes
+MFL_drop_on_panic                    6          5      1  violated:DueWoken                     violated:DueWoken                     yes
+MFL_run_loop_uncaught                8          7      1  violated:ShardRunsOn                  violated:ShardRunsOn                  yes
+U_visitor                           10          8      1  pass                                  pass                                  yes
+M_own_fallback                       5          4      2  violated:SleepEnds                    violated:SleepEnds                    yes
+M_leave_keeps_timers                60         38      1  violated:SleepEnds                    violated:SleepEnds                    yes
+W_nobody_inside                     68         38      1  violated:SleepEnds                    violated:SleepEnds                    yes
 
-results matching EXPECTED.txt: 10 of 10
+results matching EXPECTED.txt: 35 of 35

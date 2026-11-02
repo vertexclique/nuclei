@@ -6,6 +6,7 @@
 <li><code>sleep(duration)</code> and <code>sleep_until(instant)</code> give a <code>Sleep</code>; <code>reset</code> moves its deadline, <code>deadline</code> and <code>is_elapsed</code> read it.</li>
 <li><code>timeout(duration, future)</code> and <code>timeout_at(deadline, future)</code> give <code>Ok(output)</code>, or <code>Err(Elapsed)</code> if the time ran out first. The future is polled before the clock is read, so one that is ready at once always wins.</li>
 <li>Dropping a timer's future cancels it.</li>
+<li>A sleep that completes spends one operation of the task's <a href="tasks.html#yield">budget</a>, as IO does, so a loop over sleeps that are already due still lets the shard's other tasks run.</li>
 </ul>
 
 <h2 id="wheel">The clock and the wheel</h2>
@@ -41,6 +42,7 @@
 <li><strong>It moves by itself when nothing else can.</strong> Once every shard of the runtime is idle with a timer armed, no blocking job runs and no poll the handoff took from its worker still runs, the clock jumps to the earliest timer.</li>
 <li><code>time::advance(duration).await</code> moves it by hand and lets the timers that came due fire before it returns.</li>
 <li><code>time::resume()</code> starts it again from where it stands.</li>
+<li><strong>A pause counts every thread inside the runtime's <code>block_on</code></strong>, from a task on any worker, so the clock does not jump while one is busy. A nested <code>block_on</code> of another runtime on the same thread keeps its own clock and timers, so a paused inner clock never fires the outer runtime's sleeps early; its paused clock does not count that shard.</li>
 </ul>
 <!--example time_paused-->
 <p>A paused clock never goes backwards, on any thread, across a pause, a resume or an advance. While no runtime's clock is paused or advanced, reading it costs one load more than reading the system clock.</p>

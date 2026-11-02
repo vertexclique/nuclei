@@ -118,6 +118,10 @@ pub(crate) enum RingMem {
     },
 }
 
+// Every operation of the table carries a `RingMem`: a variant added to it moves the hot path.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<RingMem>() <= 72);
+
 /// The least a `write_zero_copy` must have left to send for its next chunk to go out zero-copy
 /// (on a ring that allows it at all: `ShardRing::zc_stream`), by default: a worker's ring takes
 /// its runtime's `Builder::zero_copy_threshold` instead (`ShardRing::zero_copy_min`). A smaller

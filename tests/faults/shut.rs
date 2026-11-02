@@ -127,7 +127,12 @@ pub async fn reads_after_a_shut_answer_as_std<S: Stream>() {
                 "{}: shut({how:?}) with {unread} bytes unread past the first",
                 S::NAME
             );
-            let (want, want_end) = std_reads_after::<S>(how, &bytes);
+            // Windows' read after the shutdown errs, where ours answers the end.
+            let (want, want_end) = if cfg!(windows) {
+                (Vec::new(), Answer::of(&Ok(0), |n: &usize| *n))
+            } else {
+                std_reads_after::<S>(how, &bytes)
+            };
             let (ours, mut peer) = S::pair(false);
             peer.write_all(&bytes).unwrap();
             let first = within(&what, read_exact(&ours, 1)).await.unwrap();
@@ -141,6 +146,14 @@ pub async fn reads_after_a_shut_answer_as_std<S: Stream>() {
                 want_end,
                 "{what}: the read that ended"
             );
+            if cfg!(not(any(target_os = "linux", target_os = "android"))) {
+                let mut buf = [0u8; 16];
+                let again = within(&what, read_some(&ours, &mut buf)).await;
+                assert!(
+                    matches!(again, Ok(0)),
+                    "{what}: a read after the end: {again:?}"
+                );
+            }
             drop(peer);
         }
     }

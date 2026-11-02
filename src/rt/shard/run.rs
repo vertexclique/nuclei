@@ -18,11 +18,35 @@ use std::time::{Duration, Instant};
 
 use super::Shard;
 use super::signal::Signal;
+use super::spin::Spun;
 use crate::rt::context::{self, Polled};
 use crate::rt::quartz::Quartz;
 use crate::rt::task::Runnable;
 use crate::rt::tuning::QUARTZ_EVERY;
 use crate::sync::internal::Ordering;
+
+#[cfg(test)]
+thread_local! {
+    /// Run in the run loop's idle pass on this thread just before its park: what it makes ready
+    /// then backs the park out.
+    pub(crate) static BEFORE_PARK: core::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Runs [`BEFORE_PARK`], taken out of its cell while it runs.
+#[cfg(test)]
+fn before_park_hook() {
+    let Some(mut hook) = BEFORE_PARK.with(|hook| hook.borrow_mut().take()) else {
+        return;
+    };
+    hook();
+    BEFORE_PARK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(hook);
+        }
+    });
+}
 
 /// The shard was taken from this thread while the loop ran.
 pub(crate) struct Detached;
@@ -49,9 +73,11 @@ impl Shard {
     /// timers and poller between its polls; on the thread's own shard if this
     /// one is taken from the thread meanwhile.
     pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
+        crate::sync::internal::freeze_frames();
         // Pinned before the nesting's closure, which then holds a reference.
         let mut future = pin!(future);
-        context::deeper(self.limits.max_nesting, || {
+        let unwinding = super::timers::ClearOnUnwind;
+        let output = context::deeper(self.limits.max_nesting, || {
             let signal = self.signal();
             match self.run_loop(future.as_mut(), &signal) {
                 Ok(output) => {
@@ -64,7 +90,9 @@ impl Shard {
                 }
                 Err(Detached) => finish_on_own(future, &signal),
             }
-        })
+        });
+        core::mem::forget(unwinding);
+        output
     }
 
     /// A worker's loop: until the shard stops, drains of its tasks, or is
@@ -79,7 +107,23 @@ impl Shard {
         self.drive_or_report(Some(Duration::ZERO));
         let stopped = pin!(self.shared.stopped());
         let signal = self.signal();
-        match self.run_loop(stopped, &signal) {
+        let mut stopped = stopped;
+        // A timer's waker that panics as the loop fires it must not end the
+        // worker and lose its shard: the loop runs again. Any other panic goes on.
+        let ended = loop {
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_loop(stopped.as_mut(), &signal)
+            }));
+            match ran {
+                Ok(ended) => break ended,
+                Err(panic) if super::timers::take_fire_panic() => crate::rt::caught::lost(
+                    format_args!("a timer's waker panicked as it fired"),
+                    panic,
+                ),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        };
+        match ended {
             // Stopped in the very poll that found the take, the thread lost the shard all the
             // same: its bound tasks and its life are seen to as a detached thread's.
             Ok(()) if !context::detached_from(&self.shared) => Worked::Stopped,
@@ -124,9 +168,11 @@ impl Shard {
             }
         }
         let _leaving = Leaving(self);
+        let unwinding = super::timers::ClearOnUnwind;
         loop {
             // A thread's own shard is never taken: nobody watches it.
             if let Ok(output) = self.run_loop(future.as_mut(), signal) {
+                core::mem::forget(unwinding);
                 return output;
             }
         }
@@ -146,7 +192,8 @@ impl Shard {
     ) -> Result<F::Output, Detached> {
         let waker = Signal::waker(signal);
         let mut cx = Context::from_waker(&waker);
-        // Turns in which the future woke itself and no task ran.
+        // Turns in which the future woke itself and no task ran, and parks that backed out with
+        // the spin cold.
         let mut self_woken = 0u32;
         // Tasks to run before the future's next poll: a future that woke
         // itself (a yield) lets the tasks queued at that moment run first,
@@ -202,15 +249,9 @@ impl Shard {
                 // driver gets a look every `DRIVER_INTERVAL` such turns too,
                 // or IO the future waits on (on a ring, an operation not even
                 // submitted yet) would never complete.
-                self_woken += 1;
-                if self_woken >= self.tuning.driver_interval {
-                    self_woken = 0;
-                    self.count_again(self.since_drive());
-                    self.drive_or_report(Some(Duration::ZERO));
-                }
+                self.count_unlooked(&mut self_woken);
                 continue;
             }
-            self.count_again(self.since_drive());
             let shared = &self.shared;
             // The spin looks at the poller too: IO that comes within it
             // costs neither a park nor the kernel's wake of this thread. The
@@ -219,7 +260,7 @@ impl Shard {
             // inbox and the homes, which the run queue's last pop just found
             // empty, from the second look on.
             let mut first = true;
-            if self.spin.run(
+            let spun = self.spin.run(
                 || self.work_may_come_soon(),
                 || {
                     (!core::mem::take(&mut first) && self.has_remote_tasks())
@@ -227,13 +268,18 @@ impl Shard {
                         || self.io_ready_now()
                         || self.has_posted_ops()
                 },
-            ) {
+            );
+            if spun == Spun::Hit {
+                self.count_again(self.since_drive());
                 continue;
             }
+            #[cfg(test)]
+            before_park_hook();
             self.before_park();
             // A park a blocking job's end cuts short says nothing of other work coming soon.
             let pool_out = self.blocking_out();
             if self.begin_park(|| self.has_remote_work() || signal.woken.load(Ordering::SeqCst)) {
+                self.count_again(self.since_drive());
                 let slept = Instant::now();
                 self.tuning.hooks.parked();
                 self.drive_or_report(None);
@@ -241,6 +287,11 @@ impl Shard {
                 self.parked_ended();
                 self.tuning.hooks.unparked();
                 self.slept_for(slept.elapsed(), !pool_out);
+            } else if spun == Spun::Missed {
+                // Every look of the spin asked the poller.
+                self.count_again(self.since_drive());
+            } else {
+                self.count_unlooked(&mut self_woken);
             }
             self.after_park();
         }
@@ -335,6 +386,21 @@ impl Shard {
     pub(super) fn count_again(&self, runs: u32) {
         self.polls.set(self.polls.get() + u64::from(runs));
         self.count_drive_from(0, self.tuning.driver_interval);
+    }
+
+    /// A turn of the run loop that ran no task and looked at no driver: the future woke itself
+    /// again, or an idle pass asked no poller (its park backed out with the spin cold). The count
+    /// of runs stays where it was, and
+    /// every `driver_interval`th such turn looks without waiting (proofs/tla/loop/RunLoop.tla,
+    /// `L_backout`).
+    #[inline(always)]
+    fn count_unlooked(&self, turns: &mut u32) {
+        *turns += 1;
+        if *turns >= self.tuning.driver_interval {
+            *turns = 0;
+            self.count_again(self.since_drive());
+            self.drive_or_report(Some(Duration::ZERO));
+        }
     }
 
     /// Runs since timers and the poller were last looked at.

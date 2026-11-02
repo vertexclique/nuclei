@@ -53,9 +53,12 @@
 (* every thread, the workers with their lingers among them. So a file's     *)
 (* linger is counted from its hand to its end wherever it runs, and the     *)
 (* exit (an `atexit` hook) waits until none is left, or its own bound ran   *)
-(* out, which it says. A handle dropped on a thread that is no worker      *)
-(* (`Mode` "off_worker": `block_on`'s thread, say) delivers its bytes      *)
-(* before its drop returns, as std's would be in the kernel by then. A     *)
+(* out, which it says. A handle dropped on a thread that is neither a     *)
+(* worker nor one of the blocking pool's (`Mode` "off_worker":            *)
+(* `block_on`'s thread, say) delivers its bytes before its drop returns,  *)
+(* as std's would be in the kernel by then; one dropped on the pool's     *)
+(* thread K hands its linger, as on a worker, since its writes would wait *)
+(* for the pool (`pool_delivers`). A                                       *)
 (* linger whose write fails or whose time runs out (`Mode` "exit_fail")    *)
 (* gives the rest up, and says so: a warning, and a count in `stats`.      *)
 (*                                                                          *)
@@ -150,13 +153,21 @@ define                                                                       \* 
     LingerOut == linger \in {"task", "held", "list", "alone", "default"}     \* as `Tracked` counts
 end define;                                                                  \* end of the names
 
-\* The held task drops where its wake was drained: its handle hands its linger.
-macro DropHeld() begin                                                       \* `Sched::drop_future`, the handle's drop
+\* The held task drops on thread `who`, where its wake was drained: its handle hands its linger. On K, a thread of
+\* the blocking pool, it hands it as on a worker: the delivery's writes would need the pool, K itself.
+macro DropHeld(who) begin                                                    \* `Sched::drop_future`, the handle's drop
     dropped := TRUE;                                                         \* the handle goes
     taskHeld := FALSE;                                                       \* the task is gone
     inbox := "empty";                                                        \* its wake was taken out
-    linger := HeldTo;                                                        \* its linger is handed
-    if HeldTo = "default" then defaultStarted := TRUE; end if;               \* (the mutation's start)
+    \* MUTATION pool_delivers: on K the handle delivers its bytes itself, as a drop off a worker does; its writes
+    \* wait for the pool, which is K, so its linger time runs out and the bytes are given up.
+    if who = "K" /\ Mutation = "pool_delivers" then                          \* (the mutation)
+        gaveUp := TRUE;                                                      \* the bytes are given up,
+        reported := TRUE;                                                    \* said at warn, and counted
+    else                                                                     \* else:
+        linger := HeldTo;                                                    \* its linger is handed
+        if HeldTo = "default" then defaultStarted := TRUE; end if;           \* (the mutation's start)
+    end if;                                                                  \* handed, or given up
 end macro;                                                                   \* end of the macro
 
 \* The worker: its task drops the handle, the linger's task runs, and the runtime's drop stops it.
@@ -267,7 +278,7 @@ K_end:                                                                       \* 
         if HandedTo = "default" then defaultStarted := TRUE; end if;         \* (the mutation's start)
     end if;                                                                  \* the wake went
 K_drain:                                                                     \* `drop_stopped`, on this thread
-    if drainer = "K" then DropHeld(); drainer := "none"; end if;             \* the task drops here
+    if drainer = "K" then DropHeld("K"); drainer := "none"; end if;          \* the task drops here
 K_out:                                                                       \* `WriteCall`'s drop
     counted := FALSE;                                                        \* the write counts itself out
 end process;                                                                 \* end of the thread
@@ -278,7 +289,7 @@ begin                                                                        \* 
 X_drain:                                                                     \* its drain, after K went on
     await drainer = "X" \/ (pc["K"] = "Done" /\ drainer = "none");          \* its part, or none came
     if drainer = "X" then                                                    \* the held task's wake is its to drop:
-        DropHeld();                                                          \* the task drops here
+        DropHeld("X");                                                       \* the task drops here
         drainer := "none";                                                   \* drained
         lateDrain := TRUE;                                                   \* (recorded)
     end if;                                                                  \* done

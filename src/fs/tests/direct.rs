@@ -255,3 +255,62 @@ fn a_direct_call_goes_through_memory_placed_as_the_callers() {
         }
     }
 }
+
+/// An unaligned write at the cursor answers the kernel's `EINVAL` itself and
+/// moves the cursor nowhere: the aligned write after it lands at offset 0.
+#[test]
+fn an_unaligned_direct_write_answers_einval_itself() {
+    let Some(dir) = direct_dir("einval") else {
+        return;
+    };
+    let mut mem = vec![0u8; 3 * 4096];
+    let probe = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(dir.file("probe"))
+        .unwrap();
+    let refused = probe.write_at(at_page(&mut mem, 0, 100), 0).is_err();
+    let rt = runtime();
+    let (path, std_file) = direct_file(&dir, 8192);
+    let written = seeded_page(0x5a);
+    let expected = written.clone();
+    rt.block_on(async {
+        within(spawn(async move {
+            let mut file = Handle::new(std_file).unwrap();
+            let page = at_page(&mut mem, 0, 4096);
+            page[..100].fill(7);
+            let answer = within(write_once(&mut file, &page[..100])).await;
+            if !refused {
+                // The filesystem serves it buffered: the write landed whole.
+                eprintln!("this filesystem serves an unaligned direct write");
+                assert_eq!(answer.unwrap(), 100);
+                return;
+            }
+            assert_eq!(answer.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+            page.copy_from_slice(&written);
+            assert_eq!(within(write_once(&mut file, page)).await.unwrap(), 4096);
+            within(file.sync_all()).await.unwrap();
+        }))
+        .await;
+    });
+    let got = std::fs::read(&path).unwrap();
+    if !refused {
+        assert!(got[..100] == [7u8; 100], "the write did not land at 0");
+        return;
+    }
+    assert!(got[..4096] == expected[..], "the write did not land at 0");
+    assert!(
+        got[4096..] == pattern(8192)[4096..],
+        "the file changed past it"
+    );
+}
+
+/// A page of a pattern told apart by `seed`.
+fn seeded_page(seed: u8) -> Vec<u8> {
+    pattern(4096).into_iter().map(|b| b ^ seed).collect()
+}
+
+/// One `poll_write` of `buf`: how many bytes went, or the write's error.
+async fn write_once(file: &mut Handle<File>, buf: &[u8]) -> io::Result<usize> {
+    poll_fn(|cx| Pin::new(&mut *file).poll_write(cx, buf)).await
+}

@@ -9,18 +9,16 @@ use std::time::Duration;
 use super::Instant;
 
 use super::error::Elapsed;
-use super::sleep::{Sleep, far_future, sleep_until};
+use super::sleep::{Sleep, sleep, sleep_until};
 
 /// Runs `future` for at most `duration`: its output, or [`Elapsed`] if the
 /// time ran out first. The future is polled before the clock is looked at,
 /// so one that is ready at once always wins.
 pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
-    timeout_at(
-        Instant::now()
-            .checked_add(duration)
-            .unwrap_or_else(far_future),
+    Timeout {
         future,
-    )
+        sleep: sleep(duration),
+    }
 }
 
 /// Runs `future` until `deadline` at most; see [`timeout`].

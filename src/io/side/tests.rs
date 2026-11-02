@@ -42,6 +42,7 @@ fn every_task_is_woken_even_past_the_slots() {
 
 /// A task that registers again keeps one slot: a take wakes it once.
 #[test]
+#[cfg_attr(miri, ignore = "under Miri `will_wake` misses a waker's clone")]
 fn a_task_registering_again_keeps_its_slot() {
     let set = WakerSet::<4>::new();
     let (count, waker) = counted();

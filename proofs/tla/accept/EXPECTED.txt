@@ -46,3 +46,11 @@ RW_ahead                       MC_AcceptReset       violated:NoServedAfterAheadS
 RW_op                          MC_AcceptReset       violated:NoServedAfterOpSkip
 RW_end                         MC_AcceptReset       violated:NoServedAfterEndSkip
 RW_peer                        MC_AcceptReset       violated:NoServedAfterPeerSkip
+R_neterr_readiness             MC_AcceptReset       pass
+R_neterr_completion            MC_AcceptReset       pass
+R_neterr_multishot             MC_AcceptReset       pass
+RM_resets_only_readiness       MC_AcceptReset       violated:NoLostToCaller
+RM_resets_only_completion      MC_AcceptReset       violated:NoLostToCaller
+RM_resets_only_end             MC_AcceptReset       violated:NoLostToCaller
+RM_uncounted_ahead             MC_AcceptReset       violated:SkipsCounted
+RM_uncounted_op                MC_AcceptReset       violated:SkipsCounted

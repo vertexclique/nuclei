@@ -272,11 +272,13 @@ fn a_task_placed_before_a_handoff_keeps_its_worker_and_a_local_future_stays_behi
     let h = rt.handle();
     let began = Arc::new(AtomicBool::new(false));
     let up = Arc::clone(&began);
+    let go = Arc::new(nuclei::sync::Notify::new());
+    let wake = Arc::clone(&go);
     let local = h
         .spawn_local_on_worker(0, move || async move {
             let before = worker_index();
             up.store(true, Ordering::SeqCst);
-            nuclei::time::sleep(Duration::from_millis(20)).await;
+            wake.notified().await;
             (before, worker_index(), std::thread::current().id())
         })
         .unwrap();
@@ -304,6 +306,8 @@ fn a_task_placed_before_a_handoff_keeps_its_worker_and_a_local_future_stays_behi
     let blocked_thread = *blocked_on.get().unwrap();
     assert_eq!(index, Some(0));
     assert_ne!(thread, blocked_thread, "the shard did not move");
+    // Only now, with the shard on another thread, may the local future go on.
+    go.notify_one();
     rt.block_on(blocked);
 
     let (before, after, finished_on) = rt.block_on(local);

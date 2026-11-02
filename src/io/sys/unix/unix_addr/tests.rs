@@ -44,6 +44,13 @@ proptest! {
     }
 }
 
+/// An empty path, whose bytes start at no allocation, holds no NUL.
+#[test]
+fn an_empty_path_holds_no_nul() {
+    assert!(!has_nul(&Vec::new()));
+    assert!(UnixAddr::path(&std::path::PathBuf::new()).is_ok());
+}
+
 #[test]
 fn a_nul_at_each_place_is_found() {
     for len in 8..=24 {

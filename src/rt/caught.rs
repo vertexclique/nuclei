@@ -17,6 +17,10 @@ pub(crate) fn catch(f: impl FnOnce()) -> Option<Panic> {
     catch_unwind(AssertUnwindSafe(f)).err()
 }
 
+/// A caught panic behind one pointer, so a result that may carry one is a
+/// word wider than its value.
+pub(crate) type Thin = Box<Panic>;
+
 /// The message of a panic whose payload is a string, as `panic!` makes it.
 pub(crate) fn message(panic: &Panic) -> Option<&str> {
     panic

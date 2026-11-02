@@ -1,26 +1,29 @@
-TLC run of every configuration in proofs/tla/keeper, 2026-11-02 14:39 UTC.
+TLC run of every configuration in proofs/tla/keeper, 2026-11-02 22:54 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3480 s each.
-CI's TLA+ run 41454975548, on bd82ae77: the rows of its 16 shares.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-K_register                        2798       1119      1  pass                                  pass                                  yes
+K_register                        2798       1119      3  pass                                  pass                                  yes
 K_detach                          1603        718      1  pass                                  pass                                  yes
 KM_keeper_drops                    541        280      1  violated:NoStuckRegistration          violated:NoStuckRegistration          yes
-KM_no_flag                         129         72      0  violated:Ends                         violated:Ends                         yes
+KM_no_flag                         129         72      2  violated:Ends                         violated:Ends                         yes
 KM_no_look                         259        155      1  violated:Ends                         violated:Ends                         yes
-KM_post_no_look                    501        243      1  violated:NoStuckRegistration          violated:NoStuckRegistration          yes
+KM_post_no_look                    501        243      2  violated:NoStuckRegistration          violated:NoStuckRegistration          yes
 KM_buf_with_poller                 502        243      1  violated:NoWriteAfterFree             violated:NoWriteAfterFree             yes
-KM_buf_stray                       970        453      0  violated:NoWriteAfterFree             violated:NoWriteAfterFree             yes
+KM_buf_stray                       970        453      1  violated:NoWriteAfterFree             violated:NoWriteAfterFree             yes
 KW_post_wake                       202        120      1  violated:NoPostWake                   violated:NoPostWake                   yes
 KW_late_read                       502        243      1  violated:NoLateRead                   violated:NoLateRead                   yes
-F_stuck                             27         16      1  pass                                  pass                                  yes
-F_slow                              50         26      1  pass                                  pass                                  yes
-F_held                              47         24      1  pass                                  pass                                  yes
-FM_forget_silent                    11          8      1  violated:Ends                         violated:Ends                         yes
-FM_forget_frees                      7          6      1  violated:NoScribble                   violated:NoScribble                   yes
-FM_end_twice                         5          5      1  violated:EndsOnce                     violated:EndsOnce                     yes
-FW_given_up                          4          4      1  violated:NoGivenUp                    violated:NoGivenUp                    yes
-FW_late                             12          9      1  violated:NoLate                       violated:NoLate                       yes
+F_stuck                             55         32      1  pass                                  pass                                  yes
+F_slow                             112         58      1  pass                                  pass                                  yes
+F_held                              99         48      1  pass                                  pass                                  yes
+FM_forget_silent                    23         16      0  violated:Ends                         violated:Ends                         yes
+FM_forget_frees                     11          9      1  violated:NoScribble                   violated:NoScribble                   yes
+FM_end_twice                        13         10      1  violated:EndsOnce                     violated:EndsOnce                     yes
+FW_given_up                          7          6      0  violated:NoGivenUp                    violated:NoGivenUp                    yes
+FW_late                             22         15      1  violated:NoLate                       violated:NoLate                       yes
+F_file                              51         32      1  pass                                  pass                                  yes
+F_file_stalled                      33         20      1  pass                                  pass                                  yes
+FM_file_short_wait                  12          9      1  violated:FileNotGivenUp               violated:FileNotGivenUp               yes
+FM_forget_unsaid                     7          6      1  violated:GivenUpSaid                  violated:GivenUpSaid                  yes
 
-results matching EXPECTED.txt: 18 of 18
+results matching EXPECTED.txt: 22 of 22

@@ -30,10 +30,11 @@ use kovan_channel::flavors::RecvDeadline;
 
 use super::blocking::Pool;
 use super::context;
+use super::handoff::life::Life;
 use super::sched::Sched;
 use super::shard::{Shard, Shared};
 use super::task::{self, ScheduleInfo, Task};
-use super::workers::Workers;
+use super::workers::{TEARDOWN_WAIT, Workers};
 
 mod builder;
 mod cores;
@@ -89,7 +90,8 @@ pub(crate) struct Inner {
 /// A runtime: worker shards and a blocking pool. Dropping it stops the
 /// workers, drops the tasks they still hold, and waits for the threads to
 /// exit (every one but the dropping thread, when a task of the runtime drops
-/// it, which goes on once the drop returns); then, on the dropping thread,
+/// it, which goes on once the drop returns, and a thread still in the poll its
+/// shard was taken in, which it waits for one second and then says so); then, on the dropping thread,
 /// for what the handles those tasks held left behind (the bytes a socket's
 /// write-behind holds, a file's writes) to land, each for at most a minute,
 /// so nothing they accepted is lost.
@@ -129,6 +131,13 @@ impl Runtime {
     }
 
     /// Runs `future` to its end on the calling thread; see [`block_on`].
+    ///
+    /// Called from a task of another runtime, `future` keeps this runtime's
+    /// clock and timers meanwhile; a sleep made inside it and polled after the
+    /// call returned reads as elapsed. On a worker's shard, whose polls the
+    /// handoff may take, the nested runtime's sleeps share the worker's wheels
+    /// and fire by the worker's runtime's clock; on a thread's own shard each
+    /// runtime keeps its own.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         block_on_with(&self.inner, future)
     }
@@ -151,8 +160,10 @@ impl Runtime {
         self.inner.pool.spawn(f)
     }
 
-    /// Stops the workers and waits for them up to `timeout`; workers still
-    /// running a task then are left to exit on their own. What the handles
+    /// Stops the workers and waits for them up to `timeout` (a thread still
+    /// in the poll its shard was taken in, too: a drop without a timeout
+    /// waits for it one second); workers still running a task then are left
+    /// to exit on their own, and it is said. What the handles
     /// of the tasks dropped left behind gets the rest of `timeout` to land,
     /// on this thread; what has not by then is given up.
     pub fn shutdown_timeout(mut self, timeout: Duration) {
@@ -186,7 +197,11 @@ impl Runtime {
     }
 
     fn stop_and_join(&mut self, timeout: Option<Duration>) {
-        let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+        let now = std::time::Instant::now();
+        let deadline = timeout.map(|timeout| now + timeout);
+        self.inner
+            .workers
+            .set_teardown_by(now + timeout.unwrap_or(TEARDOWN_WAIT));
         // Lingers handed from now on wait for this drop, never for a worker.
         self.inner.lingering.close();
         self.inner.workers.stop_all();
@@ -202,10 +217,28 @@ impl Runtime {
         }
         #[cfg(test)]
         teardown_pause(false);
-        let threads = self.inner.workers.take_threads();
+        let taken = self.inner.workers.take_threads();
         #[cfg(test)]
         teardown_pause(true);
-        self.join(threads, deadline, &mut exited);
+        self.join(taken.joined, deadline, &mut exited);
+        self.join_detached(taken.detached, &mut exited);
+    }
+
+    /// Waits for the threads still in the poll their shard was taken in until the teardown
+    /// deadline, and says so if one is still in it then
+    /// (proofs/tla/teardown/Teardown.tla, `D_wait_detached`).
+    fn join_detached(&self, threads: Vec<(JoinHandle<()>, Arc<Life>)>, exited: &mut Vec<ThreadId>) {
+        if threads.is_empty() {
+            return;
+        }
+        let (handles, lives): (Vec<_>, Vec<_>) = threads.into_iter().unzip();
+        self.join(handles, Some(self.inner.workers.teardown_by()), exited);
+        let still = lives.iter().filter(|life| life.is_detached()).count();
+        if still != 0 {
+            log::warn!(
+                "{still} runtime threads were still in a task's poll at the shutdown deadline; the tasks they hold end when those polls return"
+            );
+        }
     }
 
     /// Waits for `threads` to exit, never for the calling thread's own (a
@@ -485,7 +518,7 @@ where
 {
     let Some(shard) = inner.workers.place(inner.id, inner.local_margin) else {
         // No worker takes tasks: the spawning thread's own shard runs it.
-        return spawn_here(future, false);
+        return spawn_here::<_, false>(future);
     };
     spawn_on(inner, shard, future)
 }
@@ -500,7 +533,7 @@ where
     let hooks = inner.task_hooks.as_ref();
     let (runnable, task) = task::spawn(
         future,
-        Sched::counted(Arc::clone(shard), None, hooks.cloned()),
+        Sched::<false>::counted(Arc::clone(shard), None, hooks.cloned()),
     );
     spawned(hooks.map(|hooks| &**hooks), &task);
     // As its schedule would, without the turn through the task's table.
@@ -537,9 +570,23 @@ fn context_hooks() -> Option<Arc<super::tuning::TaskHooks>> {
     context::runtime().and_then(|inner| inner.task_hooks.clone())
 }
 
+/// Where a spawn goes on a thread that runs no shard: a task that is not bound, spawned from the
+/// rest of a poll whose shard the monitor took, goes to that shard, whose runner runs it as it
+/// would have before the take (proofs/tla/handoff/Detached.tla, `lost_spawn`); a bound task, or
+/// a spawn from a thread that lost no shard, goes to the thread's own shard (answered `None`).
+#[cold]
+#[inline(never)]
+fn lost_spawn(bound: bool) -> Option<Arc<Shared>> {
+    if bound {
+        return None;
+    }
+    context::lost_shared(|lost| lost.map(Arc::clone))
+}
+
 /// Spawns `future` on the shard of the calling thread: the worker it runs,
-/// or the thread's own. `bound`: the future is not `Send` and must stay.
-fn spawn_here<F>(future: F, bound: bool) -> Task<F::Output>
+/// or the thread's own. `bound`: the future is not `Send` and must stay. A thread whose poll lost
+/// its worker's shard to the monitor spawns a task that is not bound onto that shard.
+fn spawn_here<F, const BOUND: bool>(future: F) -> Task<F::Output>
 where
     F: Future + 'static,
     F::Output: 'static,
@@ -547,27 +594,36 @@ where
     let place = |shard: &Shard| {
         (
             Arc::clone(&shard.shared),
-            bound.then(|| context::home_for(shard)),
+            BOUND.then(|| context::home_for(shard)),
         )
     };
     let (shared, home) =
-        context::current(|current| current.map(place)).unwrap_or_else(|| place(&own_shard()));
+        context::current(|current| current.map(place)).unwrap_or_else(|| match lost_spawn(BOUND) {
+            Some(lost) => (lost, None),
+            None => place(&own_shard()),
+        });
     let hooks = context_hooks();
-    let (runnable, task, bound_to) = if let Some(home) = home {
-        let at = Arc::as_ptr(&home);
+    // One schedule type per spawn site, known at compile time: a future spawned bound has no
+    // unbound task code made for it, and the other way round.
+    let at = home.as_ref().map(Arc::as_ptr);
+    let (runnable, task, bound_to) = if BOUND {
         // SAFETY: the task's schedule sends a woken bound task only to its
-        // home's thread (leaked rather than dropped if that thread is gone);
-        // the future is 'static.
+        // home's thread; the future is 'static.
         let (runnable, task) = unsafe {
-            task::spawn_unchecked(future, Sched::counted(shared, Some(home), hooks.clone()))
+            task::spawn_unchecked(future, Sched::<true>::counted(shared, home, hooks.clone()))
         };
-        (runnable, task, Some(at))
+        if let Some(at) = at {
+            // SAFETY: `home_for` gives this thread's home, and the new task is on no list.
+            unsafe { (*at).push_task(runnable.links()) };
+        }
+        (runnable, task, at)
     } else {
         // SAFETY: the task's schedule sends a woken task of this shard back
-        // to it; the future is 'static, and `Send` (a caller with `bound`
+        // to it; the future is 'static, and `Send` (a caller with `BOUND`
         // false is `spawn`'s, whose future is).
-        let (runnable, task) =
-            unsafe { task::spawn_unchecked(future, Sched::counted(shared, None, hooks.clone())) };
+        let (runnable, task) = unsafe {
+            task::spawn_unchecked(future, Sched::<false>::counted(shared, None, hooks.clone()))
+        };
         (runnable, task, None)
     };
     spawned(hooks.as_deref(), &task);
@@ -601,10 +657,17 @@ fn block_on_here<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
     let _runtime = context::set_runtime(inner);
     // Pinned here once: the calls below take it by reference.
     let mut future = core::pin::pin!(future);
-    // On the shard this thread runs, the call nests, inside the shard.
-    if let Some(output) =
-        context::current(|current| current.map(|shard| shard.block_on(future.as_mut())))
-    {
+    // On the shard this thread runs, the call nests, inside the shard: one of
+    // another runtime than the shard is serving keeps its timers in wheels of
+    // its own (`proofs/tla/clock/OneWheel.tla`).
+    if let Some(output) = context::current(|current| {
+        current.map(|shard| match _runtime.previous() {
+            Some(outer) if !Arc::ptr_eq(outer, inner) => {
+                shard.block_on_foreign(future.as_mut(), outer, inner)
+            }
+            _ => shard.block_on(future.as_mut()),
+        })
+    }) {
         return output;
     }
     let shard = own_shard();
@@ -693,7 +756,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    spawn_here(future, true)
+    spawn_here::<_, true>(future)
 }
 
 /// Runs `f` on the blocking pool of the runtime this thread is inside, or of
@@ -724,7 +787,7 @@ where
     // its shard; the future is `Send` and 'static.
     let (runnable, task) = unsafe {
         // The runtime's own service task: not a task of its user's.
-        task::spawn_unchecked(future, Sched::uncounted(shared))
+        task::spawn_unchecked(future, Sched::<false>::uncounted(shared))
     };
     runnable.schedule();
     task.detach();

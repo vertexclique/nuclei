@@ -15,6 +15,25 @@ fn lost() -> Vec<io::Error> {
         // A multishot accept's connection whose peer went before it was taken (`peer_of`).
         io::ErrorKind::ConnectionAborted.into(),
     ];
+    // The network errors Linux's accept(2) says to retry on, as it would for `EAGAIN`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let lost = {
+        let mut lost = lost;
+        lost.extend(
+            [
+                libc::EPROTO,
+                libc::ENETDOWN,
+                libc::ENOPROTOOPT,
+                libc::EHOSTDOWN,
+                libc::ENONET,
+                libc::EHOSTUNREACH,
+                libc::EOPNOTSUPP,
+                libc::ENETUNREACH,
+            ]
+            .map(io::Error::from_raw_os_error),
+        );
+        lost
+    };
     #[cfg(windows)]
     let lost = {
         use crate::syscore::windows::{ERROR_NETNAME_DELETED, WSAECONNABORTED, WSAECONNRESET};
@@ -103,6 +122,10 @@ mod ended {
     /// leave the error for them.
     fn check(outcome: fn(io::Error) -> Outcome) {
         let mut after = After::default();
+        let skipped = || crate::stats().off_shard_errors.accepts_skipped;
+        // Off a shard, so the skips are counted among the off-shard errors, which only grow:
+        // other tests may add to them, none takes away.
+        let before = skipped();
         for err in lost() {
             let mut st = ReadState::default();
             let shown = format!("{err:?}");
@@ -117,6 +140,10 @@ mod ended {
             );
             assert!(!st.has_result(), "{shown}: kept for the tasks");
         }
+        assert!(
+            skipped() >= before + lost().len() as u64,
+            "every skipped connection is counted"
+        );
         for err in the_listeners() {
             let mut st = ReadState::default();
             let shown = format!("{err:?}");

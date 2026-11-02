@@ -1,18 +1,21 @@
-TLC run of every configuration in proofs/tla/remote, 2026-10-30 20:17 UTC.
+TLC run of every configuration in proofs/tla/remote, 2026-11-03 06:29 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-RF_safe                        1147061     415203     16  pass                                  pass                                  yes
-RF_live                         338812     128707     24  pass                                  pass                                  yes
-RF_live_tight                   278478     106419     21  pass                                  pass                                  yes
-RF_tight                       3646326    1302085     31  pass                                  pass                                  yes
-MRF_blind_push                   18368       7658      6  violated:ListConsistent               violated:ListConsistent               yes
-MRF_store_close                  72807      29767      6  violated:ListConsistent               violated:ListConsistent               yes
-MRF_release_first                18142       7661      4  violated:OpenWhileOwned               violated:OpenWhileOwned               yes
-MRF_no_bound                     18000       7514      6  violated:BoundedList                  violated:BoundedList                  yes
-WRF_closed                        7395       3079      4  violated:NoRefusedClosed              violated:NoRefusedClosed              yes
-WRF_full                          6224       2780      4  violated:NoRefusedFull                violated:NoRefusedFull                yes
-WRF_reclaimed                    15075       6242      5  violated:NoReclaimed                  violated:NoReclaimed                  yes
+RF_safe                        1147061     415203     11  pass                                  pass                                  yes
+RF_live                         338812     128707     14  pass                                  pass                                  yes
+RF_live_tight                   278478     106419     12  pass                                  pass                                  yes
+RF_tight                       3646326    1302085     18  pass                                  pass                                  yes
+MRF_blind_push                   18368       7658      2  violated:ListConsistent               violated:ListConsistent               yes
+MRF_store_close                  72807      29767      1  violated:ListConsistent               violated:ListConsistent               yes
+MRF_release_first                18142       7661      1  violated:OpenWhileOwned               violated:OpenWhileOwned               yes
+MRF_no_bound                     18000       7514      2  violated:BoundedList                  violated:BoundedList                  yes
+WRF_closed                        7395       3079      1  violated:NoRefusedClosed              violated:NoRefusedClosed              yes
+WRF_full                          6224       2780      1  violated:NoRefusedFull                violated:NoRefusedFull                yes
+WRF_reclaimed                    15075       6242      1  violated:NoReclaimed                  violated:NoReclaimed                  yes
+RF_late                        3938822    1430061     34  pass                                  pass                                  yes
+RF_live_late                    892752     340303     32  pass                                  pass                                  yes
+WRF_late_refused                 12384       5260      1  violated:NoLateRefused                violated:NoLateRefused                yes
 
-results matching EXPECTED.txt: 11 of 11
+results matching EXPECTED.txt: 14 of 14

@@ -146,6 +146,19 @@ struct Lent {
     cut: bool,
 }
 
+/// What a receive of a datagram longer than its buffer answers on Windows, as std's does: the
+/// buffer holds the bytes that fit.
+#[cfg(windows)]
+fn msg_size() -> io::Error {
+    io::Error::from_raw_os_error(crate::syscore::windows::WSAEMSGSIZE)
+}
+
+/// Whether `err` is `msg_size`'s.
+#[cfg(port)]
+fn is_msg_size(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(crate::syscore::windows::WSAEMSGSIZE)
+}
+
 /// The longest datagram UDP carries, by its length field: what a datagram
 /// received ahead needs room for whole.
 #[cfg(completion)]
@@ -180,6 +193,9 @@ pub(super) struct ReadState {
     ahead: Ahead,
     lent: Option<Lent>,
     eof: bool,
+    /// The reading half was shut where the kernel drops its queue: every read answers the end,
+    /// and bytes a receive brings are dropped.
+    shut: bool,
     error: Option<io::Error>,
     accepted: VecDeque<(Owned, Peer)>,
     datagrams: VecDeque<(Datagram, Addr)>,
@@ -638,8 +654,8 @@ impl ReadState {
             return Some(Ok(copy(&mut self.ahead, after)));
         }
         if self.eof {
-            // A read takes the end; a peek leaves it for the read.
-            self.eof = peek;
+            // A read takes the end; a peek leaves it for the read. A shut side keeps it for good.
+            self.eof = peek || self.shut;
             return Some(Ok(0));
         }
         self.error.take().map(Err)
@@ -766,6 +782,7 @@ impl ReadState {
                         self.error = Some(err);
                         break;
                     }
+                    crate::rt::counters::accept_skipped();
                 }
             }
         }
@@ -1043,9 +1060,15 @@ impl ReadState {
         if let Some(buf) = held.as_mut() {
             if let Some((datagram, addr)) = self.datagrams.pop_front() {
                 let n = datagram.append_to(buf);
+                #[cfg(windows)]
+                let long = datagram.bytes().len() > n;
                 datagram.release(after);
                 *from = Some(addr);
                 self.pass_on(after);
+                #[cfg(windows)]
+                if long {
+                    return Poll::Ready(Err(msg_size()));
+                }
                 return Poll::Ready(Ok(n));
             }
             if let Some(err) = self.error.take() {
@@ -1087,7 +1110,12 @@ impl ReadState {
             after.forget_one(w);
         }
         let Some(Lent {
-            buf, done, peer, ..
+            buf,
+            done,
+            peer,
+            #[cfg(windows)]
+            cut,
+            ..
         }) = self.lent.take()
         else {
             return Poll::Ready(Err(io::Error::other("the receive lost its buffer")));
@@ -1095,6 +1123,10 @@ impl ReadState {
         *held = Some(buf);
         *from = peer;
         after.wake(&mut self.waiters);
+        #[cfg(windows)]
+        if cut && matches!(done, Some(Ok(_))) {
+            return Poll::Ready(Err(msg_size()));
+        }
         Poll::Ready(done.unwrap_or(Ok(0)))
     }
 
@@ -1222,6 +1254,7 @@ impl ReadState {
         after: &mut After,
     ) -> Option<io::Result<(Owned, Addr)>> {
         while crate::rt::counters::lost_before_accept(&err) {
+            crate::rt::counters::accept_skipped();
             self.complete(io, kind, 0, after);
             match self.accepted.pop_front() {
                 Some((conn, Peer::Known(peer))) => return Some(Ok((conn, peer))),
@@ -1268,7 +1301,8 @@ impl ReadState {
     /// A datagram receive (or peek) into `out` that is not the task's own
     /// (on unix [`receive_now`](Self::receive_now) is first): the driver
     /// receives into the pool first if the socket may hold one, and the task
-    /// copies it out (what does not fit `out` is cut, as the kernel cuts it).
+    /// copies it out (what does not fit `out` is cut, as the kernel cuts it; on Windows the call
+    /// answers `WSAEMSGSIZE` for it, as std's does).
     fn receive(
         &mut self,
         io: Io<'_>,
@@ -1282,10 +1316,15 @@ impl ReadState {
         let taken = match self.datagrams.front() {
             Some((datagram, addr)) => {
                 let (n, addr) = (datagram.peek_into(out), addr.clone());
+                #[cfg(windows)]
+                let long = datagram.bytes().len() > out.len();
                 if !peek && let Some((done, _)) = self.datagrams.pop_front() {
                     done.release(after);
                 }
-                Some(Ok((n, addr)))
+                let answer = Ok((n, addr));
+                #[cfg(windows)]
+                let answer = if long { Err(msg_size()) } else { answer };
+                Some(answer)
             }
             None => self.error.take().map(Err),
         };
@@ -1307,7 +1346,7 @@ impl ReadState {
 
     /// On a port, a datagram receive (or `peek`) of a side the pool has no
     /// buffer for, once a zero-byte look said one came: straight from the
-    /// socket into `out`, cut to it as the pool's receive cuts it, so the
+    /// socket into `out` (`WSAEMSGSIZE` for a longer datagram, as the pool's receive answers), so the
     /// call takes it at once (proofs/tla/port/PortStarve.tla). `None` for any
     /// other side.
     #[cfg(port)]
@@ -1336,7 +1375,8 @@ impl ReadState {
         if !peek {
             tally::received(&result);
         }
-        self.readable = peek && result.is_ok();
+        // A peek that answered `WSAEMSGSIZE` left its datagram queued, so the socket stays readable.
+        self.readable = peek && result.as_ref().map_or_else(is_msg_size, |_| true);
         Some(result.map(|(n, from)| (n, Addr::Inet(from))))
     }
 
@@ -1478,9 +1518,12 @@ impl ReadState {
 
     /// Drops the bytes read ahead and not read yet, once the kernel shut
     /// the reading half and dropped what its own queue held: a read after
-    /// it answers as the kernel does, as std's would.
+    /// it answers the end (std's read does on unix; see proofs/tla/close/ShutRead.tla). The side
+    /// is marked shut, so a receive completing later drops its bytes and every read answers the end.
     pub(super) fn drop_ahead(&mut self, after: &mut After) {
         self.ahead.release(after);
+        self.shut = true;
+        self.eof = true;
     }
 
     /// Drops what the side holds: the descriptor it came from is gone.
@@ -1494,6 +1537,7 @@ impl ReadState {
         }
         self.accepted.clear();
         self.eof = false;
+        self.shut = false;
         self.error = None;
         self.blocked = false;
         #[cfg(any(target_os = "linux", target_os = "android"))]

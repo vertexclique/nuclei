@@ -120,6 +120,7 @@ impl Here {
             self.detached.set(shard.shared_addr());
             self.lost.set(shard);
             shard.shared.detached_began();
+            aim_home(self);
         }
         self.current.set(core::ptr::null());
         self.slot.set(core::ptr::null());
@@ -211,7 +212,7 @@ impl Bracket {
                 Some(Self { slot, word })
             }
             (_, Back::Taken) => {
-                here.detach();
+                detach_here();
                 None
             }
         }
@@ -454,6 +455,36 @@ pub(crate) fn letting_go<R>(shared: &Arc<Shared>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Runs `f` with the `Shared` of the shard this thread's poll lost (`Here::lost`), `None` when
+/// it lost none: the shard whose task the rest of the poll still is.
+pub(crate) fn lost_shared<R>(f: impl FnOnce(Option<&Arc<Shared>>) -> R) -> R {
+    // SAFETY: as in `lent_back`: `lost` points at a shard while the frame of `run_shard` that
+    // ran it holds it, and only its `Shared` is followed here.
+    f(unsafe { local().lost.get().as_ref() }.map(|shard| &shard.shared))
+}
+
+/// Whether this thread's poll lost a shard to the monitor.
+pub(crate) fn lost_a_shard() -> bool {
+    !local().lost.get().is_null()
+}
+
+/// Aims the home's target at the own shard once the thread lost a shard and has both: the rest
+/// of a poll the monitor took, and every nested wait in it, runs the thread's bound tasks on
+/// its own shard, so their remote wakes go there from now on, before any loop of the own shard
+/// first looks (proofs/tla/handoff/Detached.tla, `home_not_moved`).
+#[cold]
+#[inline(never)]
+fn aim_home(here: &Here) {
+    if here.lost.get().is_null() {
+        return;
+    }
+    // SAFETY: `HOME` keeps the home alive while `home` points at it, and `OWN` the own shard.
+    let (home, own) = unsafe { (here.home.get().as_ref(), here.own.get().as_ref()) };
+    if let (Some(home), Some(own)) = (home, own) {
+        home.target().move_to(&own.shared);
+    }
+}
+
 /// Runs `f` with the shard this thread lets go of ([`letting_go`]), if any.
 pub(crate) fn letting_go_of<R>(f: impl FnOnce(Option<&Arc<Shared>>) -> R) -> R {
     // SAFETY: the mark points at an `Arc` that outlives the `letting_go` call that set it,
@@ -522,6 +553,13 @@ pub(crate) fn own_shard_if_made() -> Option<Rc<Shard>> {
         Rc::increment_strong_count(own);
         Some(Rc::from_raw(own))
     }
+}
+
+/// Whether this thread runs a worker shard the monitor watches: its polls may
+/// be taken from it, so nothing of the shard may be touched after one.
+#[inline]
+pub(crate) fn watched() -> bool {
+    !local().slot.get().is_null()
 }
 
 /// The address of the `Shared` of the shard this thread was detached from,
@@ -785,6 +823,7 @@ fn make_own_shard() -> io::Result<Rc<Shard>> {
         })?;
         *own.borrow_mut() = Some(Rc::clone(&shard));
         local().own.set(Rc::as_ptr(&shard));
+        aim_home(local());
         Ok(shard)
     })
 }
@@ -838,6 +877,13 @@ pub(crate) fn try_set_runtime(inner: &Arc<Inner>) -> Option<RuntimeSet> {
 /// Restores the runtime that was set before [`set_runtime`].
 pub(crate) struct RuntimeSet {
     previous: Option<Arc<Inner>>,
+}
+
+impl RuntimeSet {
+    /// The runtime that was set before.
+    pub(crate) fn previous(&self) -> Option<&Arc<Inner>> {
+        self.previous.as_ref()
+    }
 }
 
 impl Drop for RuntimeSet {

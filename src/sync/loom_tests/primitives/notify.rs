@@ -73,10 +73,9 @@ fn an_older_notified_queued_behind_a_newer_one_gets_the_broadcast() {
 /// the broadcast, so the permit is a newer waiter's: a newer `Notified`
 /// made after both calls must find it once the older one is done.
 ///
-/// Fails today: the older one may queue and run the pass that reads the
-/// generation before the broadcast; that pass serves the `notify_one` to it,
-/// and the permit is gone (the witness `W_owed_to_woken` of
-/// proofs/tla/notify). Kept running until the pass is fixed.
+/// The owed count of that `notify_one` carries the generation after the
+/// broadcast, so a pass that read the generation before the broadcast cannot
+/// serve it to the older waiter: it turns the count into the permit.
 #[test]
 fn a_permit_stored_after_a_broadcast_is_not_eaten_by_a_waiter_it_owed() {
     explore(
@@ -106,6 +105,37 @@ fn a_permit_stored_after_a_broadcast_is_not_eaten_by_a_waiter_it_owed() {
             assert!(
                 polled.is_ready(),
                 "the permit was taken by a waiter the broadcast owed"
+            );
+        },
+    );
+}
+
+/// A queued waiter is owed a `notify_one` and then a broadcast reaches it
+/// too: one wake serves it, so no permit is left for a waiter made later.
+#[test]
+fn a_notify_one_before_a_broadcast_leaves_no_permit() {
+    explore(
+        "a_notify_one_before_a_broadcast_leaves_no_permit",
+        3,
+        5,
+        || {
+            let notify = Arc::new(Notify::new());
+            let queued = Arc::new(AtomicBool::new(false));
+            let waiter = {
+                let (notify, flag) = (Arc::clone(&notify), Arc::clone(&queued));
+                thread::spawn(move || block_on(flag_when_queued(notify.notified(), &flag)))
+            };
+            wait_for(&queued);
+            notify.notify_one();
+            notify.notify_waiters();
+            waiter.join().expect("waiter");
+            let mut newer = Box::pin(notify.notified());
+            let polled = newer
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()));
+            assert!(
+                polled.is_pending(),
+                "a notify_one owed to a queued waiter left a permit"
             );
         },
     );

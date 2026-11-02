@@ -16,10 +16,23 @@
 (* the take of the permit are two steps (`Core::drive`): a broadcast can   *)
 (* land between them, and a permit taken after it is passed on with a      *)
 (* `notify_one`, since the broadcast already owed this waiter its wake.    *)
-(* A pass reads the generation once, too: a broadcast and then a           *)
-(* `notify_one` that land while it runs are seen as an owed wake for a     *)
-(* waiter the broadcast already woke, so the permit is lost (the witness  *)
-(* `W_owed_to_woken`; the fix waits on a design choice).                   *)
+(*                                                                          *)
+(* An owed wake is counted in a word that also holds the generation it    *)
+(* was made at (`Owed`, one word for `notify_one`, one for `notify_last`): *)
+(* the notifier reads the generation, then adds its count in one step.    *)
+(* A count of the word's own generation is current; one made at a later    *)
+(* generation turns the word's counts old and starts its own; one whose   *)
+(* read came before a newer call's is old. A pass reads the generation,   *)
+(* then takes both words: the counts of that generation are served to its *)
+(* waiters; the older ones belong to the waiters the broadcasts since     *)
+(* woke, which the pass expires, each of them taking one (a `notify_one`  *)
+(* that came before the broadcast woke it, as the broadcast did); a word  *)
+(* of a newer generation (a broadcast and a call came after the read) goes *)
+(* back whole, for the pass that broadcast asks for. What is left of the  *)
+(* current and older counts becomes the permit. So a broadcast and then a *)
+(* `notify_one` while a pass runs leave the permit for a waiter made      *)
+(* after both, and a `notify_one` and then a broadcast leave none.        *)
+(*                                                                          *)
 (* A pass reads the generation after it took the arrivals, grants the      *)
 (* queued waiters and the arrivals of an                                   *)
 (* older generation, turns a stored permit into a wake for the front, and  *)
@@ -68,6 +81,9 @@ Range(s) == {s[i] : i \in DOMAIN s}
 Without(s, S) == SelectSeq(s, LAMBDA x : x \notin S)
 \* The calls of notifier `n`.
 Calls(n) == IF n = NT THEN Notifier ELSE Notifier2
+\* An owed word with no count: of generation 0.
+NoOwed == [tag |-> 0, cur |-> 0, old |-> 0]
+Min(a, b) == IF a < b THEN a ELSE b
 
 (* --algorithm Notify
 variables
@@ -76,8 +92,8 @@ variables
     draining = FALSE,
     dirty = FALSE,
     generation = 0,
-    pendingFirst = 0,
-    pendingLast = 0,
+    owedFirst = NoOwed,              \* `notify_one`'s word: [tag, cur, old]
+    owedLast = NoOwed,               \* `notify_last`'s word, the same
     arrivals = <<>>,
     list = <<>>,
     phase = [w \in W |-> "none"],    \* "none", "waiting", "granted", "cancelled"
@@ -130,9 +146,40 @@ define
     \* already owes it its wake, never keeps a permit for itself.
     NoPermitEatenByOwed == ~eaten
     \* Every waiter made after the notifier's last call ends: the permit a notify_one left
-    \* stored is still there for it. (Broken today by a pass that read the generation
-    \* before a broadcast and serves a later notify_one to a waiter that broadcast woke.)
+    \* stored is still there for it.
     LateAwaiterEnds == <>[](\A w \in W : Waiters[w] = "after" => done[w])
+    \* No waiter made after the notifier's last call is done: a notify_one that came while
+    \* every early waiter was queued leaves no permit, whatever broadcast follows it.
+    NoSparePermit == \A w \in W : Waiters[w] = "after" => ~done[w]
+    \* A count of an owed wake made at generation `gn`, added to word `w` (`Owed::owe`, one
+    \* compare-and-swap): one of the word's own generation is current; one of a later generation
+    \* turns the word's counts old and starts that generation's; one whose read came before a
+    \* newer call's is old.
+    \* MUTATION split_word: the tag is ignored and every count is current, as when the counts
+    \* were kept apart from the generation.
+    Owe(w, gn) == IF Mutation = "split_word" \/ w.tag = gn THEN [w EXCEPT !.cur = @ + 1]
+                  ELSE IF w.tag < gn THEN [tag |-> gn, cur |-> 1, old |-> w.old + w.cur]
+                  ELSE [w EXCEPT !.old = @ + 1]
+    \* What a pass that read generation `g` after it took word `w` serves to the waiters of `g`,
+    \* and what it holds as older.
+    \* Whether word `w` is of a newer generation than `g`, which the pass gives back.
+    \* MUTATION newer_as_old: a newer word is taken as older, its counts given to the waiters the
+    \* pass expires, which a broadcast before it woke.
+    Newer(w, g) == Mutation # "split_word" /\ Mutation # "newer_as_old" /\ w.tag > g
+    CurOf(w, g) == IF Mutation = "split_word" \/ w.tag = g THEN w.cur ELSE 0
+    OldOf(w, g) == IF Mutation = "split_word" \/ w.tag = g THEN w.old
+                   ELSE IF Newer(w, g) THEN 0
+                   ELSE w.old + w.cur
+    \* Word `t`, taken, given back to word `w` (one compare-and-swap): of `w`'s generation, its
+    \* counts add to `w`'s; `w` of a newer one (another count came since), all of `t`'s are older.
+    GiveBack(w, t) == IF w.tag = t.tag THEN [w EXCEPT !.cur = @ + t.cur, !.old = @ + t.old]
+                      ELSE [w EXCEPT !.old = @ + t.cur + t.old]
+    \* The waiting nodes a pass of generation `g` expires, in line order: the list's front up to
+    \* its first node of `g`, then the arrivals of another generation.
+    ExpiredSeq(l, a, g) ==
+        SelectSeq(SubSeq(l, 1, Len(l) - Len(Unexpired(l, g))), LAMBDA x : phase[x] = "waiting")
+        \o SelectSeq(a, LAMBDA x : phase[x] = "waiting" /\ payload[x] # g
+                                  /\ Mutation # "arrivals_unchecked")
     \* Witnesses.
     NoPermitStored == ~permit
     NoPassOn == ~passedOn
@@ -149,32 +196,78 @@ macro claimOrDirty(claimed) begin
 end macro;
 
 procedure Drain()
-variables g = 0, first = 0, last = 0, wl = {}, n = NoNode, arr = <<>>;
+variables g = 0, first = 0, last = 0, oldF = 0, oldL = 0, fw = NoOwed, lw = NoOwed,
+          wl = {}, n = NoNode, arr = <<>>;
 begin
 D_clear:
     dirty := FALSE;
 D_take:
-    \* The arrivals, then the generation: each arrival carries it or an older one.
+    \* The arrivals, the generation, then the owed words: each arrival carries the generation or
+    \* an older one, and a count of an older one was made before the broadcast that moved it on,
+    \* or by a call that overlapped it.
     if Mutation = "generation_first" then
         g := generation;
     end if;
 D_absorb:
-    \* The arrival stack is taken whole (`WaitQueue::take`), then the generation is read.
+    \* The arrival stack is taken whole (`WaitQueue::take`).
     arr := arrivals;
     arrivals := <<>>;
-    if Mutation # "generation_first" then
+D_gen:
+    \* MUTATION owed_before_generation: the owed words are taken before the generation is read:
+    \* a notify_one made between the take and the read, before a broadcast, is left for a later
+    \* pass, which finds the waiters it was owed to expired by this one, and stores it as a permit.
+    if Mutation \notin {"generation_first", "owed_before_generation"} then
         g := generation;
+    end if;
+D_owed_first:
+    \* `notify_one`'s word, its counts taken and its generation left (`Owed::take`).
+    fw := owedFirst;
+    owedFirst := [owedFirst EXCEPT !.cur = 0, !.old = 0];
+D_owed_last:
+    \* `notify_last`'s, the same.
+    lw := owedLast;
+    owedLast := [owedLast EXCEPT !.cur = 0, !.old = 0];
+D_gen_late:
+    \* (The mutation's read, after the take.)
+    if Mutation = "owed_before_generation" then
+        g := generation;
+    end if;
+D_counts:
+    \* A word of a newer generation than the pass read goes back whole (`Owed::give_back`): its
+    \* counts are for the waiters of that generation, which a later pass, asked for by the
+    \* broadcast that made it, serves.
+    first := CurOf(fw, g);
+    last := CurOf(lw, g);
+    oldF := OldOf(fw, g);
+    oldL := OldOf(lw, g);
+    if Newer(fw, g) then
+        owedFirst := GiveBack(owedFirst, fw);
+    end if;
+    if Newer(lw, g) then
+        owedLast := GiveBack(owedLast, lw);
     end if;
 D_expire:
     \* From the front, while the front is withdrawn or of another generation: a withdrawn
     \* node is let go, a waiting one granted. Then each arrival on its own: a withdrawn one is
-    \* let go, one of another generation granted, one of this generation queued.
+    \* let go, one of another generation granted, one of this generation queued. The expired
+    \* take the older counts as they are granted, the oldest `notify_one`'s, the next
+    \* `notify_last`'s, marked as those calls' grants.
     \* MUTATION arrivals_unchecked: every arrival still waiting is queued, whatever its
     \* generation, so an older one can sit behind a newer front that stops the expiry.
-    wl := {x \in Range(list) \ Range(Unexpired(list, g)) : phase[x] = "waiting"}
-          \cup {x \in Range(arr) : phase[x] = "waiting" /\ payload[x] # g
-                                  /\ Mutation # "arrivals_unchecked"};
-    phase := [x \in W |-> IF x \in wl THEN "granted" ELSE phase[x]];
+    \* MUTATION old_to_permit: the expired take none of the older counts, which all become the
+    \* permit.
+    with es = ExpiredSeq(list, arr, g),
+         af = IF Mutation = "old_to_permit" THEN 0 ELSE Min(oldF, Len(ExpiredSeq(list, arr, g))),
+         al = IF Mutation = "old_to_permit" THEN 0
+              ELSE Min(oldL, Len(ExpiredSeq(list, arr, g)) - Min(oldF, Len(ExpiredSeq(list, arr, g)))) do
+        wl := Range(es);
+        phase := [x \in W |-> IF x \in Range(es) THEN "granted" ELSE phase[x]];
+        payload := [x \in W |-> IF \E k \in 1..af : es[k] = x THEN BY_FIRST
+                               ELSE IF \E k \in (af + 1)..(af + al) : es[k] = x THEN BY_LAST
+                               ELSE payload[x]];
+        oldF := oldF - af;
+        oldL := oldL - al;
+    end with;
     list := Unexpired(list, g) \o SelectSeq(arr, LAMBDA x : phase[x] = "waiting" /\ x \notin wl);
 D_tidy:
     \* `List::tidy` sweeps every withdrawn node only once enough of them piled up: here it
@@ -184,11 +277,6 @@ D_tidy:
     or
         skip;
     end either;
-D_owed:
-    first := pendingFirst;
-    pendingFirst := 0;
-    last := pendingLast;
-    pendingLast := 0;
 D_permit:
     \* A stored permit is a wake for the front: `List::front` lets the withdrawn nodes at the
     \* front go, and with a waiting one there the permit is taken.
@@ -246,9 +334,9 @@ D_last_grant:
     end if;
     goto D_last;
 D_leftover:
-    \* What nobody could take is a permit again.
+    \* What nobody could take, current or older, is a permit again.
     \* MUTATION leftover_lost: it is dropped.
-    if first + last > 0 /\ Mutation # "leftover_lost" then
+    if first + last + oldF + oldL > 0 /\ Mutation # "leftover_lost" then
         permit := TRUE;
     end if;
 D_exit:
@@ -268,7 +356,7 @@ end procedure;
 
 \* `notify_with`: a permit with nobody queued, else an owed wake and a pass.
 procedure NotifyWith(kind = "one")
-variables claimed = FALSE;
+variables claimed = FALSE, gn = 0;
 begin
 N_tr:
     ones := ones + 1;
@@ -276,11 +364,15 @@ N_tr:
         permit := TRUE;
         return;
     end if;
+N_gen:
+    \* The generation the count is made at.
+    gn := generation;
 N_owe:
+    \* One compare-and-swap of the word (`Owed::owe`).
     if kind = "one" then
-        pendingFirst := pendingFirst + 1;
+        owedFirst := Owe(owedFirst, gn);
     else
-        pendingLast := pendingLast + 1;
+        owedLast := Owe(owedLast, gn);
     end if;
 N_drainTr:
     claimOrDirty(claimed);

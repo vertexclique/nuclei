@@ -512,10 +512,10 @@ fn a_blocking_lock_inside_a_task_lets_the_holder_finish() {
     assert_eq!(done, 1);
 }
 
-/// A task woken once its worker stopped is dropped then: it is never run
-/// again, and it does not keep itself (and its shard) for good.
+/// A task waiting when its worker stops is dropped with the worker, once: a wake after that finds
+/// it gone and does not keep it or its shard.
 #[test]
-fn a_task_woken_after_its_worker_stopped_is_dropped() {
+fn a_task_waiting_as_its_worker_stops_is_dropped_with_it() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(AtomicBool::new(false));
     let gate = Gate::default();
@@ -535,14 +535,14 @@ fn a_task_woken_after_its_worker_stopped_is_dropped() {
     drop(rt);
     assert_eq!(
         dropped.load(Ordering::SeqCst),
-        0,
-        "the waiting task went with its worker"
+        1,
+        "the waiting task was kept past its worker"
     );
     gate.open();
     assert_eq!(
         dropped.load(Ordering::SeqCst),
         1,
-        "the task woken after its worker stopped was kept"
+        "the task woken after its worker stopped was dropped again"
     );
 }
 
