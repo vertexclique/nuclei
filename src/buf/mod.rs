@@ -220,7 +220,7 @@ pub(crate) struct Pool {
     home: Arc<Home>,
     free: [RefCell<Vec<NonNull<u8>>>; CLASSES.len()],
     /// Bytes the pool may hold, in use and free, the reservation included.
-    cap: usize,
+    cap: Cell<usize>,
     /// Of `charged`, the bytes [`reserve`](Self::reserve) took for memory the
     /// shard holds outside the pool.
     reserved: Cell<usize>,
@@ -251,7 +251,7 @@ impl Pool {
                 waiters: SegQueue::new(),
             }),
             free: Default::default(),
-            cap,
+            cap: Cell::new(cap),
             reserved: Cell::new(0),
             top: Cell::new(top_for(cap)),
             charged: Cell::new(0),
@@ -275,7 +275,7 @@ impl Pool {
     )]
     pub(crate) fn reserve(&self, bytes: usize) -> bool {
         let reserved = self.reserved.get().saturating_add(bytes);
-        if reserved.saturating_add(CLASSES[0]) > self.cap || !self.charge(bytes) {
+        if reserved.saturating_add(CLASSES[0]) > self.cap.get() || !self.charge(bytes) {
             return false;
         }
         self.reserved.set(reserved);
@@ -300,7 +300,7 @@ impl Pool {
     /// The bytes the pool's own buffers may hold: the cap less the
     /// reservation.
     pub(crate) fn room(&self) -> usize {
-        self.cap - self.reserved.get()
+        self.cap.get() - self.reserved.get()
     }
 
     /// Times a buffer was wanted while every byte under the cap was in use.
@@ -341,7 +341,17 @@ impl Pool {
 
     /// The bytes the pool may hold, the reservation included.
     pub(crate) fn cap(&self) -> usize {
+        self.cap.get()
+    }
+
+    /// Holds the pool to `cap` from now on (at least one buffer of the smallest class), freeing
+    /// its idle buffers past it now; a pool still past it takes no new memory until it is back
+    /// under it.
+    fn hold_to(&self, cap: usize) {
         self.cap
+            .set(cap.max(CLASSES[0]).max(self.reserved.get() + CLASSES[0]));
+        self.top.set(top_for(self.room()));
+        let _ = self.make_room(0);
     }
 
     /// A buffer that holds all of `len` bytes, whatever their number: a class
@@ -427,7 +437,7 @@ impl Pool {
     /// Frees idle buffers, the largest first, until `size` more bytes fit
     /// under the cap. False when even all of them would not make the room.
     fn make_room(&self, size: usize) -> bool {
-        let fits = |charged: usize| charged.saturating_add(size) <= self.cap;
+        let fits = |charged: usize| charged.saturating_add(size) <= self.cap.get();
         if fits(self.charged.get()) {
             return true;
         }
@@ -502,30 +512,20 @@ impl Drop for Pool {
 }
 
 thread_local! {
-    /// What the pool of this thread, which runs no shard, may hold, once the thread said which
-    /// runtime it serves ([`serve_with_cap`]).
-    static FALLBACK_CAP: Cell<Option<usize>> = const { Cell::new(None) };
-    /// The pool of a thread that runs no shard (a blocking pool's, one whose shard was handed
-    /// over, a task of another executor writing to a handle), made on first need and held to
-    /// the cap of the runtime it serves ([`fallback_cap`]), as a worker's is
-    /// (proofs/tla/bufcap/BufCap.tla).
-    static FALLBACK: Pool = Pool::new(fallback_cap());
+    /// The pool of a thread that runs no shard (a task of another executor writing to a handle,
+    /// a blocking pool's thread, a worker whose shard was handed over), made on first need. A
+    /// thread that serves a runtime holds it to that runtime's cap ([`serve_with_cap`]).
+    static FALLBACK: Pool = Pool::new(DEFAULT_CAP);
 }
 
-/// Holds the pool of this thread, which serves a runtime and runs no shard (a blocking pool's),
-/// to that runtime's `io_buffer_cap`. Called before the thread does any IO.
+/// Holds the pool of this thread, which serves a runtime and may run no shard (a blocking
+/// pool's thread, a worker, a thread inside the runtime with `enter`), to that runtime's
+/// `io_buffer_cap`, as a worker's own pool is (proofs/tla/bufcap/BufCap.tla). Called as the
+/// thread starts serving, before its IO; a pool that holds more than the cap meanwhile frees
+/// its idle buffers past it now and takes no new memory until it is back under it. Here and not
+/// in the pool's lazy start, so the IO steps that reach this thread's pool carry none of it.
 pub(crate) fn serve_with_cap(cap: usize) {
-    FALLBACK_CAP.set(Some(cap));
-}
-
-/// What a pool of a thread that runs no shard may hold: the cap of the runtime it serves, its
-/// blocking pool's or the one it is inside, else of the default runtime if that runs, else the
-/// default.
-fn fallback_cap() -> usize {
-    FALLBACK_CAP
-        .get()
-        .or_else(|| crate::rt::runtime::running_inner().map(|inner| inner.buffer_cap))
-        .unwrap_or(DEFAULT_CAP)
+    let _ = FALLBACK.try_with(|pool| pool.hold_to(cap));
 }
 
 /// Runs `f` with this thread's pool: the pool of the shard it runs (a call

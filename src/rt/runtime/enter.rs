@@ -66,6 +66,7 @@ impl fmt::Display for TryCurrentError {
 impl std::error::Error for TryCurrentError {}
 
 fn enter(inner: &Arc<Inner>) -> EnterGuard<'_> {
+    crate::buf::serve_with_cap(inner.buffer_cap);
     EnterGuard {
         _set: context::set_runtime(inner),
         _runtime: PhantomData,
