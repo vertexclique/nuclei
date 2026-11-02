@@ -246,16 +246,6 @@ pub(super) struct ReadState {
     armed: bool,
     #[cfg(ring)]
     multi_stopping: bool,
-    /// A stream that goes by readiness on a ring (`read_direct`) reads through the multishot
-    /// receive instead, a count having found its bytes running ahead of its reads, until the
-    /// receive's arrivals keep fitting the reads (see `fit_runs`)
-    /// (proofs/tla/ring/RingPoll.tla).
-    #[cfg(ring)]
-    recv_mode: bool,
-    /// Arrivals of the receive's in a row that each came to a reader waiting with nothing read
-    /// ahead, and fit its read: at `FIT_RUNS` the side goes by readiness again.
-    #[cfg(ring)]
-    fit_runs: u8,
     /// The tasks that wait for connections take no address: an accept may
     /// go out as a multishot one.
     #[cfg(ring)]
@@ -351,10 +341,6 @@ impl ReadState {
         if self.starved && self.readable {
             return Poll::Ready(self.eof);
         }
-        #[cfg(ring)]
-        if let Some(ready) = self.ready_by_readiness(io, fd, kind, after) {
-            return ready;
-        }
         // A datagram read ahead (on a completion driver, of UDP) is read
         // whole: the receive that takes it may ask for any size, and one read
         // into less would be cut. The pool's largest buffer holds any
@@ -377,39 +363,6 @@ impl ReadState {
         }
         self.wait(waker, len);
         Poll::Pending
-    }
-
-    /// On a ring, whether a stream read by readiness (`read_direct`) may be read now: as on a
-    /// poller, the bytes there are read ahead into a buffer of the pool for the handle's own
-    /// reads (`read_ahead`), unless the side found the socket empty and the ring's poll said
-    /// nothing since. Found empty, the side waits for the poll, which the wait arms
-    /// (proofs/tla/ring/RingPoll.tla). `None` for any other side, and to wait.
-    #[cfg(ring)]
-    fn ready_by_readiness(
-        &mut self,
-        io: Io<'_>,
-        fd: Option<crate::io::raw::Raw>,
-        kind: Kind,
-        after: &mut After,
-    ) -> Option<Poll<bool>> {
-        if !matches!(io.via, Via::Ops(_))
-            || !kind.counts_left()
-            || self.recv_mode
-            || self.poll_first
-            || self.has_result()
-            || self.lent.is_some()
-            || !self.inq_wanted(kind)
-        {
-            return None;
-        }
-        // The read ahead keeps the poller's flag for the socket found empty; on a ring that is
-        // the wait for the poll.
-        let blocked = self.blocked;
-        self.read_ahead(fd?, kind, self.want.max(1), after);
-        if core::mem::replace(&mut self.blocked, blocked) {
-            self.poll_first = true;
-        }
-        self.has_result().then_some(Poll::Ready(self.eof))
     }
 
     /// On a readiness driver, whether a stream socket the pool has no buffer
@@ -1459,27 +1412,16 @@ impl ReadState {
             return;
         }
         match arrival {
-            super::ring::Arrival::Chunk(chunk) => {
-                // A chunk that comes to a reader waiting with nothing read ahead, and fits its
-                // read, is one the reads keep up with.
-                if self.recv_mode {
-                    self.count_fit(self.ahead.is_empty() && chunk.len() <= self.want);
-                }
-                self.ahead.push(Piece::Ring(chunk), after);
-            }
+            super::ring::Arrival::Chunk(chunk) => self.ahead.push(Piece::Ring(chunk), after),
             super::ring::Arrival::Conn(conn) => self.accepted.push_back((conn, Peer::Ask)),
             super::ring::Arrival::Datagram(payload, from) => {
                 self.datagrams.push_back((Datagram::Ring(payload), from));
             }
             // The ring's edge: a task that found the socket empty receives again
             // (`receive_now`), and one made with no guard that saw the count before it asks again.
-            super::ring::Arrival::Ready { unsure } => {
+            super::ring::Arrival::Ready => {
                 self.poll_first = false;
                 self.edges = self.edges.wrapping_add(1);
-                // As a poller's hangup edge: a count of none no longer says the socket is empty.
-                if unsure {
-                    self.short_reads_unsure();
-                }
             }
         }
         self.want = 0;

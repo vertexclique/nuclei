@@ -119,18 +119,6 @@ pub(crate) const UNIX_INQ: bool = cfg!(any(
 /// a Unix stream by `SO_INQ` (Linux 6.17). False where the kernel does not
 /// know the option.
 pub(crate) fn enable_inq(fd: RawFd, tcp: bool) -> bool {
-    set_inq(fd, tcp, 1)
-}
-
-/// Stops the count [`enable_inq`] asked for, so the kernel's receives of `fd` no longer work it
-/// out: for a socket a ring's multishot receive reads from then on. False where the kernel does
-/// not know the option.
-pub(crate) fn disable_inq(fd: RawFd, tcp: bool) -> bool {
-    set_inq(fd, tcp, 0)
-}
-
-/// Sets the count [`enable_inq`] names to `on`.
-fn set_inq(fd: RawFd, tcp: bool, on: libc::c_int) -> bool {
     let (level, name) = if tcp {
         (libc::IPPROTO_TCP, libc::TCP_INQ)
     } else {
@@ -149,13 +137,14 @@ fn set_inq(fd: RawFd, tcp: bool, on: libc::c_int) -> bool {
         )))]
         return false;
     };
+    let one: libc::c_int = 1;
     // SAFETY: a plain setsockopt with a pointer to our own int.
     let ret = unsafe {
         libc::setsockopt(
             fd,
             level,
             name,
-            (&on as *const libc::c_int).cast(),
+            (&one as *const libc::c_int).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         )
     };

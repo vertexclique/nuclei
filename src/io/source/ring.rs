@@ -537,11 +537,9 @@ impl RingIssuer<'_> {
 
 /// What a multishot receive, accept or poll hands the side as it comes.
 pub(crate) enum Arrival {
-    /// The socket of a side whose task receives its datagrams itself, or reads a stream by
-    /// readiness, may be readable: the multishot poll's edge. `unsure` when the kernel also
-    /// reported a hangup or an error, which a stream's count of what a read leaves may not tell
-    /// (`ReadState::short_reads_unsure`).
-    Ready { unsure: bool },
+    /// The socket of a side whose task receives its datagrams itself may be
+    /// readable: the multishot poll's edge.
+    Ready,
     /// A receive's buffer of bytes.
     Chunk(crate::rt::shard::recv::RingChunk),
     /// An accepted connection, whose peer is asked of the kernel when a task
@@ -646,10 +644,7 @@ fn entry(
         }
         Want::ReadyMulti => (
             RingMem::ReadyMulti,
-            // A hangup is asked for too, as a poller's edges report it: a stream's count of what
-            // a read leaves may not tell the end. Urgent data needs no word here: it stays in a
-            // stream's count, so no read takes the socket for empty in front of it.
-            Sqe::poll_add_multi(slot, (libc::POLLIN | libc::POLLRDHUP) as u32),
+            Sqe::poll_add_multi(slot, libc::POLLIN as u32),
         ),
         Want::Accept => {
             let mut addr = Spare::new(RawAddr::empty());

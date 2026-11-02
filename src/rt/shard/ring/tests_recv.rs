@@ -59,14 +59,11 @@ pub(super) fn ring_shard_of(entries: u32, buffers: u16, size: u32) -> Option<Sha
     }
 }
 
-/// A socket of a pair with its source, and the pair's other end. The source reads through the
-/// multishot receive from its first read, as a stream whose bytes run ahead of its reads does
-/// (one read by readiness reads straight from the socket instead).
+/// A socket of a pair with its source, and the pair's other end.
 pub(super) fn source_pair() -> (UnixStream, Arc<Source>, UnixStream) {
     let (mine, peer) = UnixStream::pair().unwrap();
     sys::set_nonblocking(mine.as_raw_fd()).unwrap();
     let src = Source::new(mine.as_raw_fd(), Kind::Stream);
-    src.read_through_receive();
     (mine, src, peer)
 }
 
@@ -110,8 +107,7 @@ async fn pause(d: Duration) {
 }
 
 /// Messages that come one at a time are all served by the one receive the
-/// first read armed, for a reader that takes each in two reads (one that
-/// takes each arrival whole goes by readiness again).
+/// first read armed.
 #[test]
 fn one_multishot_receive_serves_every_arrival() {
     let Some(shard) = recv_shard(16, 4096) else {
@@ -132,9 +128,7 @@ fn one_multishot_receive_serves_every_arrival() {
     shard.block_on(async {
         for i in 0..32u8 {
             let mut message = [0u8; 100];
-            for half in message.chunks_mut(50) {
-                read_exact(&src, half).await;
-            }
+            read_exact(&src, &mut message).await;
             assert!(message.iter().all(|&b| b == i), "message {i} changed");
             read_one.send(()).unwrap();
         }
