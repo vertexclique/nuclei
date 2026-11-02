@@ -405,7 +405,9 @@ S_fresh:
     if closedBit /\ Mutation # "try_ignores_close" then
         status[req] := "failed";            \* closed: the operation fails at once
         goto S_failed;
-    elsif (~queuedBit \/ Mutation = "try_ignores_queue") /\ free >= OpOf(req).n then
+    \* A request for no slot succeeds unless the channel is closed, queue or not
+    \* (`FairSemaphore::try_acquire`'s `n == 0`).
+    elsif (~queuedBit \/ OpOf(req).n = 0 \/ Mutation = "try_ignores_queue") /\ free >= OpOf(req).n then
         free := free - OpOf(req).n;         \* the slots are free and nobody waits: take them
         held[self] := held[self] + OpOf(req).n;   \* they are this sender's permits now
         status[req] := "done";              \* (record) it has its slots
@@ -746,12 +748,13 @@ Conservation ==
     /\ Len(mq) <= Cap
 
 \* First come, first served: a request that was already in line when another began is never
-\* still waiting once that other one has its slots, a `try_` that took slots included.
+\* still waiting once that other one has its slots, a `try_` that took slots included (a
+\* request for no slot takes nothing from anybody, so it does not count).
 \* `ahead` forgets a request once it leaves the line. That changes no answer: a request that
 \* left the line never waits again, so it could never break this check. It only lets two runs
 \* that differ in nothing but who has left the line count as one state.
 FifoFair ==
-    \A r \in Reqs : status[r] \in {"granted", "done", "returned"} =>
+    \A r \in Reqs : status[r] \in {"granted", "done", "returned"} /\ OpOf(r).n > 0 =>
         \A q \in ahead[r] : status[q] # "waiting"
 
 \* After the close nothing new is admitted: no slot leaves the word, and every operation that

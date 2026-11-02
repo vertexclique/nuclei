@@ -55,3 +55,4 @@ M_release_close_grant          MC_BoundedChannel   violated:Conservation
 M_close_grant_as_ok            MC_BoundedChannel   violated:PermitsSound
 BC_late_cancel                 MC_BoundedChannel   pass
 BC_live_late_cancel            MC_BoundedChannel   pass
+BC_try_zero                    MC_BoundedChannel   pass
