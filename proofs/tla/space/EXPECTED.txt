@@ -1,0 +1,21 @@
+# configuration                spec                 expected
+G_extend                       MC_Space             pass
+G_extend_zfs                   MC_Space             pass
+G_extend_empty                 MC_Space             pass
+G_keep_inside                  MC_Space             pass
+G_keep_past                    MC_Space             pass
+G_punch                        MC_Space             pass
+G_punch_past                   MC_Space             pass
+G_zero                         MC_Space             pass
+G_zero_appends                 MC_Space             pass
+G_zero_cuts                    MC_Space             pass
+G_zero_inside                  MC_Space             pass
+G_zero_empty                   MC_Space             pass
+G_no_spacectl                  MC_Space             pass
+M_grow_truncates               MC_Space             violated:NoLostWrite
+M_aimed_appends                MC_Space             violated:NoGrowthPastEnd
+M_keep_past_end                MC_Space             violated:KeepsLength
+M_one_pass                     MC_Space             violated:Zeroed
+M_grow_first                   MC_Space             violated:ErrorKeepsLength
+K_keep_cut_meanwhile           MC_Space             violated:KeepsLength
+W_error                        MC_Space             violated:NoError

@@ -1,7 +1,8 @@
 //! The unix calls on the space a file uses and on ranges of files: reserving,
 //! punching and zeroing a range, writing a range back, telling two
 //! descriptors apart, and copying a range in the kernel. Each runs on a
-//! descriptor the caller keeps open for the call.
+//! descriptor the caller keeps open for the call. `proofs/tla/space/Space.tla`
+//! checks FreeBSD's calls on a range against other writers of the file.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -14,7 +15,8 @@ use super::cvt_int;
         target_os = "linux",
         target_os = "android",
         target_os = "macos",
-        target_os = "ios"
+        target_os = "ios",
+        target_os = "freebsd"
     )),
     allow(unused_imports)
 )]
@@ -89,27 +91,145 @@ pub(crate) fn allocate(fd: RawFd, offset: u64, len: u64, mode: Allocate) -> io::
     }
 }
 
-/// Reserves the `len` bytes of the file `fd` from `offset`, growing the file
-/// to cover them (`posix_fallocate`); no other change of space is made here.
+/// Changes the space the `len` bytes of the file `fd` from `offset` use, as
+/// `mode` says. A reservation is `posix_fallocate(2)`, which grows the file
+/// to the range's end; one that keeps the length is made only inside the
+/// file. A hole and a zeroed range are `fspacectl(2)`'s `SPACECTL_DEALLOC`,
+/// which frees the range where the file system punches holes (ZFS, tmpfs)
+/// and writes zeros over it where it does not (UFS); for `ZeroRange` the
+/// file then grows to the range's end, as a write of zeros would grow it.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn allocate(fd: RawFd, offset: u64, len: u64, mode: Allocate) -> io::Result<()> {
+    let end = offset.saturating_add(len);
+    let (offset, len) = (file_offset(offset)?, file_offset(len)?);
+    match mode {
+        Allocate::Extend => reserve(fd, offset, len),
+        // No call here reserves space past the end of a file and leaves its length:
+        // `posix_fallocate` grows the file to the range's end, a truncate back frees the blocks
+        // past the new end (UFS keeps none there), `fspacectl` only frees, and ZFS reserves no
+        // range at all (its `VOP_ALLOCATE` is `EOPNOTSUPP`).
+        Allocate::KeepSize if ends_past_the_file(fd, end)? => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this system cannot reserve space past the end of a file without growing it",
+        )),
+        Allocate::KeepSize => reserve(fd, offset, len),
+        Allocate::PunchHole => deallocate(fd, offset, len),
+        Allocate::ZeroRange => {
+            deallocate(fd, offset, len)?;
+            grow(fd, end)
+        }
+    }
+}
+
+/// Whether `fd` is a regular file shorter than `end`; any other file gets the
+/// system's own answer to a reservation.
+#[cfg(target_os = "freebsd")]
+fn ends_past_the_file(fd: RawFd, end: u64) -> io::Result<bool> {
+    let st = stat(fd)?;
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFREG && end > st.st_size as u64)
+}
+
+/// `posix_fallocate(2)` of the `len` bytes of the file `fd` from `offset`,
+/// which answers its error number itself.
 #[cfg(any(
     target_os = "freebsd",
     target_os = "dragonfly",
     target_os = "illumos",
     target_os = "solaris"
 ))]
-pub(crate) fn allocate(fd: RawFd, offset: u64, len: u64, mode: Allocate) -> io::Result<()> {
-    if mode != Allocate::Extend {
-        return Err(unsupported_mode());
-    }
-    let (offset, len) = (file_offset(offset)?, file_offset(len)?);
+fn reserve(fd: RawFd, offset: libc::off_t, len: libc::off_t) -> io::Result<()> {
     loop {
-        // SAFETY: a plain call on the caller's descriptor; it answers the error number itself.
+        // SAFETY: a plain call on the caller's descriptor.
         match unsafe { libc::posix_fallocate(fd, offset, len) } {
             0 => return Ok(()),
             libc::EINTR => {}
             err => return Err(io::Error::from_raw_os_error(err)),
         }
     }
+}
+
+#[cfg(target_os = "freebsd")]
+type Fspacectl = unsafe extern "C" fn(
+    libc::c_int,
+    libc::c_int,
+    *const libc::spacectl_range,
+    libc::c_int,
+    *mut libc::spacectl_range,
+) -> libc::c_int;
+
+/// `fspacectl(2)`, which FreeBSD's C library has from 14.0, looked up once: a
+/// program that uses nuclei still starts on an older system, where a hole or
+/// a zeroed range answers `Unsupported`.
+#[cfg(target_os = "freebsd")]
+fn fspacectl() -> Option<Fspacectl> {
+    static FOUND: std::sync::OnceLock<Option<Fspacectl>> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        // SAFETY: a lookup of a symbol by its name, which a C string holds.
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"fspacectl".as_ptr()) };
+        // SAFETY: the C library's `fspacectl`, of this signature.
+        (!found.is_null())
+            .then(|| unsafe { core::mem::transmute::<*mut libc::c_void, Fspacectl>(found) })
+    })
+}
+
+/// Makes the `len` bytes of the file `fd` from `offset` read as zeros
+/// (`SPACECTL_DEALLOC`), up to the file's end; a call a signal stopped part
+/// way goes on with what it left.
+#[cfg(target_os = "freebsd")]
+fn deallocate(fd: RawFd, offset: libc::off_t, len: libc::off_t) -> io::Result<()> {
+    let Some(fspacectl) = fspacectl() else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this system cannot free or zero a range of a file",
+        ));
+    };
+    let mut range = libc::spacectl_range {
+        r_offset: offset,
+        r_len: len,
+    };
+    let range = &raw mut range;
+    loop {
+        // SAFETY: the kernel reads the range and writes what it left of it into the same one,
+        // as fspacectl(2) allows.
+        retry(|| cvt_int(unsafe { fspacectl(fd, libc::SPACECTL_DEALLOC, range, 0, range) }))?;
+        // SAFETY: our own range, which the call wrote.
+        if unsafe { (*range).r_len } == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Grows the file `fd` to `end` bytes if it is shorter, with zeros: a write
+/// of one zero at `end - 1`, which never cuts a write of someone else's past
+/// it, as a truncate to `end` would. A descriptor that appends writes at the
+/// file's end wherever a write is aimed, so the zero goes through a
+/// descriptor of the file's own that does not (`O_EMPTY_PATH`).
+#[cfg(target_os = "freebsd")]
+fn grow(fd: RawFd, end: u64) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if super::file_size(fd)? >= end {
+        return Ok(());
+    }
+    // SAFETY: a plain fcntl on the caller's descriptor.
+    if cvt_int(unsafe { libc::fcntl(fd, libc::F_GETFL) })? & libc::O_APPEND == 0 {
+        return super::pwrite_all(fd, &[0], end - 1);
+    }
+    let flags = libc::O_EMPTY_PATH | libc::O_WRONLY | libc::O_CLOEXEC;
+    // SAFETY: opens the file `fd` names once more, from its empty path.
+    let aimed = retry(|| cvt_int(unsafe { libc::openat(fd, c"".as_ptr(), flags) }))?;
+    // SAFETY: a new descriptor nobody else owns.
+    let aimed = unsafe { OwnedFd::from_raw_fd(aimed) };
+    super::pwrite_all(aimed.as_raw_fd(), &[0], end - 1)
+}
+
+/// Reserves the `len` bytes of the file `fd` from `offset`, growing the file
+/// to cover them (`posix_fallocate`); no other change of space is made here.
+#[cfg(any(target_os = "dragonfly", target_os = "illumos", target_os = "solaris"))]
+pub(crate) fn allocate(fd: RawFd, offset: u64, len: u64, mode: Allocate) -> io::Result<()> {
+    if mode != Allocate::Extend {
+        return Err(unsupported_mode());
+    }
+    reserve(fd, file_offset(offset)?, file_offset(len)?)
 }
 
 /// No call here changes the space of a range.
@@ -131,7 +251,8 @@ pub(crate) fn allocate(_: RawFd, _: u64, _: u64, _: Allocate) -> io::Result<()> 
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
-    target_os = "ios"
+    target_os = "ios",
+    target_os = "freebsd"
 )))]
 fn unsupported_mode() -> io::Error {
     io::Error::new(

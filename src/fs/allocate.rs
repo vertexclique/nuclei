@@ -9,14 +9,18 @@ pub enum Allocate {
     /// ends past its end. The new part reads as zeros.
     Extend,
     /// Reserves disk space for the range and leaves the file's length as it
-    /// is.
+    /// is. On FreeBSD only inside the file: a range that ends past its end
+    /// answers `Unsupported`.
     KeepSize,
     /// Frees the disk space of the range, which then reads as zeros, and
     /// leaves the file's length as it is. A range that ends past the end of
-    /// the file does not grow it.
+    /// the file does not grow it. On FreeBSD a file system that cannot free
+    /// a range writes zeros over it instead (UFS).
     PunchHole,
     /// Makes the range read as zeros, without a write of zeros, and grows the
     /// file to cover the range when it ends past the end, as a write of zeros
-    /// would.
+    /// would. On FreeBSD the system writes the zeros where the file system
+    /// cannot free the range (UFS), and grows the file with a write of one
+    /// zero at the range's last byte.
     ZeroRange,
 }
