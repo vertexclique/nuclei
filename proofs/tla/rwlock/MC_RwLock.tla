@@ -23,4 +23,10 @@ UpgWrite == <<<<"upg">>, <<"write">>>>
 DowngradeHoldRead == <<<<"downgrade_hold">>, <<"read">>>>
 \* An upgrade against a reader and a writer queued behind it.
 UpgradeReadWrite == <<<<"upgrade">>, <<"read">>, <<"write">>>>
+\* An upgrade dropped while it waits for a reader, against that reader and one more read.
+UpgradeDropRead == <<<<"upgrade_drop">>, <<"read", "read">>>>
+\* An upgradable read dropped while it waits, against an upgradable read and a reader.
+DropUpg == <<<<"upg">>, <<"drop_upg">>, <<"read">>>>
+\* Two readers.
+ReadRead == <<<<"read">>, <<"read">>>>
 =============================================================================
