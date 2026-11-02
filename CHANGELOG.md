@@ -78,6 +78,10 @@
   (`GetOverlappedResult`) before the call returns; the event's low bit keeps the end off the port
   the handle is bound to (`proofs/tla/port/PortFile.tla`). A test writes such a file at its cursor
   and at offsets at once, syncs it and reads every byte back.
+- **`Allocate::KeepSize` says what it keeps on Windows.** NTFS holds the space reserved past a
+  file's end only while a handle to the file is open, and frees it when the last one closes (a
+  1 MiB reservation read back 1 MiB with a handle open and 0 once reopened after the last close);
+  the docs promised it as a lasting reservation. A test checks both on Windows.
 
 ### Changed
 

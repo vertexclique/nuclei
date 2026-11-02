@@ -9,7 +9,9 @@ pub enum Allocate {
     /// ends past its end. The new part reads as zeros.
     Extend,
     /// Reserves disk space for the range and leaves the file's length as it
-    /// is.
+    /// is. On Windows (NTFS) the space reserved past the end of the file is
+    /// held while a handle to the file is open: the system frees it when the
+    /// file's last handle closes, as it frees any allocation past the end.
     KeepSize,
     /// Frees the disk space of the range, which then reads as zeros, and
     /// leaves the file's length as it is. A range that ends past the end of
