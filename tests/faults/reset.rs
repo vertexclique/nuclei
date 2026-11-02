@@ -262,6 +262,22 @@ pub async fn reset_then_a_write<S: Stream>() {
     }
 }
 
+/// Whether `err` is what FreeBSD's `sendfile(2)` leaves on a socket whose
+/// connection went while pages it sends were still being read in (all of a
+/// ZFS file's that are not in the page cache): it tears the socket down when
+/// they come and marks it `EIO` (sys/kern/kern_sendfile.c
+/// `sendfile_iodone`), which a later call of the file's send, or the next
+/// call on the socket, answers.
+fn torn_down_by_send_file(how: Writer, err: &io::Error) -> bool {
+    #[cfg(target_os = "freebsd")]
+    return matches!(how, Writer::SendFile) && err.raw_os_error() == Some(libc::EIO);
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let _ = (how, err);
+        false
+    }
+}
+
 /// A write far larger than the buffers, partly queued when the peer, having
 /// read some of it, resets: the write fails as std's does, and so does the
 /// next; the reads that follow end.
@@ -304,21 +320,24 @@ pub async fn reset_during_a_large_write<S: Stream>() {
         let wrote = within(&what, write_as(&ours, how, &bytes)).await;
         joined(peer).await;
         match wrote {
-            Err(err) => assert!(is_one_of(&err, RESET_WRITE), "{what}: {err}"),
+            Err(err) => assert!(
+                is_one_of(&err, RESET_WRITE) || torn_down_by_send_file(how, &err),
+                "{what}: {err}"
+            ),
             Ok(()) if cfg!(windows) => {}
             Ok(()) => panic!("{what}: the write went through"),
         }
         let again = within(&what, write_as(&ours, Writer::Plain, b"more")).await;
         let err = again.expect_err(&format!("{what}: the write after it"));
         assert!(
-            is_one_of(&err, RESET_WRITE),
+            is_one_of(&err, RESET_WRITE) || torn_down_by_send_file(how, &err),
             "{what}: the write after it: {err}"
         );
         let read = within(&what, read_once(&ours, Reader::Borrowed, 4096)).await;
         match read {
             Ok(bytes) => assert!(bytes.is_empty(), "{what}: a read after it found bytes"),
             Err(err) => assert!(
-                is_one_of(&err, RESET_READ),
+                is_one_of(&err, RESET_READ) || torn_down_by_send_file(how, &err),
                 "{what}: the read after it: {err}"
             ),
         }

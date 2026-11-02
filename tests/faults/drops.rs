@@ -371,8 +371,20 @@ fn a_shard_that_goes_hands_its_streams_on_with_every_byte() {
                     .unwrap(),
                 1
             );
-            let (ours, mut peer) = <TcpStream as Stream>::pair(false);
-            peer.write_all(&bytes).unwrap();
+            let (ours, peer) = <TcpStream as Stream>::pair(false);
+            // The peer writes from a thread of its own: FreeBSD's buffers hold
+            // 160 KiB of a stream nobody reads, and the bytes after the first
+            // read wait for the reads after the stop. It writes the word after
+            // them once the shard went.
+            let (stop, stopped_now) = std::sync::mpsc::channel::<()>();
+            let sent = bytes.clone();
+            let writer = std::thread::spawn(move || {
+                let mut peer = peer;
+                peer.write_all(&sent).unwrap();
+                stopped_now.recv().unwrap();
+                peer.write_all(b"after").unwrap();
+                peer
+            });
             let ours = std::sync::Arc::new(ours);
             let first = {
                 let ours = std::sync::Arc::clone(&ours);
@@ -385,10 +397,11 @@ fn a_shard_that_goes_hands_its_streams_on_with_every_byte() {
             };
             let (mut got, stopped) = within("the first read", first).await;
             let what = format!("round {round}: a stream whose shard went (stopped {stopped})");
-            peer.write_all(b"after").unwrap();
+            stop.send(()).unwrap();
             let rest = within(&what, read_exact(&*ours, bytes.len() - 10 + 5)).await;
             got.extend_from_slice(&rest.unwrap());
             same_bytes(&what, &got, &[bytes.as_slice(), b"after"].concat());
+            let mut peer = joined(writer).await;
             within(&what, write_all(&*ours, b"back")).await.unwrap();
             let mut four = [0u8; 4];
             peer.read_exact(&mut four).unwrap();
