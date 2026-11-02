@@ -165,6 +165,41 @@
   which a 10 ms timer of the ring's own brings though nothing else is out
   (`proofs/tla/ring/RingClose.tla`: `MC_update_ignored`, `MC_update_frees`,
   `MC_update_no_wake`; `proofs/lean/Nuclei/Files.lean`: `refused_release_keeps_the_slot`).
+- **A stream write that found the socket full no longer waits for good when its shard is handed
+  off in the same poll** (epoll, kqueue). The owner's straight send finds the socket full, and the
+  rest of its poll was told so and blocked the side on the next write edge without asking the
+  kernel again. When the monitor took the shard between the two, the shard's driver on its new
+  thread could take the edge that room brought and pass over it, since the send's hold had
+  published nothing and the side still said it was only ever its owner's and idle; the rest of the
+  poll, now on a thread with no shard, then blocked the side on an edge that had already passed,
+  and a write or a flush waited until the peer spoke again. A poll whose shard was taken now asks
+  the kernel itself under its own hold (`proofs/tla/sendsnow/TakenFull.tla`).
+- **A shard handed off while its old thread sits in a wait no signal ends goes on with its polls
+  and its wakes** (Linux, io_uring). A watched worker's ring is not single-issuer, so the kernel
+  runs the completion of each request as work queued to the thread that submitted it, and a thread
+  in a killable wait (a `vfork` parent, a read of a slow disk, a stalled network file system) runs
+  none of it until it comes back. After a handoff, a stream read by readiness, a datagram's poll, a
+  write waiting for room, and the ring's own wake read, all armed by the old thread, then brought
+  nothing: the stream and the write waited, and a task spawned or woken from another thread did not
+  run, for as long as the old thread's wait lasted. The new runner now cancels each poll the old
+  thread armed, before its first drive, and its side arms another of the new runner's; the old one
+  stays until its own end, which goes to no side, and the ring's wake is armed again under an id of
+  its own (`proofs/tla/ring/RingHandoff.tla`). An operation that takes or gives bytes (a receive
+  into the ring's buffers, a send, a connect), a file's call, a child's exit watch and an accept
+  still complete only once the old thread comes back: an accept's poll is the first exclusive
+  waiter of its listener, which takes each connection's wake even once cancelled, so it cannot be
+  armed again from the new runner.
+- **A call whose heavy fence fails no longer waits for good on a side whose claimant cannot serve
+  it** (Linux, whose heavy fence, `membarrier`, can fail under memory pressure). Such a call leaves its work in a biased side and nudges the shard that claimed the side,
+  which does it at its next take. The claim stayed with the first shard that claimed it, so once a
+  source left that shard (a thread's own shard whose `block_on` returned, a worker that went), the
+  nudge reached a shard that ran nothing, and once the source was homed on another shard the
+  claimant's own calls, foreign now, nudged themselves without end; the call waited until something
+  else took the side. A shard now gives its claim up as it lets go of its sources, doing any work a
+  fenceless call left before, and a fenceless call that finds the claim given up, or that runs on
+  the claimant's own thread with nothing held, takes the side itself. The shard claims the side
+  again at its next take as its owner (`proofs/tla/side_biased/SideBiased.tla`, `ClaimStops` and
+  `Rehomed`).
 
 ### Changed
 

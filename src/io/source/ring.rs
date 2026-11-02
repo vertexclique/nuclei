@@ -103,6 +103,10 @@ pub(crate) enum RingMem {
     /// A zero-copy send whose first completion came: it only holds the buffer, which the kernel
     /// may still read, until its notification.
     ZcHeld(#[expect(dead_code, reason = "the kernel may read it until the notification")] Pinned),
+    /// A poll a runner that lost its shard submitted, cancelled by the shard's new runner, which
+    /// told its side it ended (`RingMem::adopted`, `ShardRing::adopt`): it is no side's, points at
+    /// no memory, and only waits for its own end, which runs on its old thread.
+    Zombie,
 }
 
 /// The least a `write_zero_copy` must have left to send for its next chunk to go out zero-copy
@@ -171,6 +175,22 @@ impl RingMem {
             && let RingMem::SendZc { buf, .. } = core::mem::replace(self, RingMem::Ready)
         {
             *self = RingMem::ZcHeld(buf);
+        }
+    }
+
+    /// What a shard's new runner makes of this operation of the old runner's, cancelled from the
+    /// new one (`ShardRing::adopt`): a poll gives the zombie that stays in its place until its own
+    /// end, and the end its side is told now, so it submits another; anything else comes back as
+    /// it is. An operation that takes or gives bytes cannot be done again; an accept's poll is an
+    /// exclusive waiter of its listener, the first of which takes each connection's wake, so a
+    /// cancelled one its old thread has not ended would take them all from the new one
+    /// (proofs/tla/ring/RingHandoff.tla, `adopt_accepts`).
+    pub(crate) fn adopted(self, kind: Kind) -> Result<(RingMem, Outcome), RingMem> {
+        match self {
+            RingMem::Ready | RingMem::ReadyMulti => {
+                Ok((RingMem::Zombie, self.complete(-libc::ECANCELED, kind)))
+            }
+            other => Err(other),
         }
     }
 
@@ -294,6 +314,9 @@ impl RingMem {
             RingMem::SendPinned(_) => Outcome::SendPinned(wrote_of(res)),
             // A zero-copy send was counted at its first completion.
             RingMem::SendZc { .. } | RingMem::ZcHeld(_) => Outcome::SendPinned(answer(res)),
+            // Never a side's: its end is buried (`ShardRing::bury`), and this is what a cancelled
+            // poll's would be.
+            RingMem::Zombie => Outcome::Ready(Answer::Undone { not_ready: false }),
             RingMem::Recv(_)
             | RingMem::Send(_)
             | RingMem::SendLent(_)

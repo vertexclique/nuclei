@@ -136,3 +136,16 @@ MRS_port_queued                MC_RingSend          violated:OwnResult
 RS_port                        MC_RingSend          pass
 RS_port_live                   MC_RingSend          pass
 MRS_port_no_wake               MC_RingSend          violated:Termination
+RH_interruptible               MC_RingHandoff       pass
+RH_uninterruptible             MC_RingHandoff       pass
+RH_ends                        MC_RingHandoff       pass
+RH_data_interruptible          MC_RingHandoff       pass
+MRH_uninterruptible            MC_RingHandoff       violated:IoRescued
+MRH_coop_taskrun               MC_RingHandoff       violated:IoRescued
+MRH_zombie_reaches_side        MC_RingHandoff       violated:OwnEnds
+MRH_two_out                    MC_RingHandoff       violated:OneOut
+WRH_old_posts                  MC_RingHandoff       violated:NoOldPost
+WRH_data_waits                 MC_RingHandoff       violated:IoRescued
+RH_accept_ends                 MC_RingHandoff       pass
+MRH_adopt_accepts              MC_RingHandoff       violated:IoRescued
+WRH_accept_waits               MC_RingHandoff       violated:IoRescued

@@ -673,6 +673,22 @@ impl Source {
         after.run();
     }
 
+    /// `shard` let go of the source, its eviction from there done, on the shard's own thread: each
+    /// side `shard` claimed gives the claim up (`Side::give_up`), so that a call whose heavy fence
+    /// fails no longer leaves its work to a shard that may run nothing again
+    /// (proofs/tla/side_biased/SideBiased.tla, `ClaimStops`).
+    pub(crate) fn give_up_claims(self: &Arc<Self>, shard: &Arc<Shared>) {
+        let who = Arc::as_ptr(shard) as usize;
+        let hooks = SourceHooks {
+            claim: Some(shard),
+            ..self.hooks()
+        };
+        let mut after = After::default();
+        self.read.give_up(who, &mut after, &hooks);
+        self.write.give_up(who, &mut after, &hooks);
+        after.run();
+    }
+
     /// The shard the source is registered with is going away: the
     /// registration goes, and every task waiting on the source is woken, to
     /// register it where it polls next.

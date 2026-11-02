@@ -97,6 +97,13 @@ fn witness(path: usize) {
 /// `intent` bit: a foreign call's heavy fence failed.
 const UNFENCED: u8 = 2;
 
+/// `owner` bit, beside the claimant's address: the claimant gave its claim up as its shard let go
+/// of the source (`Side::give_up`), and holds the side biased no more until it claims it again.
+const LEFT: usize = 1;
+
+/// The flags a holder does work for.
+const WORK: u8 = WAITING | READY | DEFER | REQ;
+
 /// Slots of a side's contended set: polls of more tasks than this at one
 /// moment share the last slot.
 const SIDE_SLOTS: usize = 4;
@@ -145,6 +152,11 @@ pub(crate) trait Hooks<S> {
     /// source is homed on that shard, else 0: the caller is then the owner
     /// of a biased side.
     fn owner(&self) -> usize {
+        0
+    }
+    /// The address of the shard the calling thread runs, inside it, wherever the source is
+    /// homed; 0 for none.
+    fn runs(&self) -> usize {
         0
     }
     /// This caller just claimed the side as its owner.
@@ -282,16 +294,21 @@ impl<S> Side<S> {
     }
 
     /// Whether `who`, which is not the side's owner, claims the side as its owner now: only
-    /// while no shard has.
+    /// while no shard has, or once `who` itself gave its claim up (`give_up`). The full fence
+    /// after the claim orders it before this take's look at `intent`, against a call whose heavy
+    /// fence failed and that found no claim (`unserved`): either it sees this claim, or this take
+    /// sees its intent.
     #[cold]
     #[inline(never)]
     fn claim(&self, who: usize, hooks: &impl Hooks<S>) -> bool {
-        let claimed = self.owner.load(Ordering::Relaxed) == 0
+        let current = self.owner.load(Ordering::Relaxed);
+        let claimed = (current == 0 || current == who | LEFT)
             && self
                 .owner
-                .compare_exchange(0, who, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(current, who, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok();
         if claimed {
+            full_fence(Ordering::SeqCst);
             hooks.claimed();
         }
         claimed
@@ -369,24 +386,81 @@ impl<S> Side<S> {
     }
 
     /// A foreign call whose heavy fence failed (`intent` is up): `own` is not
-    /// read, since only the fence orders it. With no owner claimed, none can
-    /// hold biased (a later claimant sees `intent`), so the side goes shared
-    /// and is taken through the word. Otherwise the call's flag is left and
-    /// the owner, which sees `intent` at its next release, is asked to take
-    /// the side and let go of it. A claimant whose notice is not in yet has
-    /// not held either, and takes through the word after it sees `intent`.
+    /// read, since only the fence orders it. When no thread may hold the side biased now
+    /// (`none_holds_biased`), the side goes shared and is taken through the word. Otherwise the
+    /// call's flag is left and the owner, which sees `intent` at its next release, is asked to take
+    /// the side and let go of it; a claimant that gave its claim up meanwhile may have looked for
+    /// work before the flag was left, so the call looks at the claim again (`claim_given_up`). A
+    /// claimant whose notice is not in yet has not held either, and takes through the word after it
+    /// sees `intent`.
     fn unserved(&self, extra: u8, hooks: &impl Hooks<S>) -> Take<'_, S> {
         full_fence(Ordering::SeqCst);
-        if self.owner.load(Ordering::SeqCst) == 0 {
+        if self.none_holds_biased(hooks) {
             self.shared.store(true, Ordering::Relaxed);
             return self.take_word(extra);
         }
         self.intent.fetch_or(UNFENCED, Ordering::SeqCst);
         if extra != 0 {
             self.state.fetch_or(extra, Ordering::AcqRel);
+            if let Some(held) = self.claim_given_up() {
+                return Take::Held(held);
+            }
             hooks.nudge();
         }
         Take::Unserved
+    }
+
+    /// For a call whose heavy fence failed, after a full fence: whether no thread may hold the
+    /// side biased now. No shard claimed it, so none holds biased (a later claimant sees
+    /// `intent`); the claimant gave its claim up (`give_up`), after its last biased hold, and
+    /// holds biased again only once it claimed again, which sees `intent`; or the claimant is the
+    /// shard this thread runs, and this thread's own store of `own`, which needs no fence, says it
+    /// holds nothing.
+    fn none_holds_biased(&self, hooks: &impl Hooks<S>) -> bool {
+        let owner = self.owner.load(Ordering::SeqCst);
+        owner == 0
+            || owner & LEFT != 0
+            || (owner == hooks.runs() && self.own.load(Ordering::Relaxed) == 0)
+    }
+
+    /// For a call whose heavy fence failed and that left its work: the side, held through the
+    /// word, if the claimant gave its claim up meanwhile. Its look for work came either after the
+    /// work was left, and it does it, or before this look, which then sees the claim given up
+    /// (both sides fence between their store and their load).
+    fn claim_given_up(&self) -> Option<Held<'_, S>> {
+        full_fence(Ordering::SeqCst);
+        if self.owner.load(Ordering::SeqCst) & LEFT == 0 {
+            return None;
+        }
+        self.shared.store(true, Ordering::Relaxed);
+        match self.take_word(0) {
+            Take::Held(held) => Some(held),
+            Take::Busy | Take::Left | Take::Unserved => None,
+        }
+    }
+
+    /// The shard `who` claimed the side and lets go of its source, on its own thread, holding no
+    /// side: the claim is given up (`LEFT`), so that a call whose heavy fence fails takes the side
+    /// itself rather than leave its work to a shard that may run nothing again. Work such a call
+    /// left before it saw the claim go is done here, through the word, the side shared first. The
+    /// shard claims the side again at its next take as its owner.
+    pub(crate) fn give_up(&self, who: usize, after: &mut After, hooks: &impl Hooks<S>) {
+        if self.shared.load(Ordering::Acquire)
+            || self
+                .owner
+                .compare_exchange(who, who | LEFT, Ordering::SeqCst, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        full_fence(Ordering::SeqCst);
+        if self.state.load(Ordering::SeqCst) & WORK == 0 {
+            return;
+        }
+        self.shared.store(true, Ordering::Relaxed);
+        if let Take::Held(held) = self.take_word(0) {
+            held.release(after, hooks);
+        }
     }
 
     /// The side, taken as `role` does, raising `extra` as the word's take
@@ -575,10 +649,7 @@ impl<S> Side<S> {
             Take::Held(held) => Some(held),
             Take::Busy => self.contend(waker, false),
             Take::Left => self.contend(waker, true),
-            Take::Unserved => {
-                self.leave_waker(waker, hooks);
-                None
-            }
+            Take::Unserved => self.leave_waker(waker, hooks),
         }
     }
 
@@ -616,13 +687,18 @@ impl<S> Side<S> {
     }
 
     /// A poll whose foreign take got no fence: its waker and the waiting bit
-    /// are left, then the owner is asked to take the side and wake it.
-    fn leave_waker(&self, waker: &Waker, hooks: &impl Hooks<S>) {
+    /// are left, then the owner is asked to take the side and wake it, unless the claimant gave
+    /// its claim up meanwhile (`claim_given_up`): the poll holds the side then.
+    fn leave_waker(&self, waker: &Waker, hooks: &impl Hooks<S>) -> Option<Held<'_, S>> {
         // A false register woke the waker already: the poll comes again.
         if self.contended().register(waker) {
             self.state.fetch_or(WAITING, Ordering::AcqRel);
+            if let Some(held) = self.claim_given_up() {
+                return Some(held);
+            }
             hooks.nudge();
         }
+        None
     }
 
     /// The driver's part for an edge, after side-local work `defer` (say,
@@ -725,7 +801,7 @@ impl<S> Side<S> {
     fn release_biased_came(&self) -> bool {
         self.switch_if_unfenced();
         let left = self.state.fetch_or(0, Ordering::SeqCst);
-        if left & (WAITING | READY | DEFER | REQ) == 0 {
+        if left & WORK == 0 {
             return false;
         }
         let held = self.state.fetch_or(BUSY, Ordering::AcqRel) & BUSY == 0;

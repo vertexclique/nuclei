@@ -78,11 +78,13 @@ pub(crate) struct Workers {
 }
 
 /// A shard for a runner to run: worker place `place`, watched through
-/// `slot` with the handoff on.
+/// `slot` with the handoff on; `handed`: the monitor took it from another
+/// thread.
 struct Run {
     place: usize,
     shard: Owned,
     slot: Option<Arc<Slot>>,
+    handed: bool,
 }
 
 impl From<Gift> for Run {
@@ -91,6 +93,7 @@ impl From<Gift> for Run {
             place: gift.place,
             shard: gift.shard,
             slot: Some(gift.slot),
+            handed: true,
         }
     }
 }
@@ -262,6 +265,7 @@ impl Workers {
             place: index,
             shard: Owned(shard),
             slot,
+            handed: false,
         };
         match Self::spawn_thread(inner, run, life) {
             Ok(()) => {
@@ -474,6 +478,7 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
         place,
         shard: Owned(shard),
         slot,
+        handed,
     } = run;
     let cores = &workers.start.cores;
     if !cores.is_empty() {
@@ -489,6 +494,9 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
     context::set_home(Arc::clone(&home));
     let worked = {
         let _current = context::enter_watched(&shard, slot.as_deref());
+        if handed {
+            shard.adopt();
+        }
         shard.run_worker()
     };
     if worked == Worked::Detached

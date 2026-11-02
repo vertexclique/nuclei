@@ -631,10 +631,11 @@ each with a mutation of the code that makes one of them fail.
 
 ## The side's guard biased to its owner
 
-`side_biased` (`tla/side_biased/SideBiased.tla`) checks the owner-biased guard (`Side::try_hold`,
-`Side::poll`, `Side::contend`, `Side::defer`, `Side::take_for_request` and
-`Held::release_or_again` in `src/io/side.rs`; the heavy fence is `heavy` and `heavy_retried` in
-`src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
+`side_biased` (`tla/side_biased/SideBiased.tla`) checks the owner-biased guard (`Side::role`,
+`Side::claim`, `Side::try_biased`, `Side::take_foreign`, `Side::poll`, `Side::contend`,
+`Side::defer`, `Side::take_for_request`, `Held::release_or_again`, `Side::release_biased`,
+`Side::unserved` and `Side::give_up` in `src/io/side.rs`; the heavy fence is `heavy` and
+`heavy_retried` in `src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
 x86's do. A socket's side has an owner, the thread running its home shard, which serves the
 driver's edges. The owner takes the side with a plain store of its word `own`, a compiler fence
 and a plain load of the foreign word `intent`: zero, it holds; one, it undoes `own` and takes
@@ -662,7 +663,19 @@ takes the side next anyway). The owner, letting go of `own` at its fallback or i
 switches the side to shared when it sees UNFENCED (`Side::switch_if_unfenced`), so the woken poll
 takes through the word.
 
-40 configurations: 19 that must pass (the owner and one foreign thread polling twice; one making a
+The claimant may never take the side again. Its shard may let go of the source for good
+(`ClaimStops`: a thread's own shard whose `block_on` returned, a worker that went): it gives its
+claim up after its last hold, with a locked instruction, and looks once more for work a fenceless
+call left before that, which it does through the word (`Side::give_up`, called from
+`Source::give_up_claims` as `src/rt/shard/going.rs` lets go of the sources). A fenceless call that
+finds the claim given up takes the side itself; one that left its work looks at the claim again
+after a full fence of its own (`Side::claim_given_up`), so one of the two looks sees the other's
+store. Or the source may be homed elsewhere while the claimant's thread still runs it (`Rehomed`):
+its own calls are then foreign ones, and when its fence fails it reads its own `own`, which needs
+no fence, holds nothing, and takes the side itself (`Side::none_holds_biased`). A claimant that
+gave its claim up claims the side again at its next take as its owner.
+
+51 configurations: 25 that must pass (the owner and one foreign thread polling twice; one making a
 defer and a request; the owner and two foreign threads polling, and making requests; a handoff
 mid-run beside a foreign thread; a handoff after which the old owner polls and makes a request;
 fences that may fail, with one and two edges, a defer and a request, and a handoff; every fence
@@ -671,7 +684,9 @@ one holder at a time, `NoSpin`, no thread waits for another except asleep until 
 `NoLostWork`, every edge served and no left bit up once everything is finished, and
 `SharedAbsorbing`, shared mode for good, with no deadlock; and `Termination` under weak fairness,
 without and with a handoff, with fences that may fail, and with every fence failing with and
-without an owner), 13 mutations (no heavy fence on the foreign path, an owner that holds without
+without an owner; a claimant shard that lets go of the source for good, with every fence failing
+and with fences that may fail, and its liveness; the source homed elsewhere, with fences that never
+fail and with every fence failing, and its liveness), 17 mutations (no heavy fence on the foreign path, an owner that holds without
 reading `intent`, an owner that trusts a mode still biased over `intent`, a foreign thread that
 holds through its intent alone without switching, a move of the shard while its owner is inside
 a take, a move that leaves the old owner's stores in its buffer, a call that reads `own` after a
@@ -679,10 +694,15 @@ failed fence, and a switch stored before the owner's `own := 0` each break `Excl
 that never looks for left work, one that reads the flag word with a plain load, and a nudge that
 never reaches the owner each end in a deadlock, a lost wake; a release that finds work but does
 not take the side again breaks `NoLostWork`; an owner that never switches on UNFENCED leaves the
-poll failing its fence for ever, breaking `Termination`), and 8 witnesses (a foreign call that
+poll failing its fence for ever, breaking `Termination`; a claim kept as its shard lets go of the
+source, a give-up with no look for work left before it, and a fenceless poll that does not look at
+the claim again after it left its work each end in a deadlock; a claimant's own fenceless call,
+the source homed elsewhere, that leaves its work to itself nudges itself for good, breaking
+`Termination`), and 9 witnesses (a foreign call that
 leaves its work to the owner, a switch to shared mode, a handoff, the owner's release taking the
 side again to wake a waiting poll, and to do a deferred bit a foreign defer left, a failed fence
-the owner's switch serves, a failed fence with no owner that goes shared, a nudge served). The
+the owner's switch serves, a failed fence with no owner that goes shared, a nudge served, a fenceless call that finds the
+claim given up). The
 switch stored before `own := 0` breaks `Exclusive` because the model's hold lasts until that store;
 on x86 the owner touches nothing between them, so it shows the rule rather than a lost update.
 
@@ -1264,6 +1284,35 @@ mutations (a starved reader that waits for a buffer to come back, a starved writ
 poll whose end wakes nobody break `Served`), and 2 witnesses (a reader finds the pool empty; a
 starved side uses its own buffer). `tests/idle_peers.rs` fills the pool of a 512 KiB cap with
 receives of idle peers and checks every other peer is answered.
+
+`tla/ring/RingHandoff.tla` checks a worker's ring handed to a new runner while a request its old
+runner submitted waits in the kernel (`ShardRing::adopt` and `bury` in `src/rt/shard/ring.rs`,
+called by `run_shard` in `src/rt/workers.rs` before the new runner's first drive;
+`RingPoller::adopt` in `src/rt/park/ring.rs` for the ring's wake; `RingMem::adopted` in
+`src/io/source/ring.rs`; `setup_flags` in `src/syscore/linux/iouring/ring/mod.rs`). A watched
+worker's ring is not single-issuer, so the kernel runs a request's completion as work queued to
+the thread that submitted it, which a thread in a wait no signal ends never runs. The new runner
+cancels each poll the old runner armed (a stream's or a datagram's poll, a poll for room, the
+ring's wake read), tells its side it ended so the side arms another of its own, and keeps the old
+one as a zombie whose late completions go nowhere and whose end only frees it; a data operation
+and an accept are left as they are. An entry still waiting to reach the kernel is left alone (the
+new runner submits it), and the completions already posted are delivered before the zombies are
+made: both matter when one runner after another blocks at once, which one take cannot show, so
+`tests/cadence.rs` checks them. 13 configurations: 5 that must pass (the old runner asleep
+where a signal wakes it; in a wait no signal ends, for good and until it comes back; a data
+operation with the old runner asleep where a signal wakes it; an accept with the old runner coming
+back; with `OneOut`, the side has one request out as its own, `OwnEnds`, it takes only that
+request's completions, `IoRescued`, the reader gets the datum, and `ZombieFreed`), 5 mutations (no
+adopt, as before the fix, and a ring that runs a thread's completion work only at its next enter,
+`IORING_SETUP_COOP_TASKRUN`, which the new runner asleep in its wait never reaches, each break
+`IoRescued`; a zombie's completions handed to the side break `OwnEnds`; an adopt that does not tell
+the side breaks `OneOut`; an adopt of an accept breaks `IoRescued` even once the old runner is back,
+since the cancelled accept stays its listener's first exclusive waiter until its thread ends it and
+takes the connection's wake), and 3 witnesses (the old runner posting late; a data operation, and an
+accept, waiting for an old runner that never comes back: what the adopt leaves).
+`tests/handoff_uninterruptible.rs` holds the old runner in `clone(CLONE_VFORK)`, which waits
+killable only, and checks a receive, a write waiting for room, a task spawned from another thread
+and a timer go on meanwhile.
 
 `lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`,
 `take_out` in `src/rt/shard/ring.rs`): every entry names its source's file by a slot of the
@@ -2194,6 +2243,18 @@ has no `intent` to raise; a send with no look at the bit goes out ahead of a byt
 the side; a release that says the side holds nothing while a byte waits there does the same),
 and 1 witness (the owner sends on the bit).
 
+`tla/sendsnow/TakenFull.tla` checks that send when it finds the socket full and the shard is taken
+from its thread before the rest of the same poll (`Source::poll_write_bufs` and `poll_write_any`
+in `src/io/source/write/calls.rs`, `WriteState::found_full` in `src/io/source/write.rs`). The
+send's hold publishes nothing, so the side still says it was only ever its owner's and idle, and
+the shard's driver on its new thread may pass over the write edge the refusal owed, while the old
+thread's poll goes the way of any other thread (its call finds the shard taken). That way asks the
+kernel again under its own hold, which made the side shared, rather than block the side on the
+send's answer. 4 configurations: 2 that must pass (no take; a take between the poll's calls; with
+`BlockedOwed`, a blocked side has an edge owed, queued or left for its holder, and `Sent`), 1
+mutation (the foreign way blocking on the send's answer waits for an edge nothing owes, breaking
+`BlockedOwed`), and 1 witness (the new thread's driver passing over the edge).
+
 ## A queue with a count
 
 `counted` (`tla/counted/Counted.tla`) checks the queue a ring's thread takes items from without
@@ -2266,23 +2327,30 @@ the shard to a spare with a fresh slot. A detached runner's code may still call 
 on the slot it was taken from, once a call around a nested `block_on` whose poll found the take
 ends (`Bracket`'s drop puts that slot back): each such call, a leaf push or a bracket, reads that
 slot's claim, which stays taken for good (`Slot::take` is its last write, `Slot::contest` swaps
-only from pending, and the monitor never claims the old slot again), and stays out. 23
+only from pending, and the monitor never claims the old slot again), and stays out. An IO
+owner's step on such a thread (`Source::send_as_owner`, `Source::here`) first looks at the shard
+the thread runs (`context::running`), which the detach cleared, so it marks nothing (its mark,
+`mark_call`, reads the thread's own slot, cleared too) and goes the way of any other thread, a
+bracket on the old slot that stays out. 25
 configurations: 5 that must pass (two handoffs, a remote push and a bound task: at most one thread
 inside the shard, `Exclusive`, a detached thread staying out, `DetachedStaysOut`, a bound task on
 its creator only; a first poll that makes a call and then never returns, every remote push run
 anyway, `Rescued`; both again, with one handoff and one poll, with the call a leaf push; and the
 leaf push's run with one poll a turn, the taken runner's code making one more call on its old
-slot, `D_safe`); 12
+slot, `D_safe`, which an IO owner's step on that thread marking nothing through its cleared slot,
+`NoMarkWithoutSlot`, joins); 13
 mutations, each of which must break a property (no heavy fence, no second read of the word, no
 look at the claim at a poll's end or in a call into the runtime, a call that looks at its claim
 with no mark first, a leaf push that goes in with no look at its claim, the old runner's slot
 handed on: each breaks `Exclusive`; a runner that clears the taken claim as it detaches, so its
 code's next call goes into the shard the monitor took, breaks `DetachedStaysOut`; the new runner
-taking the bound tasks breaks `BoundOnCreator`; no handoff at all, a call that leaves its mark as it ends, and a leaf push that
+taking the bound tasks breaks `BoundOnCreator`; an IO owner's step that marks its call with no
+look at the shard the thread runs reads the slot a detach cleared and breaks `NoMarkWithoutSlot`; no handoff at all, a call that leaves its mark as it ends, and a leaf push that
 backs out with its mark still up, so a poll that blocks after a call is never seen to block, each
-break `Rescued`); and 6 witnesses (a handoff, a cancel by the monitor, a call into the runtime
+break `Rescued`); and 7 witnesses (a handoff, a cancel by the monitor, a call into the runtime
 from a detached thread, a cancel by the runner, a leaf push backing out on a claim, a detached
-thread's leaf push backing out on its old slot's claim). `tla/handoff/Retarget.tla` checks the waker of a
+thread's leaf push backing out on its old slot's claim, a detached thread's IO owner step going
+the way of any other thread). `tla/handoff/Retarget.tla` checks the waker of a
 `block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
 the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
 1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old

@@ -103,6 +103,18 @@ impl Sq {
         self.tail.wrapping_sub(self.head().load(Ordering::Acquire))
     }
 
+    /// Hands `f` the user data of each entry pushed that the kernel has not consumed yet. Only
+    /// for a ring with no kernel submission thread, which consumes them only at an enter.
+    pub(crate) fn pending(&self, mut f: impl FnMut(u64)) {
+        // Acquire, as in `ready`: a slot the kernel freed is not read.
+        let head = self.head().load(Ordering::Acquire);
+        for at in 0..self.tail.wrapping_sub(head) {
+            // SAFETY: the slot is inside the SQE array and the kernel has not consumed it, so this
+            // thread's own write of it is the last.
+            f(unsafe { (*self.sqes.add((head.wrapping_add(at) & self.mask) as usize)).user_data });
+        }
+    }
+
     /// Free slots left.
     pub(crate) fn space(&self) -> u32 {
         self.entries - self.ready()

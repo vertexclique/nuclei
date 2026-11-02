@@ -22,6 +22,8 @@ W_leaf_back           Handoff     violated:NoLeafBack
 D_safe                Handoff     pass
 M_taken_cleared       Handoff     violated:DetachedStaysOut
 W_stale_back          Handoff     violated:NoStaleBack
+M_owner_skips_running Handoff     violated:NoMarkWithoutSlot
+W_owner_detached      Handoff     violated:NoOwnerDetached
 R_seqcst              Retarget    pass
 M_retarget_relaxed    Retarget    violated:WokenPolled
 W_old_wake            Retarget    violated:NoOldWake

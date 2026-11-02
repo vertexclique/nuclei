@@ -40,13 +40,18 @@ impl Sqe {
         self
     }
 
-    /// Sets the value echoed back in this operation's completion(s).
     /// The entry as the kernel reads it, for a test.
     #[cfg(test)]
     pub(crate) fn raw(&self) -> &IoUringSqe {
         &self.0
     }
 
+    /// The value echoed back in this operation's completion(s).
+    pub(crate) fn data(&self) -> u64 {
+        self.0.user_data
+    }
+
+    /// Sets the value echoed back in this operation's completion(s).
     pub(crate) fn user_data(mut self, user_data: u64) -> Self {
         self.0.user_data = user_data;
         self
