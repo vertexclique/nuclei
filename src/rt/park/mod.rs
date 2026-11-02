@@ -42,6 +42,36 @@ pub(crate) mod iocp;
 #[cfg(windows)]
 pub(crate) use self::iocp::{Notifier, Poller};
 
+#[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
+thread_local! {
+    /// This thread's next notifications a test makes fail, as a failing
+    /// kernel call would.
+    static FAIL_NOTIFIES: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Makes this thread's next `n` notifications fail; returns how many were
+/// still to fail.
+#[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
+pub(crate) fn fail_notifies(n: u32) -> u32 {
+    FAIL_NOTIFIES.replace(n)
+}
+
+/// A notification's kernel call, `post`, or the failure a test asked for
+/// in its place (kqueue's and the port's: an eventfd's write cannot fail).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[inline(always)]
+fn post_notification(post: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NOTIFIES.with(|left| {
+        let fails = left.get() > 0;
+        left.set(left.get().saturating_sub(1));
+        fails
+    }) {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    post()
+}
+
 /// What a registered source became ready for. A hang-up or an error counts
 /// as both: the operations waiting on it then see it.
 #[cfg(readiness)]

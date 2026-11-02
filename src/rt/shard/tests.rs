@@ -133,6 +133,51 @@ fn a_turn_runs_a_bounded_number_of_tasks() {
     });
 }
 
+/// A notification of a sleeping shard that fails is tried again, so the
+/// shard wakes for its work all the same. Only kqueue's `kevent` and the
+/// port's `PostQueuedCompletionStatus` can fail; Linux's eventfd write
+/// cannot. Each round's sender waits for the shard to say it parks, then
+/// sends with its next notification failing; a round whose send found the
+/// shard awake (its notification not made) is run again.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[test]
+fn a_failed_notification_is_tried_again() {
+    let shared = Arc::clone(&context::own_shard().unwrap().shared);
+    for _ in 0..50 {
+        let (tx, rx) = crate::sync::oneshot::channel::<u32>();
+        let sender = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut backoff = Duration::from_micros(50);
+                while !shared.is_parked() {
+                    assert!(Instant::now() < deadline, "the shard never parked");
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(5));
+                }
+                // Into its wait on the kernel, past its last look.
+                std::thread::sleep(Duration::from_millis(20));
+                crate::rt::park::fail_notifies(1);
+                tx.send(7).unwrap();
+                crate::rt::park::fail_notifies(0) == 0
+            })
+        };
+        let start = Instant::now();
+        let got = crate::block_on(crate::time::timeout(Duration::from_secs(10), rx));
+        let took = start.elapsed();
+        let failed_one = sender.join().unwrap();
+        assert_eq!(got.ok().and_then(Result::ok), Some(7));
+        if failed_one {
+            assert!(
+                took < Duration::from_secs(5),
+                "the failed notification was lost: the shard slept {took:?}"
+            );
+            return;
+        }
+    }
+    panic!("no round's notification found the shard asleep");
+}
+
 /// A waker that holds a shard's `Shared`, as the one of a worker's loop
 /// does.
 struct Holds(#[allow(dead_code)] Arc<super::Shared>);

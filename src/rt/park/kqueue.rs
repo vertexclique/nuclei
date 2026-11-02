@@ -356,6 +356,7 @@ impl Notifier {
     /// Wakes the poller, or makes its next wait return at once.
     pub(crate) fn notify(&self) {
         // A failure here means the queue is gone, so nobody waits on it.
-        let _ = submit(&self.queue, &wake_event(0, libc::NOTE_TRIGGER));
+        let _ =
+            super::post_notification(|| submit(&self.queue, &wake_event(0, libc::NOTE_TRIGGER)));
     }
 }

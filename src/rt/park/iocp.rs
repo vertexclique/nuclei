@@ -479,10 +479,20 @@ impl Timer {
 
 impl Notifier {
     pub(crate) fn notify(&self) {
-        // SAFETY: a packet with no operation, on a port that lives as long
-        // as this notifier. A full queue only drops a wake while another
-        // is pending, which wakes the shard all the same.
-        unsafe { PostQueuedCompletionStatus(self.port.handle, 0, WAKE, core::ptr::null_mut()) };
+        // A full queue only drops a wake while another is pending, which
+        // wakes the shard all the same.
+        let _ = super::post_notification(|| {
+            // SAFETY: a packet with no operation, on a port that lives as
+            // long as this notifier.
+            let posted = unsafe {
+                PostQueuedCompletionStatus(self.port.handle, 0, WAKE, core::ptr::null_mut())
+            };
+            if posted == 0 {
+                Err(last_error())
+            } else {
+                Ok(())
+            }
+        });
     }
 }
 
