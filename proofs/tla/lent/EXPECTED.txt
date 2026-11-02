@@ -113,3 +113,8 @@ PF_pos_into_inner              MC_LentFile          pass
 MF_pos_close_at_drop           MC_LentFile          violated:NoCallOnClosed
 MF_pos_into_inner_early        MC_LentFile          violated:NoCallOnClosed
 WF_pos_outlives_drop           MC_LentFile          violated:NoJobAfterDrop
+PO_orphan                      MC_LentOrphan        pass
+MO_pass_cut                    MC_LentOrphan        violated:NoCutPassed
+MO_full_as_cut                 MC_LentOrphan        violated:NoWholeDropped
+WO_dropped                     MC_LentOrphan        violated:NoDropped
+WO_handed_on                   MC_LentOrphan        violated:NoHandedOn
