@@ -299,7 +299,9 @@ D_exit:
     \* The compare-and-swap that gives the role up: it fails, and the drain passes again,
     \* when the queue changed meanwhile, or when a release asked and somebody waits.
     \* MUTATION exit_ignores_release: the role is given up over a release's request.
-    if dirty \/ (found /\ wakeFront /\ Mutation # "exit_ignores_release") then
+    \* MUTATION exit_ignores_dirty: the role is given up over a dirty mark.
+    if (dirty /\ Mutation # "exit_ignores_dirty")
+       \/ (found /\ wakeFront /\ Mutation # "exit_ignores_release") then
         goto D_clear;
     else
         draining := FALSE;                  \* the role is free again
@@ -378,9 +380,12 @@ variables
     wasGranted = FALSE; \* the cancelled request had been granted first
 begin
 S_next:
-    \* The next operation, or the end of the program.
+    \* The next operation, or the end of the program. "hold" keeps the sender's handle
+    \* until the receiver's program is over.
     if i > Len(Prog[self]) then
         goto S_drop_sender;
+    elsif Prog[self][i].op = "hold" then
+        goto S_hold;
     else
         req := <<self, i>>;                 \* this operation's request
     end if;
@@ -449,7 +454,8 @@ S_repoll:
     end if;
 S_granted:
     \* The future looks at the grant: the close (an error) or its slots.
-    if closedG[req] then
+    \* MUTATION close_grant_as_ok: the close's grant is taken for slots.
+    if closedG[req] /\ Mutation # "close_grant_as_ok" then
         status[req] := "failed";            \* the close: the operation fails
         goto S_failed;
     else
@@ -460,14 +466,21 @@ S_granted:
     end if;
 S_failed:
     \* The failed wait's drop (`Reserve`'s drop): wake a receiver that waits for a closed
-    \* channel to go idle.
-    if Finished then wake_rx(); end if;
+    \* channel to go idle (`wake_if_finished`).
+    \* MUTATION no_idle_wake: none of `wake_if_finished`'s calls wakes anybody.
+    if Finished /\ Mutation # "no_idle_wake" then wake_rx(); end if;
     goto S_op_done;
 S_cancel:
     \* `Wait::cancel`: withdraw the node, unless a grant got there first.
     if nodeState[req] = "granted" then
         wasGranted := TRUE;                 \* too late to withdraw: a grant came first
-        if closedG[req] then
+        \* MUTATION release_close_grant: the close's grant is given back as the slots
+        \* asked for, which it never carried.
+        if closedG[req] /\ Mutation = "release_close_grant" then
+            inHand[self] := inHand[self] + OpOf(req).n;
+            left := OpOf(req).n;
+            status[req] := "returned";
+        elsif closedG[req] then
             status[req] := "failed";        \* granted the close: nothing to give back
         else
             inHand[self] := inHand[self] + owned[req];   \* granted slots: give them back
@@ -510,7 +523,7 @@ S_cancel_wake:
     \* The cancelled wait's drop wakes a receiver whose closed channel just went idle.
     left := 0;                              \* nothing left to give back
     wasGranted := FALSE;                    \* and whether a grant came first is no longer asked
-    if Finished then wake_rx(); end if;
+    if Finished /\ Mutation # "no_idle_wake" then wake_rx(); end if;
     goto S_op_done;
 S_use:
     \* With its slots in hand, the operation puts `use` values in (a "cancel" puts none).
@@ -561,7 +574,11 @@ S_give_back:
 S_give_wake:
     \* `Chan::give_back`: wake a receiver whose closed channel just went idle.
     left := 0;                              \* nothing left to give back
-    if Finished then wake_rx(); end if;
+    if Finished /\ Mutation # "no_idle_wake" then wake_rx(); end if;
+S_hold:
+    \* "hold": the handle is kept until the receiver's program is over, so only the close
+    \* can end the channel meanwhile.
+    await pc[Rx] = "Done";
 S_op_done:
     \* On to the next operation.
     i := i + 1;                             \* the next position in the program
@@ -571,7 +588,8 @@ S_drop_sender:
     txCount := txCount - 1;
 S_drop_wake:
     \* ... and the last sender wakes the receiver, whose channel has ended.
-    if txCount = 0 then wake_rx(); end if;
+    \* MUTATION last_drop_no_wake: it goes without waking it.
+    if txCount = 0 /\ Mutation # "last_drop_no_wake" then wake_rx(); end if;
 end process;
 
 (***************************************************************************)
@@ -750,6 +768,9 @@ ExactlyOnce ==
 PerSenderOrder ==
     \A j, m \in DOMAIN received :
         j < m /\ received[j][1] = received[m][1] => received[j][2] < received[m][2]
+
+\* A value is pushed only through a permit a sender holds: no sender's permits go below zero.
+PermitsSound == \A s \in Senders : held[s] >= 0
 
 \* All the safety properties together.
 Safe == Conservation /\ FifoFair /\ CloseSemantics /\ CloseReturnsShare
