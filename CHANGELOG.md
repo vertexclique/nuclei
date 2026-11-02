@@ -32,6 +32,12 @@
   system's time before it looks at the mark, and a pause marks the clock before it reads its time
   (`proofs/tla/clock/ClockRead.tla`); a clock that was paused or advanced reads the system's time
   once per reading, as before.
+- **A precise sleep ends on time after the running clock is advanced** (epoll, kqueue). The
+  poller's own timer counts the system's time but was armed again only when the deadline on the
+  clock changed: after `time::advance` on a running clock it stayed at the deadline as the system
+  saw it before, up to a millisecond late, or the advance late. It is now armed for the deadline
+  as the system sees it (`proofs/tla/precise`, the `key_on_clock` mutation). A clock nobody
+  paused or advanced pays nothing for it.
 
 ### Changed
 

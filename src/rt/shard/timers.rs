@@ -112,7 +112,18 @@ impl Shard {
         let now = inner.clock.now();
         if !inner.clock.is_paused() {
             let wait = next.map(|at| at.saturating_duration_since(now));
-            self.arm_precise(parking, earliest, wait);
+            // The poller's own timer counts the system's time, so it is given
+            // the deadline as the system sees it: an advance moves that, the
+            // deadline on the clock staying, and the timer is armed again
+            // (proofs/tla/precise, `M_key_on_clock`).
+            let system = earliest.zip(wait).map(|((at, precise), wait)| {
+                let at = inner
+                    .clock
+                    .system_instant(at)
+                    .unwrap_or_else(|| Instant::now() + wait);
+                (at, precise)
+            });
+            self.arm_precise(parking, system, wait);
             return wait;
         }
         if next.is_some_and(|at| at <= now) {

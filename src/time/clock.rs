@@ -326,6 +326,19 @@ impl Clock {
         }
     }
 
+    /// The system's instant at which a running clock reads `at`: where a
+    /// timer the system counts (a poller's own) ends for that deadline.
+    /// `None` past what an instant holds.
+    pub(crate) fn system_instant(&self, at: Instant) -> Option<Instant> {
+        let skew = self.skew.load(Ordering::Acquire);
+        let by = Duration::from_nanos(skew.unsigned_abs());
+        if skew >= 0 {
+            at.checked_sub(by)
+        } else {
+            at.checked_add(by)
+        }
+    }
+
     /// Moves a paused clock forward to `at` (nanoseconds after the origin),
     /// if it is behind it.
     pub(crate) fn advance_to_nanos(&self, at: u64) {
