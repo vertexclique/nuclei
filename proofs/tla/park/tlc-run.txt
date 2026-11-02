@@ -29,3 +29,42 @@ MS_no_look_again                  1712        775      1  violated:NothingLeft  
 WS_hand_back                       596        281      1  violated:NoHandBack                   violated:NoHandBack                   yes
 
 results matching EXPECTED.txt: 24 of 24
+
+Rechecked as CI ran them: TLA+ run 41460094467 on 569d1418, 2026-11-02, one worker each (the
+share jobs of .github/workflows/tla.yml). These times replace the ones above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+P_one                             2511        980      1  pass                                  pass                                  yes
+P_three                         644151     154004      3  pass                                  pass                                  yes
+P_live                           45651      13608      2  pass                                  pass                                  yes
+M_no_recheck                       807        333      1  deadlock                              deadlock                              yes
+M_check_first                      723        309      1  deadlock                              deadlock                              yes
+W_notify                           343        158      1  violated:NoNotify                     violated:NoNotify                     yes
+W_recheck                          165         80      2  violated:NoRecheckFind                violated:NoRecheckFind                yes
+W_spurious                         780        313      1  violated:NoSpurious                   violated:NoSpurious                   yes
+P_timer                           5607       2420      1  pass                                  pass                                  yes
+P_timer_live                    109510      35174      3  pass                                  pass                                  yes
+M_drive_waits                     1826        826      2  deadlock                              deadlock                              yes
+W_drive_fire                       158         82      1  violated:NoDriveFire                  violated:NoDriveFire                  yes
+P_proactor                          65         34      1  pass                                  pass                                  yes
+M_handshake_wake                    77         44      1  deadlock                              deadlock                              yes
+P_full                            6536       2842      1  pass                                  pass                                  yes
+P_full_live                     124960      40322      5  pass                                  pass                                  yes
+M_no_submit_first                   72         44      1  violated:SleepSeesWake                violated:SleepSeesWake                yes
+M_no_submit_first_remote           838        359      1  violated:SleepSeesWake                violated:SleepSeesWake                yes
+W_out_fire                          44         29      2  violated:NoOutFire                    violated:NoOutFire                    yes
+P_notify_fails                  122539      35032      5  pass                                  pass                                  yes
+M_notify_swallowed                1893        761      1  deadlock                              deadlock                              yes
+M_unregistered_wait                 61         32      2  deadlock                              deadlock                              yes
+PS_safe                           4144       1797      1  pass                                  pass                                  yes
+PS_live                           4144       1797      2  pass                                  pass                                  yes
+MS_check_first                     372        211      1  violated:NothingLeft                  violated:NothingLeft                  yes
+MS_no_pusher_drop                  823        384      1  violated:NothingLeft                  violated:NothingLeft                  yes
+MS_one_pass                       1154        540      1  violated:NothingLeft                  violated:NothingLeft                  yes
+WS_pusher_drain                    937        437      1  violated:NoPusherDrain                violated:NoPusherDrain                yes
+WS_second_pass                     101         55      1  violated:NoSecondPass                 violated:NoSecondPass                 yes
+MS_no_role                          79         46      1  violated:OneTaker                     violated:OneTaker                     yes
+MS_no_look_again                  1712        775      1  violated:NothingLeft                  violated:NothingLeft                  yes
+WS_hand_back                       596        281      1  violated:NoHandBack                   violated:NoHandBack                   yes
+
+results matching EXPECTED.txt: 32 of 32

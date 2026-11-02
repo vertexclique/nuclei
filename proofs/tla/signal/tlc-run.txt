@@ -12,3 +12,23 @@ WG_coalesce                         19         17      1  violated:NoCoalesce   
 WG_pump_wake                       837        480      1  violated:NoPumpWake                   violated:NoPumpWake                   yes
 
 results matching EXPECTED.txt: 7 of 7
+
+Rechecked as CI ran them: TLA+ run 41460094467 on 569d1418, 2026-11-02, one worker each (the
+share jobs of .github/workflows/tla.yml). These times replace the ones above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+SG_safe                          12736       5340      1  pass                                  pass                                  yes
+SG_live                          12736       5340      2  pass                                  pass                                  yes
+MG_write_first                   25354      10432      1  violated:SeesAll                      violated:SeesAll                      yes
+MG_dispatch_first                72854      25900      3  violated:SeesAll                      violated:SeesAll                      yes
+MG_no_recheck                     8210       3444      1  violated:SeesAll                      violated:SeesAll                      yes
+WG_coalesce                         19         17      1  violated:NoCoalesce                   violated:NoCoalesce                   yes
+WG_pump_wake                       837        480      1  violated:NoPumpWake                   violated:NoPumpWake                   yes
+SP_safe                          10567       4446      2  pass                                  pass                                  yes
+SP_live                          10567       4446      2  pass                                  pass                                  yes
+MP_pump_dropped                   4290       1894      2  violated:SeesAll                      violated:SeesAll                      yes
+MP_no_wake_at_drop                8219       3440      1  violated:SeesAll                      violated:SeesAll                      yes
+MP_wake_before_down               8537       3850      1  violated:SeesAll                      violated:SeesAll                      yes
+WP_restart                         623        342      1  violated:NoRestart                    violated:NoRestart                    yes
+
+results matching EXPECTED.txt: 13 of 13

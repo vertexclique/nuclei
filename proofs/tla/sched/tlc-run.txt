@@ -1,0 +1,14 @@
+TLC run of every configuration in proofs/tla/sched, as CI ran them: TLA+ run 41460094467 on 569d1418,
+2026-11-02, one worker each (the share jobs of .github/workflows/tla.yml), rows as
+proofs/tla/run_tlc.sh printed them.
+
+configuration                generated   distinct    sec  result                                expected                              match
+S_fair                           46871      36394      2  pass                                  pass                                  yes
+S_fair_future                   381095     276674      2  pass                                  pass                                  yes
+M_no_lifo_cap                    31360      25432      1  violated:Served                       violated:Served                       yes
+M_no_inbox_interval               2683       2297      1  violated:Served                       violated:Served                       yes
+M_home_after_empty                9973       8040      1  violated:Served                       violated:Served                       yes
+M_owed_grows                    267782     201113      2  violated:Served                       violated:Served                       yes
+W_home_over_inbox                  693        647      1  violated:NoHomeOverInbox              violated:NoHomeOverInbox              yes
+
+results matching EXPECTED.txt: 7 of 7
