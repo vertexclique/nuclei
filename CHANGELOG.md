@@ -25,6 +25,16 @@
   system resources with `ERROR_NO_SYSTEM_RESOURCES`. Only `WSAEMFILE` paused the stream; the other
   two ended it for good, though the backlog would be served once resources came back. All three
   now pause it, as `EMFILE` and `ENFILE` do on unix.
+- **A datagram received ahead is never cut** (Windows; and io_uring once its receive group ran
+  dry). A port receives a UDP datagram ahead into a buffer of the pool for the call that waits, and
+  sized that buffer by the call's length: a look at the sender (`peek_sender`, which asks for no
+  bytes on Windows) or a short peek took a 1400-byte datagram into 512 bytes, the cut completed as
+  a success, and the next `recv_from` got the first 512 bytes as the whole datagram. The buffer of
+  a receive ahead now holds the largest UDP datagram whatever the call asked for, as the ring's
+  receive group does; a pool with no such buffer has the port look with a zero-byte receive and the
+  task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
+  "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
+  buffer of the pool while it waits, where it held one of its own length.
 
 ### Changed
 

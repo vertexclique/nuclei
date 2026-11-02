@@ -164,7 +164,7 @@ impl ReadState {
             let multi = !self.dry && issuer.multishot_datagrams(kind);
             #[cfg(not(ring))]
             let multi = false;
-            match self.datagram_want(multi, len, after) {
+            match self.datagram_want(multi, after) {
                 Some(want) => want,
                 // No buffer of the pool: a poll that holds none, and the task
                 // receives into its own buffer (`task_receives`).
@@ -225,9 +225,9 @@ impl ReadState {
     }
 
     /// The datagram receive to go out: a multishot one into the receive
-    /// group (`multi`), or one into a buffer of the pool that holds `len`
-    /// whole; `None` while the pool has none.
-    fn datagram_want(&mut self, multi: bool, len: usize, after: &mut After) -> Option<Want> {
+    /// group (`multi`), or one into a buffer of the pool that holds any UDP
+    /// datagram whole; `None` while the pool has none.
+    fn datagram_want(&mut self, multi: bool, after: &mut After) -> Option<Want> {
         #[cfg(ring)]
         if multi {
             self.multi = true;
@@ -236,10 +236,11 @@ impl ReadState {
         #[cfg(not(ring))]
         let _ = multi;
         // Only UDP is received ahead, and no UDP datagram is longer than its
-        // length field counts: a larger buffer of the task's needs no larger
-        // one of the pool.
-        self.buffer(len.min(UDP_MAX), true, after)
-            .map(Want::RecvFrom)
+        // length field counts. What comes ahead may go to another call than
+        // the one that asked (a look at the sender asks for none, a receive
+        // may be given up), and a cut datagram completes as a success: so the
+        // buffer holds the largest, whatever was asked (proofs/tla/ring/RingRecv.tla).
+        self.buffer(UDP_MAX, true, after).map(Want::RecvFrom)
     }
 
     /// A receive into a buffer of the pool completed.

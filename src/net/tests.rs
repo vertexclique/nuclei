@@ -1006,6 +1006,8 @@ mod reset;
 
 mod send_file;
 
+mod udp_ahead;
+
 mod zero_copy;
 
 /// Whether `fd`'s kernel counts what its reads leave (`TCP_INQ`).

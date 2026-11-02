@@ -1211,8 +1211,9 @@ copied into the write-behind).
 `tla/ring/RingRecv.tla` checks a datagram socket's receives (`receive_now` and
 `datagram_ready` in `src/io/source/read/datagram.rs`, the bound in `datagram_want` and the ring's
 poll armed in `submit_ops`, `src/io/source/read/ops.rs`, its arrivals in `take_arrival`, the edge
-in `serve`), on epoll or kqueue and on a ring. The same multishot poll serves a stream read by
-readiness on a ring, which `tla/ring/RingPoll.tla` checks.
+in `serve`; on a port `receive`, `receive_starved` and `PortMem::RecvFrom` in
+`src/io/source/port.rs`), on epoll or kqueue, on a ring and on a Windows completion port. The same
+multishot poll serves a stream read by readiness on a ring, which `tla/ring/RingPoll.tla` checks.
 A peer sends a small datagram and then the largest the socket carries, which for a Unix socket
 is more than the pool's largest buffer holds; the task receives each into a buffer that holds
 it, maybe asking first whether the socket is readable. The task receives a datagram itself into
@@ -1235,7 +1236,15 @@ the pool's largest buffer, a ring's UDP receive ahead into a buffer below the la
 and a ring that receives a Unix datagram ahead for a task that receives it itself break `NoCut`;
 a poll, and an edge, that wake nobody, and a call that waits behind the armed poll as behind an
 operation out, break `Termination`), and 2 witnesses (a call that waits for the poll, a datagram
-received ahead and taken).
+received ahead and taken). A port receives UDP ahead too, into a buffer of the pool that holds the
+largest datagram whatever the call that waits asked for, a cut datagram completing as a success
+(`STATUS_BUFFER_OVERFLOW`); with no such buffer in the pool it looks with a zero-byte receive that
+leaves the datagram queued, and the task receives it itself once the look said one came. 7 more
+configurations: 4 that must pass (UDP on a port received ahead, and on a port the pool has no
+buffer for, with `NoCut` and `InOrder`, and `Termination` for each), 2 mutations (a receive ahead
+into a buffer as large as the call that waits asked for, as a port's was, and a ring's into the pool
+once its group ran dry, cuts the largest datagram for a look at the sender, breaking `NoCut`), and a
+witness (a port's zero-byte look, then the task's own receive).
 
 `tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
