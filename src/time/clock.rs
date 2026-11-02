@@ -380,6 +380,14 @@ pub(crate) fn now_nanos() -> u64 {
     if ALTERED.load(Ordering::Relaxed) == 0 {
         return system;
     }
+    altered_now_nanos(system)
+}
+
+/// [`now_nanos`] while some clock is altered, `system` read before the look:
+/// out of line, so the common read keeps its frame as small as it was.
+#[cold]
+#[inline(never)]
+fn altered_now_nanos(system: u64) -> u64 {
     crate::rt::runtime::with_clock(|clock| {
         clock.map_or(system, |clock| clock.now_nanos_from(|| system))
     })
@@ -393,6 +401,13 @@ pub(crate) fn now() -> Instant {
     if ALTERED.load(Ordering::Relaxed) == 0 {
         return system;
     }
+    altered_now(system)
+}
+
+/// [`now`] while some clock is altered, as [`altered_now_nanos`].
+#[cold]
+#[inline(never)]
+fn altered_now(system: Instant) -> Instant {
     crate::rt::runtime::with_clock(|clock| clock.map_or(system, |clock| clock.now_from(system)))
 }
 
