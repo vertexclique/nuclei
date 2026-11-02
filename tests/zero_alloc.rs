@@ -87,6 +87,22 @@ fn burst<F: core::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
+/// A round whose receive is polled before its bytes are sent, so it waits and its socket
+/// registers with the shard: each socket case's warm-up starts with one. A warm-up whose
+/// receives all found their bytes there already leaves the registration, and the slot it
+/// takes in the shard's table, to the measured rounds, as FreeBSD's loopback, which hands
+/// the bytes over on a thread of its own, did now and then.
+async fn waiting_round<R, S>(recv: R, send: S) -> (R::Output, S::Output)
+where
+    R: core::future::Future,
+    S: core::future::Future,
+{
+    nuclei::join!(recv, async {
+        nuclei::task::yield_now().await;
+        send.await
+    })
+}
+
 #[test]
 fn udp_datagrams_to_an_address_allocate_nothing() {
     let rt = nuclei::Runtime::builder()
@@ -102,7 +118,16 @@ fn udp_datagrams_to_an_address_allocate_nothing() {
     drop(rt);
     let to = b.local_addr().unwrap();
     let mut buf = [0u8; 64];
+    let mut primed = false;
     let made = steady(async || {
+        if !primed {
+            primed = true;
+            let (got, sent) =
+                waiting_round(b.recv_from(&mut buf), a.send_to(b"datagram", to)).await;
+            got.unwrap();
+            sent.unwrap();
+            return;
+        }
         a.send_to(b"datagram", to).await.unwrap();
         b.recv_from(&mut buf).await.unwrap();
     });
@@ -127,7 +152,15 @@ fn connected_udp_allocates_nothing() {
     });
     drop(rt);
     let mut buf = [0u8; 64];
+    let mut primed = false;
     let made = steady(async || {
+        if !primed {
+            primed = true;
+            let (got, sent) = waiting_round(b.recv(&mut buf), a.send(b"datagram")).await;
+            got.unwrap();
+            sent.unwrap();
+            return;
+        }
         a.send(b"datagram").await.unwrap();
         b.recv(&mut buf).await.unwrap();
     });
@@ -153,7 +186,18 @@ fn a_tcp_round_trip_allocates_nothing() {
     });
     drop(rt);
     let mut buf = [0u8; 64];
+    let mut primed = false;
     let made = steady(async || {
+        if !primed {
+            primed = true;
+            let (got, sent) = waiting_round(server.recv(&mut buf[..4]), client.send(b"ping")).await;
+            let mut got = got.unwrap();
+            sent.unwrap();
+            while got < 4 {
+                got += server.recv(&mut buf[got..4]).await.unwrap();
+            }
+            return;
+        }
         client.send(b"ping").await.unwrap();
         let mut got = 0;
         while got < 4 {
