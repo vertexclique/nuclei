@@ -65,6 +65,37 @@
   fat LTO (1 more, in the general read's frame). Counted as the ops gate counts them, every row is
   at or below what it was, and CI's budgets in `ci/op_budget.txt` were lowered to match.
 
+- **A spawn or wake from a task's code on a watched worker pushes as a leaf.** Such a call put
+  the task on its shard through a bracket out of line: the call's mark, the push and the mark's
+  end, in a function that saved six registers to do it. A push into the shard's empty LIFO slot,
+  the usual one, now first tries a leaf (`context::push_lifo_marked`): the call marked and its
+  claim read as a bracket does, the task put in the slot and the poll's word put back. A claim
+  up, a slot that holds a task or a task of another shard puts the word back as it found it and
+  takes the full bracket, which settles the claim (`Slot::mark_unless_claimed`;
+  `proofs/tla/handoff`, the leaf push, whose mutations go in with no look at the claim and back
+  out with the mark still up). With the default watch on io_uring, default release build, user
+  instructions per operation: a spawn and its join 790 before, 756 now (631 with the watch off);
+  a oneshot round 1017, 983 (858 off); a bounded channel round 611, 594 (530 off); under fat
+  LTO 757, 715; 864, 822; 530, 509. With the watch off the rows cost what they did, but for the
+  file read, whose read's frame spills one more register: about 3 more of 2606 on a read the page
+  cache serves, and about 4 more of 3692 on io_uring on one it misses, the same on epoll (counted
+  on a 16 MiB file read in 64 KiB pieces, its cached pages dropped with
+  `posix_fadvise(POSIX_FADV_DONTNEED)` before each read).
+- **Still behind: the watch's cost of a task's run, and the file read's spilled register.** A
+  watched worker still runs each task out of line (`run_task_watched`: 33 instructions, about 14
+  of them its frame) where an unwatched one runs it inline, two runs to a spawn and its join: with
+  the watch on, a spawn and its join costs 756 to the 631 of one with it off. Three ways were
+  measured for 0.5.4 and left out, each for what it cost with the watch off. The worker's loop
+  compiled once for a watched slot and once for none, its watched runs inline: a spawn and its
+  join 737 with the watch on, but each stream and datagram row 29 to 38 more with it off under fat
+  LTO and with one codegen unit. The run coming back on its own last word with its mark bit
+  cleared, keeping no epoch and one register less: 746 with the watch on, but with it off the file
+  read about 4 more on a page cache hit and about 10 more on an io_uring miss. The file read's
+  rarer steps (its job in flight, its wait for a write before it, its job's submit) out of line,
+  so a read the page cache serves spills nothing: 2617 to 2596 per read on io_uring, but each read
+  that misses the cache 35 more on io_uring and 75 more on epoll, and with only the submit and the
+  wait out of line still about 20 more on io_uring.
+
 ## 0.5.3
 
 ### Fixed

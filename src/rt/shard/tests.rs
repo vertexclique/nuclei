@@ -216,3 +216,104 @@ fn a_future_that_keeps_waking_itself_still_has_its_io_driven() {
     assert_eq!(got.unwrap(), 1);
     drop(writer.join().unwrap());
 }
+
+/// The leaf push from a task's code on a watched shard (`context::push_lifo_marked`): with no
+/// claim up it fills the empty LIFO slot and puts the poll's word back, so the poll is outside
+/// again; it backs out, the word put back, when the slot holds a task, for another shard, and with
+/// a claim up, which it leaves pending for the full bracket to settle.
+#[test]
+fn a_leaf_push_fills_an_empty_slot_or_backs_out() {
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let slot = crate::rt::handoff::slot::Slot::new(false);
+    let _entered = context::enter_watched(&shard, Some(&slot));
+    let addr = shard.shared_addr();
+    let info = crate::rt::task::ScheduleInfo::new(false);
+    /// A schedule the test never runs: it drops what it is handed.
+    struct Ignore;
+    // SAFETY: the runnable is not touched after the drop.
+    unsafe impl crate::rt::task::Schedule for Ignore {
+        fn schedule(&self, runnable: crate::rt::task::Runnable, _: crate::rt::task::ScheduleInfo) {
+            drop(runnable);
+        }
+    }
+    let task = || crate::rt::task::spawn(async {}, Ignore).0;
+    let (_, polled) = context::poll(&shard.shared, || {
+        let word = slot.word();
+        assert!(
+            context::push_lifo_marked(task(), info, |s| s.shared_addr() == addr).is_ok(),
+            "the leaf did not fill the empty slot"
+        );
+        assert_eq!(slot.word(), word, "the leaf left its mark up");
+        assert_eq!(shard.queued(), 1);
+        let back = context::push_lifo_marked(task(), info, |s| s.shared_addr() == addr)
+            .expect_err("the leaf pushed into a slot that holds a task");
+        assert_eq!(slot.word(), word);
+        let back = context::push_lifo_marked(back, info, |s| s.shared_addr() == addr ^ 1)
+            .expect_err("the leaf pushed for another shard");
+        assert_eq!(slot.word(), word);
+        drop(shard.lifo.take());
+        slot.claim();
+        let back = context::push_lifo_marked(back, info, |s| s.shared_addr() == addr)
+            .expect_err("the leaf pushed with a claim up");
+        assert_eq!(slot.word(), word, "the leaf backed out with its mark up");
+        assert_eq!(shard.queued(), 0);
+        assert!(slot.take(), "the leaf settled the claim");
+        drop(back);
+    });
+    assert_eq!(polled, context::Polled::Detached);
+}
+
+/// The leaf push from a task's code whose shard was taken under a call that has ended since: a
+/// nested poll in the call (a nested `block_on`'s) found the take, and the call's end put the
+/// slot back as the one the task's code runs outside of. The leaf finds the claim up and backs
+/// out, and the full bracket finds no shard.
+#[test]
+fn a_leaf_push_after_a_take_under_a_call_backs_out_to_no_shard() {
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let slot = crate::rt::handoff::slot::Slot::new(false);
+    let _entered = context::enter_watched(&shard, Some(&slot));
+    let addr = shard.shared_addr();
+    let info = crate::rt::task::ScheduleInfo::new(false);
+    /// A schedule the test never runs: it drops what it is handed.
+    struct Ignore;
+    // SAFETY: the runnable is not touched after the drop.
+    unsafe impl crate::rt::task::Schedule for Ignore {
+        fn schedule(&self, runnable: crate::rt::task::Runnable, _: crate::rt::task::ScheduleInfo) {
+            drop(runnable);
+        }
+    }
+    let (_, polled) = context::poll(&shard.shared, || {
+        let word = slot.word();
+        {
+            let call = context::bracketed();
+            assert!(call.shard().is_some(), "the call found no shard");
+            let (_, nested) = context::poll(&shard.shared, || {
+                slot.claim();
+                assert!(slot.take(), "the nested poll was not taken");
+            });
+            assert_eq!(nested, context::Polled::Detached);
+        }
+        assert_eq!(slot.word(), word, "the call's end left another word");
+        let task = crate::rt::task::spawn(async {}, Ignore).0;
+        let back = context::push_lifo_marked(task, info, |s| s.shared_addr() == addr)
+            .expect_err("the leaf pushed on a taken shard");
+        assert_eq!(slot.word(), word, "the leaf left its mark up");
+        assert_eq!(shard.queued(), 0);
+        assert!(
+            context::current(|current| current.is_none()),
+            "the full bracket found the taken shard"
+        );
+        drop(back);
+    });
+    assert_eq!(polled, context::Polled::Detached);
+}

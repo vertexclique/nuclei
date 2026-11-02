@@ -2129,19 +2129,33 @@ a runner leaves its shard for a task's poll (a release store of its word), comes
 poll's end and at each call into the runtime from the task, every owner's path a task's code
 takes included (a store of its word, the compiler's fence, a load of its claim: a call reads the
 word it left first and puts it back, a release store, as it ends; an IO owner's step ends its
-call as it settles what it left, before its wakes), and cancels a pending claim
+call as it settles what it left, before its wakes; the push of a task into the shard's empty
+LIFO slot tries a leaf first, which marks the call and reads its claim as a call does but never
+contests one: it puts its word back and the call takes the full bracket when a claim is up or
+the push is another), and cancels a pending claim
 with a compare-and-swap; the monitor sets the claim pending, runs the heavy fence (every buffer
 flushed at once), reads the word again and takes with the opposite compare-and-swap, then hands
-the shard to a spare with a fresh slot. 15 configurations: 2 that must pass (two handoffs, a
-remote push and a bound task: at most one thread inside the shard, `Exclusive`, a detached thread
-staying out, a bound task on its creator only; a first poll that makes a call and then never
-returns, every remote push run anyway, `Rescued`); 9 mutations, each of which must break a
-property (no heavy fence, no second read of the word, no look at the claim at a poll's end or in
-a call into the runtime, a call that looks at its claim with no mark first, the old runner's slot
-handed on: each breaks `Exclusive`; the new runner taking the bound tasks breaks
-`BoundOnCreator`; no handoff at all, and a call that leaves its mark as it ends, so a poll that
-blocks after a call is never seen to block, each break `Rescued`); and 4 witnesses (a handoff, a
-cancel by the monitor, a call into the runtime from a detached thread, a cancel by the runner). `tla/handoff/Retarget.tla` checks the waker of a
+the shard to a spare with a fresh slot. A detached runner's code may still call into the runtime
+on the slot it was taken from, once a call around a nested `block_on` whose poll found the take
+ends (`Bracket`'s drop puts that slot back): each such call, a leaf push or a bracket, reads that
+slot's claim, which stays taken for good (`Slot::take` is its last write, `Slot::contest` swaps
+only from pending, and the monitor never claims the old slot again), and stays out. 23
+configurations: 5 that must pass (two handoffs, a remote push and a bound task: at most one thread
+inside the shard, `Exclusive`, a detached thread staying out, `DetachedStaysOut`, a bound task on
+its creator only; a first poll that makes a call and then never returns, every remote push run
+anyway, `Rescued`; both again, with one handoff and one poll, with the call a leaf push; and the
+leaf push's run with one poll a turn, the taken runner's code making one more call on its old
+slot, `D_safe`); 12
+mutations, each of which must break a property (no heavy fence, no second read of the word, no
+look at the claim at a poll's end or in a call into the runtime, a call that looks at its claim
+with no mark first, a leaf push that goes in with no look at its claim, the old runner's slot
+handed on: each breaks `Exclusive`; a runner that clears the taken claim as it detaches, so its
+code's next call goes into the shard the monitor took, breaks `DetachedStaysOut`; the new runner
+taking the bound tasks breaks `BoundOnCreator`; no handoff at all, a call that leaves its mark as it ends, and a leaf push that
+backs out with its mark still up, so a poll that blocks after a call is never seen to block, each
+break `Rescued`); and 6 witnesses (a handoff, a cancel by the monitor, a call into the runtime
+from a detached thread, a cancel by the runner, a leaf push backing out on a claim, a detached
+thread's leaf push backing out on its old slot's claim). `tla/handoff/Retarget.tla` checks the waker of a
 `block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
 the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
 1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old
