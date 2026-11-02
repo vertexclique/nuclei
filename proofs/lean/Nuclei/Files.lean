@@ -19,6 +19,14 @@ to its completion. A slot goes back to be handed out only when no source holds i
 names it. So an entry still on its way, queued or in the kernel, never reaches the file of the
 next source that takes the slot.
 
+The kernel can refuse to take a file out of its table (the update finds no memory). Then the
+file stays in the table, and so does the slot's hold: the slot is not released, so no source
+takes it while it still holds the file, and the take-out is tried again after the ring's next
+wait (`releaseRefused`, then a later `release`). Released anyway, as the code once did, the
+slot would be free with the file still in the table (`ignoring_a_refusal_frees_a_slot_with_its_file`):
+the kernel keeps the gone source's file open, and the take-out of the next source to take the
+slot would remove that source's file instead.
+
 A worked example, computed below (`example_reuse_waits`): a table of one slot.
 
 1. Source A takes slot 0, whose table now holds A's file, and submits a read: one entry names
@@ -97,6 +105,10 @@ inductive Op where
   /-- The source holding `s` went: its file leaves the table, and the slot is released
   (`take_out`, `release`). -/
   | release (s : Nat)
+  /-- The source holding `s` went, but the kernel refused to take its file out of the table
+  (`take_out` when the update fails): the slot stays held, its file in the table, until a later
+  `release` tries again. -/
+  | releaseRefused (s : Nat)
 
 /-- Frees `s`: it can be handed out again (`free_slot`). -/
 def freeSlot (f : Files) (s : Nat) : Files :=
@@ -130,6 +142,8 @@ def step (f : Files) : Op → Files
       let f' := { f with slot := upd f.slot s { f.slot s with held := false, fileIn := false } }
       if (f.slot s).entries = 0 then freeSlot f' s else f'
     else f
+  -- A refused take-out changes nothing: the slot keeps its hold and its file.
+  | .releaseRefused _ => f
 
 /-- Operations in order. -/
 def run (f : Files) : List Op → Files
@@ -230,6 +244,7 @@ theorem inv_step (f : Files) (op : Op) (h : Inv f) : Inv (step f op) := by
         · subst e; simp [notFree] at ht
         · simp [e] at ht ⊢; exact h t ht
     · exact h
+  | releaseRefused _ => exact h
 
 /-- Any sequence of operations from a fresh table keeps the invariant. -/
 theorem inv_run (fixed : Nat) (ops : List Op) : Inv (run (init fixed) ops) := by
@@ -279,6 +294,40 @@ theorem release_takes_the_file_out (f : Files) (s : Nat) (held : (f.slot s).held
   by_cases u : (f.slot s).entries = 0
   · simp [step, held, u, freeSlot]
   · simp [step, held, u]
+
+/-- A take-out the kernel refused keeps the slot as it was: held, so not free and never handed to
+another source, with its file still in the table, which a later `release` takes out. -/
+theorem refused_release_keeps_the_slot (f : Files) (h : Inv f) (s : Nat)
+    (held : (f.slot s).held = true) :
+    let f' := step f (.releaseRefused s)
+    f'.isFree s = false ∧ (f'.slot s).held = true ∧ (f'.slot s).fileIn = (f.slot s).fileIn ∧
+      ((step f' (.release s)).slot s).fileIn = false := by
+  have notFree : f.isFree s = false := by
+    cases hf : f.isFree s
+    · rfl
+    · have := (h s hf).1; simp [held] at this
+  exact ⟨notFree, held, rfl, release_takes_the_file_out f s held⟩
+
+/-- What the code once did on a refused take-out: the slot released anyway, its file left in the
+table (`take_out` ignoring the update's failure), freed at once when no entry names it. -/
+def ignoreRefusal (f : Files) (s : Nat) : Files :=
+  if (f.slot s).held = true then
+    let f' := { f with slot := upd f.slot s { f.slot s with held := false } }
+    if (f.slot s).entries = 0 then { f' with isFree := upd f'.isFree s true } else f'
+  else f
+
+/-- Ignoring a refusal breaks the invariant: a table of one slot, a source takes it (its file in
+the table), and its take-out is refused and ignored; the slot is free with the gone source's file
+still in the table, so the kernel keeps that file open, and the next source's take-out of the slot
+would remove its own file instead. -/
+theorem ignoring_a_refusal_frees_a_slot_with_its_file :
+    let f := ignoreRefusal (run (init 1) [.take 0]) 0
+    f.isFree 0 = true ∧ (f.slot 0).fileIn = true ∧ ¬ Inv f := by
+  refine ⟨by decide, by decide, ?_⟩
+  intro inv
+  have := (inv 0 (by decide)).2.2
+  revert this
+  decide
 
 /-! ## The worked example -/
 

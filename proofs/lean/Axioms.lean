@@ -88,6 +88,8 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Files.no_double_free
 #print axioms Nuclei.Files.named_slot_is_not_free
 #print axioms Nuclei.Files.release_takes_the_file_out
+#print axioms Nuclei.Files.refused_release_keeps_the_slot
+#print axioms Nuclei.Files.ignoring_a_refusal_frees_a_slot_with_its_file
 #print axioms Nuclei.Files.example_reuse_waits
 
 -- A vectored read's fill: each room takes at most its size, the rooms take the whole count (or

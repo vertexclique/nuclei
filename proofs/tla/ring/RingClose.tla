@@ -36,6 +36,17 @@
 (* the kernel's task work, which the detach's call runs, ends the          *)
 (* cancelled accept within it; a file is closed once nothing holds it (the *)
 (* object, the table, a request in the kernel).                           *)
+(*                                                                          *)
+(* The kernel may refuse to take a fixed file out of the table once        *)
+(* (`UpdateFails`: `IORING_REGISTER_FILES_UPDATE2` finds no memory). Then  *)
+(* the file stays in the table, so the kernel keeps it open, and the slot  *)
+(* stays held: handed to another source, the slot's next take-out would    *)
+(* take that source's file out instead. The take-out is tried again after *)
+(* the ring's next wait (`take_out` puts the slot back on `leaving`), and  *)
+(* a short timer the refusal arms makes that wait come though nothing else *)
+(* is out (`RETRY_TAKE_OUT`): an idle ring's thread would sleep for good.  *)
+(* The lease goes all the same: the object may close, as the table holds   *)
+(* the file meanwhile.                                                     *)
 (***************************************************************************)
 EXTENDS Integers, TLC                                                        \* numbers and TLC's helpers
 
@@ -43,6 +54,7 @@ CONSTANTS                                                                    \* 
     Table,     \* TRUE: the slot is a fixed file of the ring's table; FALSE: it names the handle's descriptor
     Here,      \* TRUE: the handle drops on the ring's own thread; FALSE: on another thread
     Busy,      \* TRUE: the kernel holds completions it has no room for as the drop comes
+    UpdateFails, \* TRUE: the kernel refuses the first take-out of a fixed file from the table
     Mutation   \* "none", or the name of the one rule this run takes away
 
 (* --algorithm RingClose                                                      \* the algorithm, in PlusCal
@@ -55,6 +67,10 @@ variables                                                                    \* 
     lease = FALSE,                                                           \* a lease keeps the object open for the ring
     detachPosted = FALSE,                                                    \* the detach waits in the ring's mailbox
     leaving = FALSE,                                                         \* the detach is to be finished after the next wait
+    retry = FALSE,                                                           \* a take-out the kernel refused waits to be tried again
+    timer = FALSE,                                                           \* the retry's timer is armed: the ring's thread waits again
+    refusals = IF UpdateFails THEN 1 ELSE 0,                                 \* how many take-outs the kernel may still refuse
+    refused = FALSE,                                                         \* (record) the kernel refused a take-out
     slotHeld = TRUE,                                                         \* the source holds the slot
     slotFree = FALSE,                                                        \* the slot is free to hand out again
     reused = FALSE,                                                          \* another file took the descriptor's number
@@ -72,13 +88,42 @@ define                                                                       \* 
     \* The table after the take-out.
     \* MUTATION table_until_done: the file stays in the table until the slot frees.
     TakenOut == IF Mutation = "table_until_done" THEN tableHas ELSE FALSE    \* out at once
-    \* The slot after the release.
+    \* The slot after the release: free if no entry names it, else reserved until its end.
     \* MUTATION free_at_release: the slot is free at once, though an entry names it.
-    FreedAt == slotFree \/ Mutation = "free_at_release"                      \* reserved until its end
+    FreedAt == slotFree \/ ~named \/ Mutation = "free_at_release"           \* reserved until its end
     \* The object once the close's hold went, while the ring still has the detach to finish.
     \* MUTATION close_before_flush: no lease: the object closes at once.
     KeptOpen == Mutation # "close_before_flush"                              \* the lease keeps it open
 end define;                                                                  \* end of the names
+
+\* The take-out, once every entry naming the slot reached the kernel (`take_out`): the file leaves the
+\* table and the slot is released; or, a fixed file only, the kernel refuses (no memory).
+macro TakeOut() begin                                                        \* one take-out, in the step that does it
+    either                                                                   \* the kernel takes the file out:
+        tableHas := TakenOut;                                                \* the file leaves the table
+        slotHeld := FALSE;                                                   \* the slot is released
+        slotFree := FreedAt;                                                 \* free if unnamed, else reserved while named
+        retry := FALSE;                                                      \* nothing is left to try again
+        timer := FALSE;                                                      \* and no timer is armed
+    or                                                                       \* or it refuses:
+        await Table /\ tableHas /\ refusals > 0;                              \* a fixed file, while it may still refuse
+        refusals := refusals - 1;                                            \* it refuses this once
+        refused := TRUE;                                                     \* (recorded)
+        if Mutation = "update_ignored" then                                  \* MUTATION update_ignored: the refusal is ignored, as before the fix:
+            slotHeld := FALSE;                                               \* the slot is released, the file still in the table
+            slotFree := FreedAt;                                             \* and nothing tries again
+        elsif Mutation = "update_frees" then                                 \* MUTATION update_frees: tried again later, but
+            slotHeld := FALSE;                                               \* the slot is released now, the file still in it
+            slotFree := FreedAt;                                             \* (another source could take it)
+            retry := TRUE;                                                   \* the take-out waits to be tried again
+            timer := TRUE;                                                   \* and its timer is armed
+        else                                                                 \* the fix: the slot stays held, the file in it,
+            retry := TRUE;                                                   \* and the take-out waits to be tried again
+            \* MUTATION update_no_wake: no timer, so only other work makes the ring's thread wait again.
+            timer := Mutation # "update_no_wake";                            \* the retry's timer is armed
+        end if;                                                              \* the refusal is dealt with
+    end either;                                                              \* taken out, or refused
+end macro;                                                                   \* end of the take-out
 
 \* The handle's drop: its close's detach, here or through the mailbox; then the close's hold goes.
 fair process handle = "handle"                                               \* weakly fair: the drop comes
@@ -88,9 +133,7 @@ H_drop:                                                                      \* 
         cancelling := TRUE;                                                  \* the accept's cancel is queued
         if AtOnce then                                                       \* the kernel takes every entry now:
             entry := "ended";                                                \* the accept goes in and its cancel ends it, its file let go
-            tableHas := TakenOut;                                            \* the file leaves the table
-            slotHeld := FALSE;                                               \* the slot is released, reserved while named
-            slotFree := FreedAt;                                             \* (free only once its end is taken)
+            TakeOut();                                                       \* the file leaves the table and the slot is released, or not
             objOpen := FALSE;                                                \* no lease is left: the object closes
         else                                                                 \* the kernel cannot take it all now:
             leaving := TRUE;                                                 \* the next wait finishes the detach
@@ -110,20 +153,19 @@ end process;                                                                 \* 
 fair process ring = "ring"                                                   \* weakly fair: it keeps running
 begin                                                                        \* the ring's steps:
 R_loop:                                                                      \* the next thing to do
-    while ~(dropDone /\ ~detachPosted /\ ~leaving /\ ~named) do              \* until the source is all gone
+    while ~(dropDone /\ ~detachPosted /\ ~leaving /\ ~retry /\ ~named) do    \* until the source is all gone
         either                                                               \* a wait:
-            await entry = "queued" \/ (cancelling /\ entry = "kernel") \/ leaving;  \* something to submit or finish
+            await \/ entry = "queued" \/ (cancelling /\ entry = "kernel") \/ leaving  \* something to submit or finish,
+                  \/ (retry /\ timer);                                        \* or the retry's timer ran out
             \* What the queue holds goes to the kernel, which takes it all (the wait took its completions).
             if entry = "queued" /\ ~Table /\ reused then strayed := TRUE; end if;    \* a queued entry on a number gone to another file
             entry := IF cancelling /\ entry # "ended" THEN "ended"           \* a cancelled accept ends
                      ELSE IF entry = "queued" THEN "kernel" ELSE entry;      \* else a queued one goes in
-            if leaving then                                                  \* a detach left to this wait:
-                tableHas := TakenOut;                                        \* the file leaves the table
-                slotHeld := FALSE;                                           \* the slot is released
-                slotFree := FreedAt;                                         \* reserved while named
+            if leaving \/ retry then                                         \* a detach left to this wait, or a refused take-out:
+                TakeOut();                                                   \* the file leaves the table and the slot is released, or not
                 lease := FALSE;                                              \* the lease goes
                 objOpen := FALSE;                                            \* and with the close's hold gone, the object closes
-                leaving := FALSE;                                            \* the detach is finished
+                leaving := FALSE;                                            \* the detach is finished, but for a take-out to try again
             end if;                                                          \* the wait is done
         or                                                                   \* the mailbox:
             await detachPosted;                                              \* a detach posted from another thread
@@ -132,9 +174,7 @@ R_loop:                                                                      \* 
             if AtOnce then                                                   \* the kernel takes every entry now:
                 if entry = "queued" /\ ~Table /\ reused then strayed := TRUE; end if;  \* a queued entry on a number gone elsewhere
                 entry := "ended";                                            \* the accept goes in and its cancel ends it
-                tableHas := TakenOut;                                        \* the file leaves the table
-                slotHeld := FALSE;                                           \* the slot is released
-                slotFree := FreedAt;                                         \* reserved while named
+                TakeOut();                                                   \* the file leaves the table and the slot is released, or not
                 lease := FALSE;                                              \* the lease goes
                 objOpen := FALSE;                                            \* and the object closes
             else                                                             \* the kernel cannot take it all now:
@@ -176,8 +216,12 @@ NoStray == ~strayed                                                          \* 
 \* A slot is free to hand out only once no entry names it.
 SlotReserved == slotFree => ~named                                           \* reserved while named
 
-\* Dropped on the ring's thread with the kernel taking everything, the file is closed when the drop returns.
-ClosedAtDrop == (Here /\ ~Busy /\ dropDone) => Refs = 0                      \* nothing holds it then
+\* Dropped on the ring's thread with the kernel taking everything, the file is closed when the drop returns
+\* (unless the kernel refused to take it out of the table, which AllClosed then covers).
+ClosedAtDrop == (Here /\ ~Busy /\ ~refused /\ dropDone) => Refs = 0          \* nothing holds it then
+
+\* A slot free to hand out holds no file in the table: its next source's take-out takes out only its own.
+SlotEmpty == slotFree => ~tableHas                                           \* handed back empty
 
 \* In the end the file is closed and the slot free, wherever the drop came from.
 AllClosed == <>(Refs = 0 /\ slotFree)                                        \* closed, and the slot handed back
@@ -193,4 +237,6 @@ AllClosed == <>(Refs = 0 /\ slotFree)                                        \* 
 NoLeaving == ~leftOnce                                                       \* never left
 \* Another file takes the descriptor's number once the object closed.
 NoReuse == ~reused                                                           \* never taken
+\* The kernel refuses to take the file out of the table, and the take-out is tried again.
+NoRefusal == ~(refused /\ retry)                                            \* never refused and retried
 =============================================================================

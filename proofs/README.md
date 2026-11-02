@@ -1170,16 +1170,26 @@ which stays reserved until the accept's end is taken; a lease keeps the handle's
 until no entry naming its number waits to reach the kernel: where the kernel holds completions it
 has no room for, until the ring's next wait, and for a drop on another thread, until the ring's
 thread applies the detach from its mailbox. Someone opening a file meanwhile gets the number once
-the object closed. 14 configurations: 8 that must pass (each kind of slot, dropped on the ring's
+the object closed. The kernel may refuse the take-out from the table once (`UpdateFails`, no memory
+for the update): the slot then stays held with the file in it, and the take-out is tried again
+after the ring's next wait, which a timer the refusal arms brings though nothing else is out. 22
+configurations: 12 that must pass (each kind of slot, dropped on the ring's
 thread or another, with the kernel taking everything or busy, with `NoStray`, no entry reaches
 the kernel on a number another file took; `SlotReserved`, a slot is free only once no entry names
 it; `ClosedAtDrop`, dropped on the ring's thread with the kernel taking everything, nothing holds
-the file when the drop returns; and liveness, `AllClosed` and `Termination`), 4 mutations (no
+the file when the drop returns, unless the kernel refused the take-out; `SlotEmpty`, a free slot
+holds no file in the table; and liveness, `AllClosed` and `Termination`; 4 of them with the
+refused take-out), 7 mutations (no
 lease, so the object closes with an entry naming its number still queued, breaks `NoStray`; the
 cancel left to the ring's next wait, and the file kept in the table until the slot frees, the two
 halves of the bug a listener dropped with an accept out still accepting after, break
-`ClosedAtDrop`; a slot free at its release breaks `SlotReserved`), and 2 witnesses (a detach left
-to the next wait; the number taken by another file). `tests/faults/drops.rs` drops a listener
+`ClosedAtDrop`; a slot free at its release breaks `SlotReserved`; a refused take-out ignored and
+the slot released, as before the fix, and one tried again with no timer to wake an idle ring,
+break `AllClosed`; one tried again but with the slot released at once breaks `SlotEmpty`), and 3
+witnesses (a detach left to the next wait; the number taken by another file; a refused take-out
+tried again). `src/rt/shard/ring/tests.rs` has the kernel refuse a retiring source's take-out and
+checks the slot stays held and the peer sees the end with the shard waiting on nothing else.
+`tests/faults/drops.rs` drops a listener
 with an accept out and checks a connect is refused when the drop returns, and drops a stream with
 a read out from a thread that then blocks and checks its peer reads the end.
 
@@ -1279,7 +1289,11 @@ no entry naming it, so an entry on its way never reaches the next source's file
 (`taken_slot_is_unnamed`); that a free slot is never freed again (`no_double_free`); that a slot an
 entry names is never free, so it stays reserved after its source went (`named_slot_is_not_free`);
 and that a release takes the file out of the table whatever entries still name the slot
-(`release_takes_the_file_out`); and it computes the worked example of a slot released with a read
+(`release_takes_the_file_out`); that a take-out the kernel refused keeps the slot held, so never
+free, with its file in the table until a later release takes it out
+(`refused_release_keeps_the_slot`), while releasing the slot anyway, as the code once did, leaves
+a free slot holding the gone source's file (`ignoring_a_refusal_frees_a_slot_with_its_file`); and
+it computes the worked example of a slot released with a read
 out and handed out again only once the read completed (`example_reuse_waits`). The Rust tests in
 `src/rt/shard/ring/tests.rs` run sources past a full table, a retire with a read out and a
 shard that goes with one, each with a mutation of the code that makes one of them fail.
