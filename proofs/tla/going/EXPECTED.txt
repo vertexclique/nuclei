@@ -63,3 +63,11 @@ LM_off_worker_hands Linger violated:OffWorkerDelivers
 L_exit_fail       Linger  pass
 L_exit_fail_live  Linger  pass
 LM_silent_give_up Linger  violated:GiveUpSaid
+VC_ring           Locals  pass
+VC_reapable       Locals  pass
+VC_quiet          Locals  pass
+VM_no_catch       Locals  violated:GoesToTheEnd
+VM_no_catch_reapable Locals  violated:NoWriteIntoFreed
+VM_one_catch      Locals  violated:NoAbort
+VM_values_first   Locals  violated:ValuesAfterSettle
+VM_before         Locals  violated:NoWriteIntoFreed

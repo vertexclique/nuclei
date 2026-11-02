@@ -301,6 +301,27 @@ again (every operation needs a reference or the handle, and none is left); and m
 refers to is freed. The loom models in `src/rt/task/loom_tests.rs` run the real code under
 weak memory orderings, with a calibration that loses a wake and must fail.
 
+The task's own code that panics outside its poll's catch is in the TLA+ model too (`Panics`):
+the future's drop (and the terminate hook after it), an output nobody takes, what the memory holds
+as it is freed, a hook around the poll, and the shutdown on a task's panic. Each panic is caught
+where it happens. A panic of a hook or of the future's drop is the task's outcome for its handle,
+even one that cancelled: a cancel whose future's drop panicked ends as a completion with that
+panic, closed no more (`RawTask::settle_panicked`), and a completion with a panic keeps it for a
+handle that cancelled during the poll; a handle that waited for a closed task's future looks again
+once it is gone. With no handle left, a panic is logged. With `Shutdown`, a runner may drop a
+runnable instead of running it (`drop_runnable`). 22 more configurations: 8 that must pass
+(awaiting, cancelling, dropping and detaching handles with every kind of panic, hooks, the
+shutdown dropping the runnable, and liveness), checking besides the properties above that no panic
+aborts (`NoAbort`), that every panic is told (`PanicTold`), and that a handle that awaits or
+cancels and waits gets the panic (`AwaiterGetsPanic`); 12 mutations (each abort the code once made
+on a panic of the future's drop, an output's drop, the free, a hook and the shutdown, `NoAbort`; a
+free whose panic skips the free, `CleanEnd`; a cancel that logs the panic though the handle waits,
+a handle that answers "no output" without looking again, and a completion that keeps the value
+over the drop's panic, `AwaiterGetsPanic`; a completion with the panic for no handle,
+`FreedAfterFuture`; an unclaimed panic, and one a handle let go of, dropped unlogged,
+`PanicTold`); and 2 witnesses (a cancel ending as a completion with a panic; the shutdown dropping
+a runnable).
+
 What the models leave out: the Lean model runs one whole operation at a time, so a poll is
 never seen in progress (that is TLA+'s part); the TLA+ model treats the future as one step per
 poll and the run queue as a count; the awaiter's waker cell is modelled by TLA+ only. The task
@@ -1936,6 +1957,34 @@ running a linger of its list; the task with the handle held by the write as its 
 another thread draining its wake after the write counted itself out; the drop's bound running
 out before every byte went).
 
+`Unworked` (`tla/going/Unworked.tla`) checks a linger handed to a runtime with no worker taking
+tasks (none built, or every one stopping): `spawn_linger` in `src/rt/runtime.rs`, `route_linger`,
+`OnThread`, `alone` and `linger_thread` in `src/rt/linger.rs`. Such a linger went to the handing
+thread's own shard, which runs only at that thread's next `block_on`, or, the thread having none,
+to the runtime's list, which only a drop runs: with neither coming, the bytes never reached the
+peer and the handle's socket stayed open. It goes to the linger thread, one for the process,
+still counted by its runtime until it ends, so a drop that comes waits for it. 6 configurations:
+2 that must pass (`AllSent` with a runtime never dropped and the handing thread never running its
+shard again; the same with a drop, and `DropWaits` for a linger handed before the drop began), 3
+mutations (the own shard and the list, each breaking `AllSent`; the linger thread's linger left
+uncounted, breaking `DropWaits`), and a witness (a drop that waited for such a linger).
+
+`Locals` (`tla/going/Locals.tla`) checks a worker's shard that goes for good holding
+`shard_local!` values whose drops panic, with a file operation out on its ring (`Shard::go` and
+`drop_locals` in `src/rt/shard/going.rs`). The ring settles first: on a ring only the shard reaps,
+the shard waits for the operation (past a bounded wait it keeps its memory for good); on a ring
+another thread can reap, it cancels it and, at the end, hands the ring and what is still out to a
+keeper, which frees the buffer once the kernel is done. Only then do the values go, each in a
+catch of its own, so a panic is logged, the next value still goes, and the shard's going reaches
+its end. 8 configurations: 3 that must pass (both values panicking, on each kind of ring, and none
+panicking), with the kernel never writing into a freed buffer, no abort, the going reaching its
+end, every value dropped and every panic logged, and the values dropped only once the ring is
+settled; 5 mutations (no catch, which leaves the tasks undropped, `GoesToTheEnd`, and on a
+reapable ring drops the ring with the operation out, `NoWriteIntoFreed`; one catch around both
+values, whose second panic comes during the first one's unwind, `NoAbort`; the values first, as
+before, `ValuesAfterSettle`; and the code before this fix, the values first with no catch, whose
+panic drops the ring before it settles, `NoWriteIntoFreed`).
+
 ## A ring kept past its shard
 
 `keeper` (`tla/keeper/`) checks what happens to a shard's ring after the shard went.
@@ -1981,17 +2030,6 @@ holds it; a slow one that completes after the shard gave up on it).
 once, `src/rt/park/ring.rs` that a wake after the poller went writes no freed memory, and
 `src/rt/shard/ring/tests.rs` that a read and a file's call given up on end with an error and let a
 retire return.
-`Unworked` (`tla/going/Unworked.tla`) checks a linger handed to a runtime with no worker taking
-tasks (none built, or every one stopping): `spawn_linger` in `src/rt/runtime.rs`, `route_linger`,
-`OnThread`, `alone` and `linger_thread` in `src/rt/linger.rs`. Such a linger went to the handing
-thread's own shard, which runs only at that thread's next `block_on`, or, the thread having none,
-to the runtime's list, which only a drop runs: with neither coming, the bytes never reached the
-peer and the handle's socket stayed open. It goes to the linger thread, one for the process,
-still counted by its runtime until it ends, so a drop that comes waits for it. 6 configurations:
-2 that must pass (`AllSent` with a runtime never dropped and the handing thread never running its
-shard again; the same with a drop, and `DropWaits` for a linger handed before the drop began), 3
-mutations (the own shard and the list, each breaking `AllSent`; the linger thread's linger left
-uncounted, breaking `DropWaits`), and a witness (a drop that waited for such a linger).
 
 ## A blocking job of a Windows handle
 

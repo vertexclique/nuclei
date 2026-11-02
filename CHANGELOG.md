@@ -42,6 +42,24 @@
   what it posts before it leaves; and a drain of the shard's table starts its generations past
   every token it handed out, so a release that comes late names nothing
   (`proofs/tla/going/Pending.tla`).
+- **A panic of a task's own code outside its poll no longer aborts the process.** A future that
+  panicked as it was dropped (on completion, on a cancel, in a runnable the shutdown dropped, or as
+  its last waker went), an output nobody took that panicked as it was dropped, the drop of what a
+  task's memory held as it was freed, a task hook (`on_before_task_poll`, `on_after_task_poll`,
+  `on_task_terminate`, `on_task_spawn`) and the shutdown on a task's panic each aborted. Each panic
+  is now caught where it happens, the task completes or is cancelled cleanly, and the runtime and
+  its other tasks run on. A panic of the future's drop, or of a poll or terminate hook, is the
+  task's outcome: awaiting the handle resumes it, and `join` answers it as a panicked `JoinError`
+  (the poll's own panic, if it had one, stays the outcome). A panic nobody can take is logged at
+  error. A spawn hook's panic unwinds out of the spawn, and the task is cancelled before it runs
+  (`proofs/tla/task/Task.tla`, `Panics` and `Shutdown`).
+- **A `shard_local!` value that panics as its worker stops no longer cuts the worker's going
+  short.** The values were dropped before the shard settled its ring, outside any catch: a panic
+  skipped the rest of the going, and the ring was dropped with its file operations still in the
+  kernel, which could then write into their freed buffers. The values now go once the ring is
+  settled (or its operations cancelled for its keeper), each in a catch of its own: a panic is
+  logged at error, the other values are still dropped, and the worker goes to its end
+  (`proofs/tla/going/Locals.tla`).
 - **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
   `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
   for a connection its peer reset in the backlog before or while the accept took it. That error is
@@ -556,6 +574,12 @@
   one-shot channel, the remote timer and the paused clock) has a configuration that removes it
   and must fail. The owner-named lock, which nothing used, is gone (`proofs/README.md`, "More
   sync and time models").
+- **A task's panic stays for its handle after a cancel, and a panic nobody awaits is logged.** A
+  task cancelled while its poll panicked, or whose future panicked as the cancel dropped it, now
+  completes with that panic for the handle that cancelled it: `cancel().await` resumes it and
+  `join` answers a panicked `JoinError`, where they answered no output before. A panic no handle
+  takes (a detached task's, or one a handle let go of unawaited) is logged at error, where it was
+  dropped after the panic hook printed it.
 - **A stream read the kernel's last count covers asks for no new count** (Linux, epoll). A read
   into the task's own buffer asks the kernel how many bytes it leaves (`TCP_INQ`, `SO_INQ`), with
   `recvmsg` and its control message, to know without another call whether the socket is empty.

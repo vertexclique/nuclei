@@ -229,10 +229,23 @@ pub enum UnhandledPanic {
     ShutdownRuntime,
 }
 
-/// Calls `hook`, if set, for the task `id`. A hook that panics aborts the
-/// process: it runs in the middle of a task's change of state.
+/// Calls `hook`, if set, for the task `id`. A panic of the hook unwinds to
+/// the caller: the spawner, for the spawn hook (the task, never run, is
+/// cancelled as the unwind drops it), and the poll's catch, for the
+/// before-poll hook.
 pub(crate) fn call(hook: Option<&TaskHook>, id: crate::task::Id) {
     if let Some(hook) = hook {
-        crate::rt::task::abort_on_panic(|| hook(&TaskMeta::new(id)));
+        hook(&TaskMeta::new(id));
     }
+}
+
+/// [`call`], catching a panic of the hook: the task it is about takes the
+/// panic as its outcome (the after-poll and terminate hooks, in the middle
+/// of a task's change of state).
+pub(crate) fn call_task_caught(
+    hook: Option<&TaskHook>,
+    id: crate::task::Id,
+) -> Option<super::caught::Panic> {
+    let hook = hook?;
+    super::caught::catch(|| hook(&TaskMeta::new(id)))
 }
