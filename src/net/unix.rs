@@ -131,14 +131,16 @@ impl Handle<UnixListener> {
         Handle::adopt(UnixListener::bind_addr(addr)?, Kind::UnixListener)
     }
 
-    /// The next connection, with its peer's address. On macOS an accept
-    /// that finds the process out of descriptors closes the connection it
-    /// took, and the next ones take none until a descriptor is free, as a
-    /// TCP listener's do.
+    /// The next connection, with its peer's address. A connection aborted
+    /// while it waited in the backlog is skipped, and the next one taken. On
+    /// macOS an accept that finds the process out of descriptors closes the
+    /// connection it took, and the next ones take none until a descriptor is
+    /// free, as a TCP listener's do.
     ///
     /// # Errors
     ///
-    /// As `accept(2)`.
+    /// As `accept(2)` for the listener itself, such as the process out of
+    /// descriptors.
     pub async fn accept(&self) -> io::Result<(Handle<UnixStream>, UnixSocketAddr)> {
         poll_fn(|cx| self.poll_accept(cx)).await
     }

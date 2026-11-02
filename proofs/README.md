@@ -1320,31 +1320,68 @@ pipe test of `tests/idle_peers.rs` checks it on every backend.
 ## A listener's stream of connections
 
 `accept` (`tla/accept/AcceptStream.tla`) checks the stream `TcpListener::accept_multi` gives
-(`TcpStreamGenerator::poll_next` in `src/net/tcp.rs`, `out_of_descriptors` in
-`src/rt/counters.rs`), and the accept under it on a readiness poller (`ReadState::accept_ahead`
-and `accept_checked` in `src/io/source/read.rs`), when the process runs out of descriptors.
-Peers connect into the backlog; the rest of the process may take every free descriptor for a
-while and gives them back in the end. A poll asks the listener for the next connection: one
-there and a descriptor free, it is accepted and the stream's pause starts over at its least; out
-of descriptors (EMFILE or ENFILE), the stream waits on a timer for its pause, which then doubles
-up to its most, and asks again when the timer fires; any other error ends the stream. On macOS an
-accept that fails for want of a descriptor closes the connection it took off the backlog
-(`Drops`), so after one the side first copies the listener's descriptor and closes the copy: none
-free, it answers EMFILE and takes nothing; one free, it accepts, though the rest of the process
-may take the last descriptor in between. The side hands an error over once and the connections
-queued before it first, so a retry asks the listener afresh. Time is the ticks left on the timer.
-11 configurations: 4 that must pass (two and three connections across two outages, with
-`NoBusyLoop`, at most one EMFILE between two ticks, `FirstWaitLeast`, the first pause after an
-accept the least, `LostPerOutage`, no more connections closed than outages began, and
-`AllServed`, every connection accepted once descriptors are free again or closed by a failed
-accept; the same on macOS, where a failed accept closes the connection it took; and an outage
-followed by another error of the listener, with `OtherEnds`, the stream ends, and
-`NothingAfterEnd`), 5 mutations (the stream that ended on EMFILE, as it did before, breaks
-`AllServed`; a retry with no timer breaks `NoBusyLoop`; a pause that does not start over after an
-accept breaks `FirstWaitLeast`; on macOS a retry with no check for a free descriptor, as before,
-and a failed accept that does not mark the side for that check, break `LostPerOutage`), and 2
-witnesses (a retry after a pause that accepts a connection; a check that found a descriptor free
-and an accept that still closed a connection, the race the check cannot close).
+(`TcpStreamGenerator::poll_next` in `src/net/tcp.rs`, `out_of_descriptors` and
+`lost_before_accept` in `src/rt/counters.rs`), and the accept under it on a readiness poller
+(`ReadState::accept_ahead` and `accept_checked` in `src/io/source/read.rs`), when the process runs
+out of descriptors and when peers reset their connections in the backlog. Peers connect into the
+backlog, some resetting theirs while it waits there; the rest of the process may take every free
+descriptor for a while and gives them back in the end. A poll asks the listener for the next
+connection: one there and a descriptor free, it is accepted and the stream's pause starts over at
+its least; one its peer reset, the listener answers with that connection's error, which the side
+skips, asking again at once; out of descriptors (EMFILE or ENFILE, on Windows WSAEMFILE,
+WSAENOBUFS or ERROR_NO_SYSTEM_RESOURCES), the stream waits on a timer for
+its pause, which then doubles up to its most, and asks again when the timer fires; any other error
+ends the stream. On macOS an accept that fails for want of a descriptor closes the connection it
+took off the backlog (`Drops`), so after one the side first copies the listener's descriptor and
+closes the copy: none free, it answers EMFILE and takes nothing; one free, it accepts, though the
+rest of the process may take the last descriptor in between. The side hands an error over once and
+the connections queued before it first, so a retry asks the listener afresh. Time is the ticks left
+on the timer. 17 configurations: 7 that must pass (two and three connections across two outages,
+with `NoBusyLoop`, at most one EMFILE between two ticks, `FirstWaitLeast`, the first pause after an
+accept the least, `LostPerOutage`, no more connections closed than outages began,
+`EndsOnlyForOther`, only the listener's own error ends the stream, and `AllServed`, every kept
+connection accepted once descriptors are free again or closed by a failed accept; the same on
+macOS, where a failed accept closes the connection it took; an outage followed by another error of
+the listener, with `OtherEnds`, the stream ends, and `NothingAfterEnd`; and the same three with
+connections reset in the backlog among the kept ones), 7 mutations (the stream that ended on
+EMFILE, as it did before, breaks `AllServed`; a retry with no timer breaks `NoBusyLoop`; a pause
+that does not start over after an accept breaks `FirstWaitLeast`; on macOS a retry with no check
+for a free descriptor, as before, and a failed accept that does not mark the side for that check,
+break `LostPerOutage`; a reset connection's error that ends the stream, as WSAECONNRESET did on
+Windows, breaks `EndsOnlyForOther`; a skip that asks the listener nothing more until another
+connection comes breaks `AllServed`), and 3 witnesses (a retry after a pause that accepts a
+connection; a check that found a descriptor free and an accept that still closed a connection, the
+race the check cannot close; a kept connection accepted after a skip).
+
+`tla/accept/AcceptReset.tla` checks the side under those accepts when a peer resets its
+connection, on every backend and through both ways of accepting: `accept` and `incoming`
+(`ReadState::accept`, and `peer_gone` for a connection a multishot accept brought) and
+`accept_multi` (`ReadState::accept_stream`, `TcpStreamGenerator::poll_next`). The peers reset a
+connection in the backlog before any accept takes it, under the accept out that took it, or after
+a multishot accept took it and before the task asks its peer; the listener may fail once with its
+own error. A readiness side's loop (`accept_ahead`, run by the task's poll and by `serve` on an
+edge) skips a reset connection's ECONNABORTED and accepts the next at once; a completion side
+(`op_done` and `submit_ops` in `src/io/source/read/ops.rs`, the kernel's answers being `outcome` in
+`src/io/source/port.rs` for `AcceptEx` and `RingMem::complete_rest` and `ShardRing::accepted` for
+io_uring) keeps nothing of an accept, or a multishot accept's end, that met one, and wakes its
+task, whose poll sends the next accept; a task that finds a multishot accept's connection gone
+(ENOTCONN) takes the next one, the side accepting again when it holds none. Linux, and any kernel
+the reset reaches after the accept, hands the connection over as it is. 27 configurations: 12 that
+must pass (each backend, readiness, completion and multishot, with each way of accepting, with two
+reset connections and a kept one, with `AllKeptServed`, every kept connection served, and
+`NoLostToCaller`, no task sees a reset connection's error nor a stream ends for one; and again with
+the listener's own error, with `ErrSurfaces`, it reaches the task), 11 mutations (a reset
+connection's error kept for the task breaks `NoLostToCaller` in a readiness side's loop, in a
+completed accept, as the soak's server met on Windows, in a plain accept's look at a multishot
+accept's connection, and in a multishot accept's end; a skip that stalls, as a readiness loop
+that stops unmarked, a completion or a multishot end that wakes nobody, and a look that sends no
+accept, breaks `AllKeptServed`; the listener's own error skipped as a reset connection's breaks
+`ErrSurfaces` on a readiness side, a completion side and a multishot accept's end), and 4
+witnesses (a kept connection served after each kind of skip). The accept tests of
+`src/net/tests/reset.rs` reset a connection in the backlog before a kept one on every backend,
+with the accept waiting and not, through `accept`, `incoming` and `accept_multi`, and check every
+byte of the kept one; `src/io/source/tests/lost_accept.rs` hands a completion side each system's
+errors of both kinds.
 
 ## A stream's close
 

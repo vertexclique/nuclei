@@ -516,13 +516,40 @@ pub(crate) fn accept_error(err: &io::Error) {
     }
 }
 
-/// Whether `err` says the process or the system has no descriptor left.
+/// Whether `err` says the process or the system has no descriptor left. Windows answers a socket
+/// it cannot make for that, the one an accept takes a connection into among them, with
+/// `WSAEMFILE` or `WSAENOBUFS` (`WSASocketW`), and an `AcceptEx` that ends for want of system
+/// resources with the status `status_error` names `ERROR_NO_SYSTEM_RESOURCES`.
 pub(crate) fn out_of_descriptors(err: &io::Error) -> bool {
     #[cfg(unix)]
     let codes = [libc::EMFILE, libc::ENFILE];
     #[cfg(windows)]
-    let codes = [crate::syscore::windows::WSAEMFILE];
+    let codes = {
+        use crate::syscore::windows::{ERROR_NO_SYSTEM_RESOURCES, WSAEMFILE, WSAENOBUFS};
+        [WSAEMFILE, WSAENOBUFS, ERROR_NO_SYSTEM_RESOURCES]
+    };
     err.raw_os_error().is_some_and(|code| codes.contains(&code))
+}
+
+/// Whether `err`, an accept's, is the error of the connection it took and not the listener's: its
+/// peer reset or aborted it while it waited in the backlog. The listener is as it was, so every
+/// accept skips the connection and takes the next one (proofs/tla/accept). On unix that is
+/// `ECONNABORTED` (macOS and the BSDs, and Linux when the connection's peer address is gone);
+/// `AcceptEx` ends with the reset's status, or with the Win32 error that status maps to.
+pub(crate) fn lost_before_accept(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    let lost = err.kind() == io::ErrorKind::ConnectionAborted;
+    #[cfg(windows)]
+    let lost = {
+        use crate::syscore::windows::{ERROR_NETNAME_DELETED, WSAECONNABORTED, WSAECONNRESET};
+        err.raw_os_error().is_some_and(|code| {
+            matches!(
+                code,
+                WSAECONNRESET | WSAECONNABORTED | ERROR_NETNAME_DELETED
+            )
+        })
+    };
+    lost
 }
 
 /// Every shard made and not taken out yet, by the address of its `Shared`
