@@ -43,8 +43,8 @@
 <p>Blocking code finds its way into tasks: a lock of a synchronous library, a slow system call, a loop longer than planned. When one poll of a task runs past <a href="api:nuclei::Builder::handoff_after"><code>handoff_after</code></a> (10 ms by default), the task holds up only itself: its worker's shard, with every other task, timer and IO of it, goes on on another thread on the same core, and the blocked task carries on once its poll returns. A task placed on a worker stays on that worker through it.</p>
 <ul>
 <li>The blocked thread still shares the core, so a handoff is a rescue, not a place to run work: give long work to <code>spawn_blocking</code> or break it up with yields.</li>
-<li>Tasks that <code>spawn_local</code> keeps on the blocked thread, and a nested <code>block_on</code> there, wait for it and finish on that thread.</li>
-<li><a href="api:nuclei::Builder::on_long_poll"><code>on_long_poll</code></a> names the task that blocked (<a href="production.html#hooks">Production</a>), and <code>stats()</code> counts each worker's <code>handoffs</code> and its <code>longest_poll</code>.</li>
+<li>Tasks that <code>spawn_local</code> keeps on the blocked thread, and a nested <code>block_on</code> there, wait for it and finish on that thread. Dropping the runtime waits for that thread once its poll has returned, as for any other; only a thread still blocked in that poll is left to exit on its own.</li>
+<li><a href="api:nuclei::Builder::on_long_poll"><code>on_long_poll</code></a> names the task that blocked (<a href="production.html#hooks">Production</a>), and <code>stats()</code> counts each worker's <code>handoffs</code>, its <code>longest_poll</code>, and <code>handoffs_failed</code>: blocked polls left to block because the kernel refused the memory fence the handoff needs.</li>
 <li>Watching costs each poll two plain stores and a load, and each call a task makes into its worker (a wake, a spawn, a send or a receive) two loads and two stores: on io_uring a 64-byte TCP round trip runs 10.8% more instructions with it, a spawn and its join 20% more. <code>handoff_after(None)</code> turns it off.</li>
 </ul>
 

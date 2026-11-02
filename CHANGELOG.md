@@ -35,6 +35,32 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
+- **A `block_on` future that finishes in the poll its worker's shard was taken in no longer
+  writes into that shard** (handoff on). The loop looked at the future's output before the take,
+  so a nested `block_on` kept its waker in the cell of the shard another thread now ran, a data
+  race, and a worker's loop answered "stopped" for a shard it had lost, so its thread skipped its
+  bound tasks and stayed marked as blocked. The loop now answers "detached" with the output
+  (`proofs/tla/handoff`, `N_safe`; the `ready_first` and `stopped_on_take` mutations). A poll on a
+  shard nobody watches no longer looks whether it was taken, which it never is.
+- **A runtime drop waits for a thread back from a blocked poll** (handoff on). The monitor stored
+  "detached" after its take and the thread stored "back" once its bound tasks were done: a thread
+  back before the monitor's store stayed marked as blocked for good, so every later drop skipped
+  joining it, and a drop while its bound tasks ran returned before they were dropped. The two
+  sides now add and take one off, in either order, and the thread says it is back as soon as its
+  poll returns (`proofs/tla/handoff/TakeRef.tla`, the `life_stored` and `back_after_home`
+  mutations).
+- **An IO step that unwinds no longer keeps its worker from being rescued** (handoff on). A
+  stream's step marks its call into the shard until it settles; a panic in the step that the task
+  caught (a waker's clone that panics) skipped the settle, so the rest of the poll looked inside
+  the shard and the monitor never took a poll that then blocked. The step's drop now ends the
+  call (`proofs/tla/handoff`, the `marked_unwind` mutation).
+- **A handoff given up because the kernel refused its fence is counted.** On Linux the monitor's
+  take runs `membarrier`; when the call failed, the take was cancelled silently, and the blocked
+  poll went on holding up its shard. `ShardStats::handoffs_failed` counts each one
+  (`proofs/tla/handoff`, `F_fail`). The handoff model now also checks the full fence of macOS, the
+  BSDs and a Linux without `membarrier` (`F_safe`, with a mutation for each side's fence), both
+  compare-and-swaps of the claim (the `blind_take` and `blind_contest` mutations), and two calls
+  into the runtime in one poll (`L_two`, `D_two`).
 
 ### Changed
 
