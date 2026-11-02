@@ -68,6 +68,12 @@ fn int_option(raw: Raw, name: i32) -> io::Result<i32> {
     Ok(value)
 }
 
+/// No count of a socket's unacknowledged bytes is asked on Windows, so the wait before a
+/// zero-linger close is skipped there, as before.
+pub(crate) fn unacked(_raw: Raw) -> Option<usize> {
+    None
+}
+
 /// What kind of socket `raw` is: one of messages (datagrams, raw or
 /// reliable ones) works as UDP does, any other as a stream, as on unix.
 pub(crate) fn kind_of_socket(raw: Raw) -> io::Result<Kind> {

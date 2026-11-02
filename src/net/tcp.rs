@@ -297,6 +297,10 @@ impl Handle<TcpStream> {
 
     /// Sets `SO_LINGER` to zero: the close drops unsent data and resets the
     /// connection.
+    ///
+    /// A handle dropped with bytes still written behind first delivers them, then waits until the
+    /// peer acknowledged what the kernel holds (within the runtime's `write_behind_linger`), and
+    /// only then resets, so the reset never overtakes the data still on its way.
     pub fn set_zero_linger(&self) -> io::Result<()> {
         super::opt::set_linger_time(self.raw_io(), Some(Duration::ZERO))
     }

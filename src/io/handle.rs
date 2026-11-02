@@ -380,10 +380,20 @@ impl<T> Drop for Handle<T> {
 /// and a TCP stream resets: its peer must not read the end of the stream
 /// after a cut one. A Unix stream has no reset: it closes, and its peer
 /// reads the end after the bytes that reached it (proofs/tla/close,
-/// `W_unix_cut`).
+/// `W_unix_cut`). A TCP stream set to zero linger whose bytes all went out first waits for the
+/// peer to acknowledge them (`wait_for_acks`), within the same time, so its reset cannot
+/// overtake them.
 async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
+    let budget = crate::rt::linger::time();
+    let start = std::time::Instant::now();
     let drain = core::future::poll_fn(|cx| source.poll_drain(cx));
-    let _ = crate::time::timeout(crate::rt::linger::time(), drain).await;
+    let _ = crate::time::timeout(budget, drain).await;
+    if !source.has_unsent()
+        && source.kind() == Kind::Tcp
+        && matches!(crate::net::opt::linger_time(own), Ok(Some(d)) if d.is_zero())
+    {
+        wait_for_acks(own, budget.saturating_sub(start.elapsed())).await;
+    }
     if source.has_unsent()
         && source.kind() == Kind::Tcp
         && let Err(err) = crate::net::opt::set_linger_time(own, Some(Duration::ZERO))
@@ -394,6 +404,27 @@ async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
         );
     }
     source.close(kept);
+}
+
+/// Waits until the kernel holds no byte of the socket `own` its peer has not acknowledged, or
+/// `time` passed: a zero-linger close resets the connection, and a reset sent while data is
+/// still on the wire may overtake it on a loopback (macOS's does), where the peer takes the reset
+/// for a stale one and its stream stays open for good (proofs/tla/close/AbortAcks.tla). Where
+/// the system has no such count (`sys::unacked` is `None`) it returns at once.
+pub(crate) async fn wait_for_acks(own: Raw, time: Duration) {
+    const FIRST: Duration = Duration::from_micros(50);
+    const LAST: Duration = Duration::from_millis(20);
+    let deadline = std::time::Instant::now() + time;
+    let mut pause = FIRST;
+    while sys::unacked(own).is_some_and(|n| n > 0) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        // No kernel event says "all acknowledged", so the count is polled with a bounded backoff.
+        crate::time::sleep(pause.min(left)).await;
+        pause = (pause * 2).min(LAST);
+    }
 }
 
 /// A dropped handle's object, kept open while its unsent bytes go out.

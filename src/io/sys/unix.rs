@@ -21,7 +21,7 @@ mod unix_addr;
 #[cfg(ring)]
 pub(crate) use self::linux::end_queued;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) use self::linux::{UNIX_INQ, enable_inq, read_inq, syscall};
+pub(crate) use self::linux::{UNIX_INQ, enable_inq, read_inq, syscall, unacked};
 pub(crate) use self::unix_addr::{UnixAddr, unix_addr};
 
 /// A std socket of type `S` over `fd` for one call, never closed by it.
@@ -33,6 +33,56 @@ pub(crate) use self::unix_addr::{UnixAddr, unix_addr};
 unsafe fn borrow<S: FromRawFd>(fd: RawFd) -> ManuallyDrop<S> {
     // SAFETY: the caller's contract; `ManuallyDrop` keeps it from closing.
     ManuallyDrop::new(unsafe { S::from_raw_fd(fd) })
+}
+
+/// The bytes the kernel holds for the socket `fd` that its peer has not acknowledged, sent or
+/// not yet sent: `SO_NWRITE` on macOS and iOS, `FIONWRITE` on FreeBSD, `SIOCOUTQ` on Linux and
+/// Android. `None` where the system has no such count, or the call failed.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn unacked(fd: RawFd) -> Option<usize> {
+    let mut count: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `count` and `len` are valid for the call, `len` is the size of `count`; a bad
+    // descriptor is an error the call answers.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NWRITE,
+            (&raw mut count).cast(),
+            &mut len,
+        )
+    };
+    if ret < 0 {
+        None
+    } else {
+        usize::try_from(count).ok()
+    }
+}
+
+/// See the Apple variant.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn unacked(fd: RawFd) -> Option<usize> {
+    let mut count: libc::c_int = 0;
+    // SAFETY: `FIONWRITE` writes one `c_int` through the pointer, valid for the call; a bad
+    // descriptor is an error the call answers.
+    let ret = unsafe { libc::ioctl(fd, libc::FIONWRITE, &raw mut count) };
+    if ret < 0 {
+        None
+    } else {
+        usize::try_from(count).ok()
+    }
+}
+
+/// See the Apple variant.
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "android"
+)))]
+pub(crate) fn unacked(_fd: RawFd) -> Option<usize> {
+    None
 }
 
 /// The answer of a call that may have to wait: `None` for "not now"

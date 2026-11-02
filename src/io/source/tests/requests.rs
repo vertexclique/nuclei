@@ -941,3 +941,118 @@ fn a_registration_made_after_a_retire_fails_no_read_after_it() {
     drop(shard);
     reads_after_the_retire(&runtime(None), &a, &b);
 }
+
+/// A connected TCP pair over the loopback.
+#[cfg(unix)]
+fn tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (b, _) = listener.accept().unwrap();
+    (a, b)
+}
+
+#[cfg(unix)]
+#[test]
+fn unacked_counts_what_the_peer_has_not_taken() {
+    let (mut writer, mut peer) = tcp_pair();
+    let fd = writer.as_raw_fd();
+    writer.write_all(&[7u8; 1000]).unwrap();
+    let mut got = [0u8; 1000];
+    peer.read_exact(&mut got).unwrap();
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )) {
+        assert!(sys::unacked(fd).is_some(), "the system has a count");
+    }
+    until_some(
+        "the peer never acknowledged the bytes",
+        || match sys::unacked(fd) {
+            Some(0) | None => Some(()),
+            Some(_) => None,
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_wait_for_acks_ends_once_the_peer_acknowledged() {
+    use crate::io::handle::wait_for_acks;
+    let rt = runtime(None);
+    let (mut writer, mut peer) = tcp_pair();
+    let fd = writer.as_raw_fd();
+    let reader = std::thread::spawn(move || {
+        let mut buf = vec![0u8; 100_000];
+        peer.read_exact(&mut buf).unwrap();
+    });
+    writer.write_all(&vec![1u8; 100_000]).unwrap();
+    let start = Instant::now();
+    rt.block_on(wait_for_acks(fd, Duration::from_secs(10)));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the wait outlasted the acknowledgements"
+    );
+    reader.join().unwrap();
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )) {
+        assert_eq!(sys::unacked(fd), Some(0), "every byte acknowledged");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_wait_for_acks_ends_at_its_deadline() {
+    use crate::io::handle::wait_for_acks;
+    let rt = runtime(None);
+    let (mut writer, peer) = tcp_pair();
+    let size: libc::c_int = 4096;
+    for fd in [writer.as_raw_fd(), peer.as_raw_fd()] {
+        for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            // SAFETY: `fd` is open for the call and `size` is a `c_int` of the length given.
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    (&raw const size).cast(),
+                    size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+        }
+    }
+    writer.set_nonblocking(true).unwrap();
+    loop {
+        match writer.write(&[0u8; 4096]) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let fd = writer.as_raw_fd();
+    let counts = cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    ));
+    assert_eq!(sys::unacked(fd).is_some(), counts, "the system's count");
+    if !counts {
+        return;
+    }
+    let start = Instant::now();
+    rt.block_on(wait_for_acks(fd, Duration::from_millis(200)));
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(200),
+        "returned early: {took:?}"
+    );
+    assert!(took < Duration::from_secs(5), "returned late: {took:?}");
+    drop(peer);
+}
