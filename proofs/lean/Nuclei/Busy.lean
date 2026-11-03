@@ -44,15 +44,19 @@ theorem decode_ran (p now : Nat) : decode (ran p) now = p := by
 is past the park's start, since no shard parks longer than it has lived (`p ≤ b`). -/
 theorem decode_parks (b p now : Nat) (hp : p ≤ b) (hb : b ≤ now) :
     decode (parks b p) now = p + (now - b) := by
-  -- the flag is set: `now - (b - p)`, which is `p + (now - b)` under the two bounds
-  simp only [decode, parks]
+  -- the flag is set, so the word decodes to `now - (b - p)` by definition
+  have h : decode (parks b p) now = now - (b - p) := rfl
+  -- which is `p + (now - b)` under the two bounds
+  rw [h]
   omega
 
 /-- No read of a parked shard's word claims more parked time than the reader's clock: the busy
 time a reader computes, its clock less the parked time, never goes below zero. -/
 theorem decode_parks_le (b p now : Nat) : decode (parks b p) now ≤ now := by
-  -- `now - (b - p)` is at most `now`
-  simp only [decode, parks]
+  -- the flag is set, so the word decodes to `now - (b - p)` by definition
+  have h : decode (parks b p) now = now - (b - p) := rfl
+  -- which is at most `now`
+  rw [h]
   omega
 
 /-- A park that ends adds its own length to the total: the running word after a park from `b` to
