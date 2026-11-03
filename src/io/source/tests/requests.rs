@@ -1025,6 +1025,9 @@ fn tcp_pair_with_a_closed_window() -> (std::net::TcpStream, std::net::TcpStream,
     set_buf(listener.as_raw_fd(), libc::SO_RCVBUF, 4096);
     let mut writer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (peer, _) = listener.accept().unwrap();
+    // Darwin does not carry the listener's size to the accepted socket and autotunes its buffer
+    // up to hundreds of KiB; setting it on the socket itself ends that.
+    set_buf(peer.as_raw_fd(), libc::SO_RCVBUF, 4096);
     set_buf(writer.as_raw_fd(), libc::SO_SNDBUF, 256 * 1024);
     writer.set_nonblocking(true).unwrap();
     let mut written = 0;
@@ -1035,6 +1038,14 @@ fn tcp_pair_with_a_closed_window() -> (std::net::TcpStream, std::net::TcpStream,
             Err(e) => panic!("{e}"),
         }
     }
+    let mut readable: libc::c_int = 0;
+    // SAFETY: `peer` is open and FIONREAD writes one `c_int` through the pointer.
+    let ret = unsafe { libc::ioctl(peer.as_raw_fd(), libc::FIONREAD, &raw mut readable) };
+    assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+    assert!(
+        usize::try_from(readable).unwrap() < written,
+        "the peer's window did not close: it holds all {written} bytes written"
+    );
     (writer, peer, written)
 }
 
