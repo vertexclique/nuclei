@@ -47,32 +47,42 @@ fn a_precise_sleep_in_block_on_never_ends_early() {
 
 /// Runs of precise sleeps and of sleeps on the wheel take turns, so the other
 /// tests of this binary, running at once on a host of few cores, slow both
-/// alike: timed one after the other, the run that met them lost to the run
-/// that came after them (an Intel macOS runner, whose precise sleep of 300 us
-/// takes 370 us at the median when it runs alone).
+/// alike. Medians are compared because one preemption on a loaded host lands
+/// in one sleep and should not decide the comparison (an Intel macOS runner,
+/// whose precise sleep of 300 us takes 370 us at the median when it runs alone).
 #[test]
 fn back_to_back_precise_sleeps_do_not_wait_for_the_wheel_millisecond() {
     let rt = runtime(1, false);
-    let (precise, coarse) = rt.block_on(rt.spawn(async {
+    let (mut precise, mut coarse) = rt.block_on(rt.spawn(async {
         let d = Duration::from_micros(300);
-        let (mut precise, mut coarse) = (Duration::ZERO, Duration::ZERO);
+        let (mut precise, mut coarse) = (Vec::new(), Vec::new());
         for _ in 0..5 {
-            let start = std::time::Instant::now();
             for _ in 0..6 {
+                let start = std::time::Instant::now();
                 time::sleep_precise(d).await;
+                precise.push(start.elapsed());
             }
-            precise += start.elapsed();
-            let start = std::time::Instant::now();
             for _ in 0..6 {
+                let start = std::time::Instant::now();
                 time::sleep(d).await;
+                coarse.push(start.elapsed());
             }
-            coarse += start.elapsed();
         }
         (precise, coarse)
     }));
+    precise.sort();
+    coarse.sort();
+    let stats = |v: &[Duration]| (v[v.len() / 2], v[v.len() * 9 / 10], v[v.len() - 1]);
+    let (p, c) = (stats(&precise), stats(&coarse));
     assert!(
-        precise < coarse,
-        "30 precise sleeps of 300 us took {precise:?}, 30 on the wheel {coarse:?}"
+        p.0 < c.0,
+        "precise sleeps of 300 us: median {:?}, p90 {:?}, max {:?}; on the wheel: median {:?}, p90 {:?}, max {:?}",
+        p.0,
+        p.1,
+        p.2,
+        c.0,
+        c.1,
+        c.2
     );
 }
 
