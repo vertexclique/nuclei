@@ -256,6 +256,9 @@ unsafe fn driver_at(
                         && (err.raw_os_error() == Some(libc::ENOMEM)
                             || err.kind() == io::ErrorKind::Unsupported) =>
                 {
+                    log::warn!(
+                        "a worker's io_uring ring could not be made ({err}); this shard uses epoll instead"
+                    );
                     poller()
                 }
                 Err(err) => Err(err),
