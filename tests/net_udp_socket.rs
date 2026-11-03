@@ -154,7 +154,12 @@ fn poll_send_to_and_poll_recv_from_answer_as_their_futures() {
         poll_fn(|cx| a.poll_send_to(cx, b"longer", b_addr))
             .await
             .unwrap();
-        poll_fn(|cx| b.poll_recv_from(cx, &mut buf)).await.unwrap();
+        let got = poll_fn(|cx| b.poll_recv_from(cx, &mut buf)).await;
+        #[cfg(unix)]
+        got.unwrap();
+        // Windows answers a longer datagram `WSAEMSGSIZE`, as std's receive does.
+        #[cfg(windows)]
+        assert_eq!(got.unwrap_err().raw_os_error(), Some(10040));
         assert_eq!(buf.filled(), b"long");
     });
 }

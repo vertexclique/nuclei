@@ -199,11 +199,12 @@ fn an_aligned_buffer_reads_and_writes_files_and_sockets() {
             .await;
         assert_eq!(n.unwrap(), 3);
         let (n, back) = b.recv_owned(AlignedBuf::new(2, 2).unwrap()).await;
-        assert_eq!(
-            (n.unwrap(), &back[..]),
-            (2, &b"ud"[..]),
-            "cut to its capacity"
-        );
+        // Windows answers a longer datagram `WSAEMSGSIZE`, as std's receive does.
+        #[cfg(windows)]
+        assert_eq!(n.unwrap_err().raw_os_error(), Some(10040));
+        #[cfg(unix)]
+        assert_eq!(n.unwrap(), 2, "cut to its capacity");
+        assert_eq!(&back[..], b"ud");
     });
 }
 

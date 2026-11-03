@@ -29,7 +29,7 @@ A_close_now_deaf                   103         58      1  pass                  
 A_capped                           746        366      1  pass                                  pass                                  yes
 A_capped_deaf                      181         91      1  pass                                  pass                                  yes
 A_capped_on_wire                   481        214      1  pass                                  pass                                  yes
-M_uncapped_wait                    159         91      1  violated:Closes                       violated:Closes                       yes
+M_uncapped_wait                     78         45      1  violated:Closes                       violated:Closes                       yes
 M_close_at_drain                   430        214      1  violated:ResetOrBound                 violated:ResetOrBound                 yes
 M_close_at_once                    321        152      1  violated:ResetOrBound                 violated:ResetOrBound                 yes
 W_cap_loss                         207        112      1  violated:NoCapLoss                    violated:NoCapLoss                    yes

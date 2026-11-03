@@ -82,8 +82,8 @@ impl Builder {
     /// reset, and its peer reads the end after the bytes that reached it. [`get_mut`] and
     /// [`into_inner`] wait for the bytes as long at most, and the runtime's drop waits for the
     /// tasks. A stream set to zero linger resets once they are written, at once; on macOS, to a
-    /// loopback peer, it first waits at most 10 ms for the peer's acknowledgements, a wait of its
-    /// own. More than zero; [`build`](Self::build) fails with `InvalidInput` at zero.
+    /// loopback peer, it first waits for the peer's acknowledgements, within the same time. More
+    /// than zero; [`build`](Self::build) fails with `InvalidInput` at zero.
     ///
     /// [`get_mut`]: crate::io::Handle::get_mut
     /// [`into_inner`]: crate::io::Handle::into_inner

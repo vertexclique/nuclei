@@ -258,13 +258,17 @@ impl Shard {
             // queues of posted work, which a moment ago held nothing (they
             // were applied above), are looked at last, past ready IO; the
             // inbox and the homes, which the run queue's last pop just found
-            // empty, from the second look on.
+            // empty, and the future's wake, looked at just above, from the
+            // second look on. So the first look asks the poller before
+            // anything else, and a spin that finds work has looked: its hit
+            // starts the count of runs over (proofs/tla/loop/RunLoop.tla,
+            // `L_spin_woken`).
             let mut first = true;
             let spun = self.spin.run(
                 || self.work_may_come_soon(),
                 || {
-                    (!core::mem::take(&mut first) && self.has_remote_tasks())
-                        || signal.woken.load(Ordering::Relaxed)
+                    (!core::mem::take(&mut first)
+                        && (self.has_remote_tasks() || signal.woken.load(Ordering::Relaxed)))
                         || self.io_ready_now()
                         || self.has_posted_ops()
                 },

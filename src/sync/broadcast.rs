@@ -154,7 +154,22 @@ pub mod error {
 struct Node<T> {
     retired: RetiredNode,
     pos: u64,
-    value: T,
+    value: core::mem::ManuallyDrop<T>,
+}
+
+impl<T> Drop for Node<T> {
+    /// A value whose drop panics is logged: the reclamation frees the node only once its drop
+    /// returns, so a panic let through would lose the node.
+    fn drop(&mut self) {
+        // SAFETY: the value is dropped once, here, as its node goes.
+        let dropped = || unsafe { core::mem::ManuallyDrop::drop(&mut self.value) };
+        if let Some(panic) = crate::rt::caught::catch(dropped) {
+            crate::rt::caught::lost(
+                format_args!("a broadcast value panicked as it was dropped"),
+                panic,
+            );
+        }
+    }
 }
 
 /// Where a receiver is: the position of the next value it takes. Only its
@@ -363,7 +378,7 @@ impl<T: Send + Sync + 'static> Sender<T> {
         let node = alloc_node(Node {
             retired: RetiredNode::new(),
             pos,
-            value,
+            value: core::mem::ManuallyDrop::new(value),
         });
         let guard = pin();
         let mut current = slot.load(Ordering::Acquire, &guard);
@@ -661,7 +676,7 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
                 if !admit() {
                     return Err(Look::Refused);
                 }
-                let value = node.value.clone();
+                let value = T::clone(&node.value);
                 drop(guard);
                 self.advance(next + 1);
                 return Ok(value);
@@ -838,8 +853,8 @@ mod tests {
         let mut other = tx.subscribe();
         for id in 0..8 {
             let value = Boom::stored(id);
-            // The panic of a retired value reaches the sender or is caught
-            // by the reclamation; either way the send went through.
+            // The panic of a retired value is logged as its node goes; the
+            // send went through.
             let _ = catch_unwind(AssertUnwindSafe(|| tx.send(value)));
         }
         let mut last = None;

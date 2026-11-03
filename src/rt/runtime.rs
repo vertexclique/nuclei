@@ -318,6 +318,8 @@ fn teardown_pause(after_take: bool) {
 
 #[cfg(all(test, not(loom)))]
 mod tests_drop;
+#[cfg(all(test, not(loom)))]
+mod tests_nested;
 
 impl Drop for Runtime {
     fn drop(&mut self) {
@@ -412,6 +414,18 @@ pub(crate) fn default_runtime() -> &'static Runtime {
 }
 
 /// The runtime this thread is inside, or the default one.
+impl Inner {
+    /// Another counted reference to this runtime: every `Inner` lives in the `Arc` its builder
+    /// made (`Builder::build`).
+    fn arc(&self) -> Arc<Inner> {
+        // SAFETY: `self` is borrowed from that live `Arc`, so its count is above zero.
+        unsafe {
+            Arc::increment_strong_count(self);
+            Arc::from_raw(self)
+        }
+    }
+}
+
 pub(crate) fn current() -> Arc<Inner> {
     context::runtime().unwrap_or_else(|| Arc::clone(&default_runtime().inner))
 }
@@ -517,10 +531,23 @@ where
     F::Output: Send + 'static,
 {
     let Some(shard) = inner.workers.place(inner.id, inner.local_margin) else {
-        // No worker takes tasks: the spawning thread's own shard runs it.
-        return spawn_here::<_, false>(future);
+        return spawn_unworked(inner, future);
     };
     spawn_on(inner, shard, future)
+}
+
+/// Spawns `future` of `inner`, which has no worker to take it, on the spawning thread's shard.
+/// Where that shard's loop serves another runtime (`inner` runs nested on it) the task is a
+/// visitor, polled and dropped with `inner` current (`proofs/tla/nested/Nested.tla`).
+fn spawn_unworked<F>(inner: &Inner, future: F) -> Task<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    if context::current(|current| current.is_some_and(|shard| shard.serves_other(inner))) {
+        return spawn_here::<_, false>(super::shard::Visiting::new(inner.arc(), future));
+    }
+    spawn_here::<_, false>(future)
 }
 
 /// Spawns `future` on `inner`'s worker `shard`.
@@ -654,24 +681,21 @@ fn block_on_with<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
 }
 
 fn block_on_here<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
-    let _runtime = context::set_runtime(inner);
+    let runtime = context::set_runtime(inner);
     // Pinned here once: the calls below take it by reference.
     let mut future = core::pin::pin!(future);
     // On the shard this thread runs, the call nests, inside the shard: one of
-    // another runtime than the shard is serving keeps its timers in wheels of
-    // its own (`proofs/tla/clock/OneWheel.tla`).
+    // another runtime than the shard serves keeps its timers in wheels of
+    // its own and its loop runs under the one the shard serves
+    // (`proofs/tla/nested/Nested.tla`, `proofs/tla/clock/OneWheel.tla`).
     if let Some(output) = context::current(|current| {
-        current.map(|shard| match _runtime.previous() {
-            Some(outer) if !Arc::ptr_eq(outer, inner) => {
-                shard.block_on_foreign(future.as_mut(), outer, inner)
-            }
-            _ => shard.block_on(future.as_mut()),
-        })
+        current.map(|shard| shard.block_on_nested(future.as_mut(), runtime.previous(), inner))
     }) {
         return output;
     }
     let shard = own_shard();
     let _current = context::enter(&shard);
+    let _serving = shard.serve(inner);
     let _guest = super::paused::Guest::enter(inner, &shard.shared);
     // A seeded runtime's choices made here repeat, call after call.
     let _seeded = inner

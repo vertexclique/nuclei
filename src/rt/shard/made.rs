@@ -201,6 +201,7 @@ impl Shard {
             side: RefCell::new(Vec::new()),
             foreign_poll: Cell::new(false),
             side_seq: Cell::new(0),
+            serving: Cell::new(core::ptr::null()),
             signal: Cell::new(None),
             sources: RefCell::new(Sources::default()),
             children: RefCell::new(children::Children::default()),

@@ -99,5 +99,5 @@ pub async fn advance(duration: Duration) {
     crate::task::yield_now().await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests;

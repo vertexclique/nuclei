@@ -250,10 +250,18 @@ impl<T: IoObject> Handle<T> {
 
     /// A regular file's IO state, made now on its first use, on a lease of
     /// the handle's own descriptor.
+    #[inline]
     pub(crate) fn file(&self) -> io::Result<&Arc<FileIo>> {
-        if let Some(file) = self.file.get() {
-            return Ok(file);
+        match self.file.get() {
+            Some(file) => Ok(file),
+            None => self.make_file(),
         }
+    }
+
+    /// [`file`](Self::file)'s first use, out of line.
+    #[cold]
+    #[inline(never)]
+    fn make_file(&self) -> io::Result<&Arc<FileIo>> {
         let file = FileIo::new(self.source().lease()?, Arc::clone(self.lost()))?;
         Ok(self.file.get_or_init(|| file))
     }
@@ -419,11 +427,6 @@ async fn deliver_file(file: &Arc<FileIo>) {
     }
 }
 
-/// How long a zero-linger reset waits for acknowledgements: macOS's loopback can let the reset
-/// overtake the data still on its way, and the loopback acknowledges what it takes almost at once; the
-/// cap bounds a peer that never acknowledges.
-const ACK_CAP: Duration = Duration::from_millis(10);
-
 /// Delivers what a dropped handle's write-behind holds through `kept`, its
 /// object itself (whose descriptor is `own`), then closes it. Bytes still
 /// behind as the drain ends (its time ran out, or it failed) are given up,
@@ -431,15 +434,17 @@ const ACK_CAP: Duration = Duration::from_millis(10);
 /// after a cut one. A Unix stream has no reset: it closes, and its peer
 /// reads the end after the bytes that reached it (proofs/tla/close,
 /// `W_unix_cut`). A TCP stream set to zero linger then resets at once; only where
-/// `Source::waits_for_acks` says (macOS, a loopback peer) it first waits at most `ACK_CAP` for the
-/// peer to acknowledge what it sent, whether it was dropped with bytes behind or with none behind
-/// but bytes its kernel holds unacknowledged.
+/// `Source::waits_for_acks` says (macOS, a loopback peer) it first waits, for what is left of the
+/// same time, for the peer to acknowledge what it sent, whether it was dropped with bytes behind or
+/// with none behind but bytes its kernel holds unacknowledged: a reader slow to take them keeps the
+/// reset from overtaking them (proofs/tla/close/AbortAcks.tla).
 async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
     let budget = crate::rt::linger::time();
+    let start = std::time::Instant::now();
     let drain = core::future::poll_fn(|cx| source.poll_drain(cx));
     let _ = crate::time::timeout(budget, drain).await;
     if !source.has_unsent() && source.waits_for_acks(own) {
-        wait_for_acks(own, ACK_CAP).await;
+        wait_for_acks(own, budget.saturating_sub(start.elapsed())).await;
     }
     if source.has_unsent()
         && source.kind() == Kind::Tcp

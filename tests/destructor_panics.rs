@@ -461,11 +461,14 @@ fn an_output_whose_drop_panics_is_logged_when_its_handle_is_dropped_unawaited() 
     let rt = runtime(|b| b);
     let h = rt.handle();
     rt.block_on(async {
-        let mut task = h.spawn(async { Bomb("unclaimed output dropped") });
-        let probe = Arc::new(Probe::new());
-        let waker = probe.waker();
-        if poll_once(&mut task, &waker).is_pending() {
-            wait_for(&probe.woken, "the task never completed");
+        let task = h.spawn(async { Bomb("unclaimed output dropped") });
+        // Watched, not polled: a poll that found it completed would take the output.
+        let deadline = Instant::now() + SAFETY;
+        let mut pause = Duration::from_micros(50);
+        while !task.is_finished() {
+            assert!(Instant::now() < deadline, "the task never completed");
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(20));
         }
         // Completed and not taken: the handle's drop takes the output.
         drop(task);

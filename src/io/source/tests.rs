@@ -590,8 +590,12 @@ fn a_datagram_is_cut_to_the_buffer_as_the_kernel_cuts_it() {
         let mut recv = Box::pin(poll_fn(|cx| b.src.poll_receive(cx, &mut small, false)));
         pends(&mut recv).await;
         a.io().send(b"0123456789").unwrap();
-        let (n, _) = within(recv).await.unwrap();
-        assert_eq!(n, 4);
+        let got = within(recv).await;
+        #[cfg(unix)]
+        assert_eq!(got.unwrap().0, 4);
+        // Windows answers a longer datagram `WSAEMSGSIZE`, as std's receive does.
+        #[cfg(windows)]
+        assert_eq!(got.unwrap_err().raw_os_error(), Some(10040));
         assert_eq!(&small, b"0123");
         // The rest of that datagram is gone, as with the kernel's own cut.
         a.io().send(b"next").unwrap();

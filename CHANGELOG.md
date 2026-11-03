@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- `broadcast`: a stored value whose drop panics no longer loses its node. The reclamation frees a
+  node only once its drop returns, so the panic left the node allocated for good; the node now catches
+  its value's panic, logs it at error, and is freed. A send that retires such a value no longer panics.
 - **Every task ends when its runtime shuts down or its thread exits.** A task neither queued nor
   woken was left live, its handle never resolved and its destructor never ran; a bound task woken
   after its thread was gone was leaked. Each shard and each thread now keeps a list of its live
@@ -32,9 +35,9 @@
   waiting forever (`tests/net_streams.rs`'s resetting peer, about one run in two on CI's macOS). A
   handle dropped there, to a peer at a loopback address, while its kernel holds bytes the peer has
   not acknowledged (`SO_NWRITE`) now goes to a linger task, after the bytes written behind if there
-  are any, which waits until the peer acknowledged them, for at most 10 ms of its own (apart from
-  `Builder::write_behind_linger`), and then resets; a peer that never acknowledges holds the reset
-  back no longer than that. A drop knows of a zero linger set through `set_zero_linger` or
+  are any, which waits until the peer acknowledged them, within what is left of
+  `Builder::write_behind_linger`, and then resets; a reader slow to take the bytes keeps the reset
+  behind them, and a peer that never acknowledges holds the reset back no longer than that time. A drop knows of a zero linger set through `set_zero_linger` or
   `set_linger` (of the stream, or of the `TcpSocket` it was connected or accepted from). Every
   other system, and any peer that is not a loopback address, resets at once after the bytes written
   behind, as before (`proofs/tla/close/AbortAcks.tla`: `M_uncapped_wait`, `M_close_at_drain`,
@@ -608,10 +611,19 @@
   A single runtime takes the path it took before. The limits: on a worker's shard, whose polls
   the handoff may take, the nested runtime's sleeps share the worker's wheels and fire by the
   worker's runtime's clock, and on a thread's own shard each runtime keeps its own; a sleep made
-  inside the nested `block_on` and polled after it returned reads as elapsed; with three runtimes nested, the
-  outermost one's timers wait until the inner frame returns; the inner runtime's paused clock
-  does not count this shard (`proofs/tla/clock/OneWheel.tla`, `OW_wheels`, and the mutation
-  `M_one_wheel`, the code before).
+  inside the nested `block_on` and polled after it returned reads as elapsed; the inner runtime's
+  paused clock does not count this shard (`proofs/tla/clock/OneWheel.tla`, `OW_wheels`, and the
+  mutation `M_one_wheel`, the code before).
+- **A task polled inside another runtime's nested `block_on` sees its own runtime.** The nested
+  loop ran under the runtime the call found, so an enter guard of another runtime or a third
+  runtime nested inside another's future left the shard's own tasks spawning onto, and reading the
+  clock of, the wrong runtime; the loop now runs under the runtime its shard serves (a worker's; on
+  a thread's own shard, the one its outermost `block_on` or the enclosing nested frame marks). A
+  task that a runtime with no worker spawns onto a shard whose loop serves another runtime (inside
+  its `block_on` nested there, or under its enter guard) is polled and dropped with its own runtime
+  current, so it and what it spawns stay on that runtime. A frame nested inside a foreign future's
+  poll on a thread's own shard puts that future's wheels aside for its loop, and a frame of a
+  runtime already nested there shares its wheels (`proofs/tla/nested/Nested.tla`).
 - **A reentrant lock request that queued before its owner took the lock enters at once.** A
   `ReentrantMutex` lock, or a `ReentrantRwLock` read, looked for its owner only on its first
   poll; once queued it only looked at its place in line. So an owner with two requests out at
@@ -824,6 +836,15 @@
   kept the poller from ever being looked at. Such a back-out now keeps the count, and counts like a
   turn in which the future woke itself, so every `driver_interval`th one looks without waiting
   (`proofs/tla/loop/RunLoop.tla`).
+- **A spin that finds its future woken has looked at the driver.** A shard's spin looked at its
+  `block_on` future's wake before its poller at its first look: a future woken from another thread
+  just after the idle pass looked at it made the spin a hit, which started the count of runs to the
+  next look at timers and the poller over without a look, and a future woken there again and again
+  kept the poller from ever being looked at. The first look now asks the poller before the future,
+  as it already did before the inbox, so a spin that finds work has looked
+  (`proofs/tla/loop/RunLoop.tla`: `L_spin_woken`, and the old order as the mutation
+  `M_spin_woken_unlooked`). It costs nothing: the first look reads one flag less, and the
+  single-connection socket rows on epoll run 8 to 14 fewer user instructions per operation.
 
 ### Changed
 
@@ -871,6 +892,16 @@
   45 fewer instructions per operation (2470 instead of 2514 on epoll) and `bulk` 8 to 12 fewer.
   A thread's own shard, once made, is taken with no result to look at, which takes 2 off each
   `block_on`.
+- **A ring's arrival takes its stream's side inline.** `Side::take`, which the ring's thread runs
+  for each arrival of a multishot receive, had become a call of its own in the default release
+  build as the arrival path grew. It is inlined again (`#[inline(always)]`, with `try_hold_for`).
+  With the spin's first look above, user instructions per operation, one codegen unit and default
+  release build: `tcp_many` on io_uring 2511 and 2556 before, 2482 and 2513 now (0.5.3: 2515 and
+  2554); the TCP round trip on io_uring 3144 and 3297 before, 3110 and 3247 now.
+- **A file read finds its handle's IO state inline.** The look at a file handle's state, which each
+  read makes, was a call of its own in the default release build; it is inline now, and the
+  state's making on first use out of line (`Handle::file`, `make_file`). `file_read` in the default
+  release build runs 296 user instructions per operation instead of 309 (0.5.3: 303).
 - **A read that takes part of a ring's chunk bounds it once.** What a read takes off a chunk of
   the receive group is bounded by what the chunk holds, with no saturating steps: `tcp_split` on
   io_uring runs 3 fewer instructions per operation (401 of 404 under fat LTO). CI's budgets in

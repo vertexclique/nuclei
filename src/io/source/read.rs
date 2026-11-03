@@ -153,6 +153,13 @@ fn msg_size() -> io::Error {
     io::Error::from_raw_os_error(crate::syscore::windows::WSAEMSGSIZE)
 }
 
+/// Whether a peek into `out` is a sender look (`poll_peek_sender`): it asks for the sender
+/// alone, so a datagram of any length answers it and `msg_size` never does.
+#[cfg(windows)]
+fn sender_look(peek: bool, out: &[u8]) -> bool {
+    peek && out.is_empty()
+}
+
 /// Whether `err` is `msg_size`'s.
 #[cfg(port)]
 fn is_msg_size(err: &io::Error) -> bool {
@@ -1317,7 +1324,7 @@ impl ReadState {
             Some((datagram, addr)) => {
                 let (n, addr) = (datagram.peek_into(out), addr.clone());
                 #[cfg(windows)]
-                let long = datagram.bytes().len() > out.len();
+                let long = datagram.bytes().len() > out.len() && !sender_look(peek, out);
                 if !peek && let Some((done, _)) = self.datagrams.pop_front() {
                     done.release(after);
                 }

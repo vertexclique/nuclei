@@ -308,8 +308,9 @@ impl Handle<TcpStream> {
     ///
     /// A handle dropped with bytes still written behind writes them first (within the runtime's
     /// `write_behind_linger`), then resets at once, its kernel dropping what it has not sent, as a
-    /// zero linger asks. On macOS, to a loopback peer, the reset first waits at most 10 ms for the
-    /// peer to acknowledge what is on its way, since that loopback can let a reset overtake data.
+    /// zero linger asks. On macOS, to a loopback peer, the reset first waits, within the same
+    /// `write_behind_linger`, for the peer to acknowledge what is on its way, since that loopback
+    /// can let a reset overtake data.
     pub fn set_zero_linger(&self) -> io::Result<()> {
         self.set_linger(Some(Duration::ZERO))
     }

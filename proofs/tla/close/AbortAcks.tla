@@ -22,15 +22,17 @@
 (* for a stale one, answers with a challenge ACK, and the writer's closed  *)
 (* port answers nothing, so the reset is lost and the reader waits for     *)
 (* good. There, and only there, the close waits until the kernel holds no  *)
-(* byte the peer has not acknowledged, for at most a short cap of its own  *)
-(* (`ACK_CAP`, a few milliseconds, not the drain's time), a drop with      *)
-(* nothing behind but bytes unacknowledged going to the linger task for    *)
-(* it. Everywhere else (`"other"`) the wire keeps its order, the reset     *)
+(* byte the peer has not acknowledged, for at most the time the linger has *)
+(* left (the runtime's `write_behind_linger` less the drain's time, its    *)
+(* "cap"), a drop with nothing behind but bytes unacknowledged going to    *)
+(* the linger task for it. A reader slow to take the bytes (its window    *)
+(* full) acknowledges only as it reads, so a cap of a few milliseconds    *)
+(* would run out with data on the wire and lose the reset. Everywhere else (`"other"`) the wire keeps its order, the reset     *)
 (* comes after the data, and the close comes at once after the drain.      *)
 (*                                                                          *)
 (* What must never happen. The socket never closes (`Closes`): a peer that *)
-(* never acknowledges must not hold the close for the drain's time, and    *)
-(* an uncapped wait would (`uncapped`). The close comes before nuclei's    *)
+(* never acknowledges must not hold the close for good, and a wait with no *)
+(* bound but the acknowledgements would (`uncapped`). The close comes before nuclei's    *)
 (* write-behind went into the kernel, with time left (`DrainedBeforeClose`).*)
 (* The reader neither takes the reset nor saw a bound run out: a stream   *)
 (* left open for good (`ResetOrBound`).                                    *)
@@ -38,10 +40,10 @@
 (* What is abstract. Bytes are counted; a segment is one byte; the         *)
 (* kernel's queue holds `Room`; the reader always has room; the drain's    *)
 (* time running out is a step that may come at any moment, or never; the  *)
-(* cap runs out at some moment once the wait began, and always does. That *)
-(* the loopback acknowledges within the cap is the bet the cap makes, not  *)
-(* a fact the model can check: a cap that runs out with data on the wire   *)
-(* may still lose the reset (`W_cap_loss`).                                *)
+(* cap runs out at some moment once the wait began, and always does: the   *)
+(* linger's time is finite. That the reader takes the bytes within it is   *)
+(* the bet the cap makes, not a fact the model can check: a cap that runs  *)
+(* out with data on the wire may still lose the reset (`W_cap_loss`).     *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, TLC                                            \* numbers, sequences, TLC's helpers
 
@@ -54,7 +56,7 @@ CONSTANTS                                                                   \* w
     Acks,       \* TRUE: the reader's kernel acknowledges what it takes; FALSE: a peer that never does
     Mutation    \* "none"; "close_at_drain": no wait after the drain on macOS's loopback;
                 \* "close_at_once": a drop with nothing behind closes at once there too;
-                \* "uncapped": the wait is bounded only by the drain's time
+                \* "uncapped": the wait has no bound but the acknowledgements
 
 \* Whether the reset may overtake the data on the wire, and so whether the close waits for the acknowledgements.
 Reorders == Platform = "mac_loopback"
@@ -96,8 +98,8 @@ L_wait:                                                                     \* t
     if Reorders /\ Mutation # "close_at_drain" then                         \* only where the reset may overtake:
         waiting := TRUE;                                                    \* the wait begins, and its cap with it
 L_waiting:                                                                  \* until the bytes are acknowledged
-        \* MUTATION uncapped: the wait is bounded only by the drain's time.
-        await (queued = 0 /\ unacked = 0) \/ (IF Mutation = "uncapped" THEN expired ELSE capped);
+        \* MUTATION uncapped: the wait has no bound but the acknowledgements.
+        await (queued = 0 /\ unacked = 0) \/ (Mutation # "uncapped" /\ capped);
         waiting := FALSE;                                                   \* the wait is over
     end if;                                                                 \* elsewhere there is none
 L_close:                                                                    \* the close with no linger
@@ -152,8 +154,8 @@ C_tick:                                                                     \* t
     expired := TRUE;                                                        \* the drain's time ran out
 end process;                                                                \* end of the clock
 
-\* The wait's own cap: once the wait began it runs out at some moment, and always does.
-fair process cap = "cap"                                                    \* weakly fair: a fixed short bound
+\* The wait's cap, the time the linger has left: once the wait began it runs out at some moment, and always does.
+fair process cap = "cap"                                                    \* weakly fair: a finite bound
 begin                                                                       \* its one step:
 K_tick:                                                                     \* the cap
     await waiting;                                                          \* once the wait began

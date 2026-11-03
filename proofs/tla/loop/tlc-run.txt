@@ -1,20 +1,21 @@
-TLC run of every configuration in proofs/tla/loop, 2026-11-03 06:56 UTC.
+TLC run of every configuration in proofs/tla/loop, 2026-11-03 09:15 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
 L_bounded                          145         72      1  pass                                  pass                                  yes
-M_no_self_woken_count               54         31      1  violated:BoundedGap                   violated:BoundedGap                   yes
+M_no_self_woken_count               54         31      2  violated:BoundedGap                   violated:BoundedGap                   yes
 W_self_woken_look                   25         17      1  violated:NoSelfWokenLook              violated:NoSelfWokenLook              yes
-W_gap_reaches_its_bound             37         27      0  violated:GapBelowItsBound             violated:GapBelowItsBound             yes
+W_gap_reaches_its_bound             37         27      1  violated:GapBelowItsBound             violated:GapBelowItsBound             yes
 L_turn                              60         44      1  pass                                  pass                                  yes
-M_turn_unbounded                    32         27      1  violated:TurnGap                      violated:TurnGap                      yes
-W_turn_gap_reaches_its_bound          51         41      1  violated:TurnGapBelowItsBound         violated:TurnGapBelowItsBound         yes
+M_turn_unbounded                    32         27      2  violated:TurnGap                      violated:TurnGap                      yes
+W_turn_gap_reaches_its_bound          51         41      2  violated:TurnGapBelowItsBound         violated:TurnGapBelowItsBound         yes
 L_backout                          361        144      1  pass                                  pass                                  yes
-M_backout_resets                   148         77      1  violated:BoundedGap                   violated:BoundedGap                   yes
-M_backout_uncounted                213        113      1  violated:BoundedGap                   violated:BoundedGap                   yes
-M_no_run_count                      81         51      1  violated:BoundedGap                   violated:BoundedGap                   yes
+M_backout_resets                   148         77      2  violated:BoundedGap                   violated:BoundedGap                   yes
+M_backout_uncounted                213        113      2  violated:BoundedGap                   violated:BoundedGap                   yes
+M_no_run_count                      81         51      2  violated:BoundedGap                   violated:BoundedGap                   yes
 W_unlooked_look                     32         19      1  violated:NoUnlookedLook               violated:NoUnlookedLook               yes
-Q_spin_woken                       279        135      1  violated:BoundedGap                   violated:BoundedGap                   yes
+L_spin_woken                       433        144      2  pass                                  pass                                  yes
+M_spin_woken_unlooked              279        135      1  violated:BoundedGap                   violated:BoundedGap                   yes
 
-results matching EXPECTED.txt: 13 of 13
+results matching EXPECTED.txt: 14 of 14

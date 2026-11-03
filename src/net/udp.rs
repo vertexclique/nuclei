@@ -378,8 +378,8 @@ impl Handle<UdpSocket> {
     /// As `recvfrom(2)` with `MSG_PEEK`.
     pub fn poll_peek_sender(&self, cx: &mut Context<'_>) -> Poll<io::Result<SocketAddr>> {
         // macOS names no sender for a receive into an empty buffer: a peek of one byte gets
-        // it named, and leaves the datagram whole on the socket. Windows names it for an
-        // empty one, and answers a peek cut short with an error.
+        // it named, and leaves the datagram whole on the socket. On Windows a peek into an
+        // empty buffer is the sender look, which a datagram of any length answers.
         #[cfg(unix)]
         let mut room = [0u8; 1];
         #[cfg(windows)]

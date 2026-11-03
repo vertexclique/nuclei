@@ -480,7 +480,7 @@ impl<S> Side<S> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn take(&self, extra: u8, hooks: &impl Hooks<S>) -> Option<Held<'_, S>> {
         match self.take_as(self.role(hooks), extra, hooks) {
             Take::Held(held) => Some(held),
@@ -496,7 +496,7 @@ impl<S> Side<S> {
 
     /// The side, if it is free, taken as `hooks`' thread takes it.
     #[cfg(completion)]
-    #[inline]
+    #[inline(always)]
     pub(crate) fn try_hold_for(&self, hooks: &impl Hooks<S>) -> Option<Held<'_, S>> {
         self.take(0, hooks)
     }

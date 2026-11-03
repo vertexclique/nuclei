@@ -99,10 +99,11 @@ unsafe fn hook_clone(data: *const ()) -> RawWaker {
 }
 
 unsafe fn hook_wake(data: *const ()) {
-    // SAFETY: `data` is a live `Rc` pointer, whose count this consumes.
-    unsafe { hook_wake_by_ref(data) };
-    // SAFETY: as above.
-    unsafe { hook_drop(data) };
+    // SAFETY: consumes the count this waker owns, given back even as `on_wake` panics.
+    let hook = unsafe { Rc::from_raw(data as *const Hook) };
+    if let Some(run) = hook.on_wake.take() {
+        run();
+    }
 }
 
 unsafe fn hook_wake_by_ref(data: *const ()) {
@@ -133,22 +134,29 @@ pub(crate) fn hooked(
 
 static DROP_PANICS: RawWakerVTable = RawWakerVTable::new(
     drop_panics_clone,
-    drop_panics_noop,
+    drop_panics_wake,
     drop_panics_noop,
     drop_panics_drop,
 );
 
 // The four functions below are the vtable of a waker built by `drop_panics`,
-// whose data is a leaked `AtomicBool`.
+// whose data is an `Arc` of its flag, each waker owning one count.
 unsafe fn drop_panics_clone(data: *const ()) -> RawWaker {
+    // SAFETY: `data` came from `Arc::into_raw` of the flag and is live; this adds the clone's count.
+    unsafe { Arc::increment_strong_count(data as *const AtomicBool) };
     RawWaker::new(data, &DROP_PANICS)
+}
+
+unsafe fn drop_panics_wake(data: *const ()) {
+    // SAFETY: consumes the count this waker owns.
+    drop(unsafe { Arc::from_raw(data as *const AtomicBool) });
 }
 
 unsafe fn drop_panics_noop(_: *const ()) {}
 
 unsafe fn drop_panics_drop(data: *const ()) {
-    // SAFETY: `data` is the leaked flag of `drop_panics`, live for good.
-    let armed = unsafe { &*(data as *const AtomicBool) };
+    // SAFETY: consumes the count this waker owns, given back even as the panic unwinds.
+    let armed = unsafe { Arc::from_raw(data as *const AtomicBool) };
     if armed.swap(false, Ordering::SeqCst) {
         panic!("a waker's drop panicked");
     }
@@ -157,14 +165,9 @@ unsafe fn drop_panics_drop(data: *const ()) {
 /// A waker whose first drop, of it or of any clone, panics: what a task's
 /// waker does when releasing it runs user code that fails. It wakes nobody.
 pub(crate) fn drop_panics() -> Waker {
-    let armed: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
-    // SAFETY: the vtable's contract is met by the leaked flag it reads.
-    unsafe {
-        Waker::from_raw(RawWaker::new(
-            armed as *const AtomicBool as *const (),
-            &DROP_PANICS,
-        ))
-    }
+    let armed = Arc::into_raw(Arc::new(AtomicBool::new(true)));
+    // SAFETY: the vtable's contract is met by a pointer from `Arc::into_raw`.
+    unsafe { Waker::from_raw(RawWaker::new(armed.cast(), &DROP_PANICS)) }
 }
 
 /// Runs `poll` inside a poll whose budget is spent.

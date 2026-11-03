@@ -99,6 +99,14 @@ skips=(
   sync::cancellation::tests::dropping_the_last_handle_of_a_deep_chain_frees_every_node
   sync::cancellation::tests::the_registry_is_empty_after_concurrent_trees_are_cancelled_and_dropped
   rt::shard::counted::tests_lazy::pushers_that_race_to_make_the_queue_share_one_and_lose_nothing
+  # Each starts a runtime, whose shards need the kernel poller (the backend probe's `prctl`).
+  rt::task::tests::a_cancel_answers_none_only_once_the_output_is_dropped
+  sync::frames::tests::a_frozen_wait_that_was_granted_passes_the_grant_to_the_frame_on_top
+  sync::frames::tests::nested_blocking_sends_never_wait_on_each_other
+  sync::frames::tests::nested_mutex_waits_never_wait_on_each_other_with_the_lock_free
+  sync::frames::tests::nested_semaphore_waits_never_wait_on_each_other
+  sync::frames::tests::nested_write_waits_never_wait_on_each_other
+  sync::frames::tests::the_stack_is_popped_after_a_panic_in_the_frames_future
   # Runs on its own, below.
   time::clock::tests::reads_never_go_backwards_across_pauses_on_many_threads
 )

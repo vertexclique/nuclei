@@ -52,11 +52,11 @@ def squash(text):
 
 # The build script's short cfg names (build.rs) as they come out with the documented features.
 PLATFORMS = {
-    "linux": {"unix": True, "windows": False, "target_os": "linux", "target_family": "unix",
+    "linux": {"unix": True, "windows": False, "target_os": "linux", "target_family": "unix", "target_arch": "x86_64",
               "ring": True, "port": False, "completion": True, "readiness": True},
-    "macos": {"unix": True, "windows": False, "target_os": "macos", "target_family": "unix",
+    "macos": {"unix": True, "windows": False, "target_os": "macos", "target_family": "unix", "target_arch": "aarch64",
               "ring": False, "port": False, "completion": False, "readiness": True},
-    "windows": {"unix": False, "windows": True, "target_os": "windows", "target_family": "windows",
+    "windows": {"unix": False, "windows": True, "target_os": "windows", "target_family": "windows", "target_arch": "x86_64",
                 "ring": False, "port": True, "completion": True, "readiness": False},
 }
 PLATFORM_NAMES = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}

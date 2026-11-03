@@ -1849,16 +1849,15 @@ after the data, and the close comes at once after the drain; a drop with nothing
 once. On macOS's loopback the reset may overtake the data still on the wire: the reader takes it
 for a stale one and answers with a challenge ACK that the writer's closed port never answers, and
 the stream stays open for good. There, and only for a peer at a loopback address, the close waits
-until the kernel holds no byte the peer has not acknowledged, for at most `ACK_CAP`, a few
-milliseconds of its own, apart from the linger's time. Before, every platform waited for the
-acknowledgements for as long as the linger's time, so a peer that never acknowledged held the
-close that long. 9 configurations: 5 that must pass (two bytes behind and one in the kernel,
+until the kernel holds no byte the peer has not acknowledged, for at most what is left of the
+linger's time: a reader slow to take the bytes acknowledges only as it reads, so a cap of a few
+milliseconds would let the reset overtake them. Every other platform and peer closes at once. 9 configurations: 5 that must pass (two bytes behind and one in the kernel,
 closed at once elsewhere and after the capped wait on macOS's loopback, with
 `DrainedBeforeClose`, the close comes only once the write-behind went into the kernel unless the
 time ran out, `ResetOrBound`, the reader takes the reset unless a bound ran out, and `Closes`, the
 socket closes in the end; a peer that never acknowledges, both ways, with `Closes`; none behind and
-two in the kernel on macOS's loopback), 3 mutations (a wait bounded only by the linger's time
-holds the close for a peer that never acknowledges, breaking `Closes`; the close as the drain
+two in the kernel on macOS's loopback), 3 mutations (a wait with no bound but the
+acknowledgements holds the close for good for a peer that never acknowledges, breaking `Closes`; the close as the drain
 ends and a drop with nothing behind that closes at once, both on macOS's loopback, break
 `ResetOrBound`), and 1 witness (the cap runs out with a byte on the wire and the reset is lost:
 the bet the cap makes is that a loopback acknowledges within a few milliseconds).
@@ -2723,14 +2722,16 @@ that `2N` is reached. An idle pass may look at no driver at all (`BackOut`): the
 work posted after the last look, with the spin cold. Such a pass started the count of runs over all
 the same, so work posted at that moment, again and again, kept the poller from ever being looked
 at. It now keeps the count where it was and counts like a turn of the future's own, so every `N`th
-such pass looks without waiting. 6 more configurations: the bound with such passes (`BoundedGap`),
-3 mutations that break it (a pass counted but starting the count of runs over, as before; a pass
-that keeps the count but is not counted; a task's run not counted down to the next look), a
-witness of a look that came from such passes, and a stated limit, `Q_spin_woken` (`BoundedGap`
-broken): a warm spin that finds the future woken at its very first look, before it asked the
-poller, still starts the count over. Counting that pass too was measured at about 70 instructions
-more a round trip on the socket rows (a look every `N` such passes), for a window a few
-instructions wide that a waker on another thread would have to hit every time.
+such pass looks without waiting. 5 more configurations: the bound with such passes (`BoundedGap`), 3
+mutations that break it (a pass counted but starting the count of runs over, as before; a pass that
+keeps the count but is not counted; a task's run not counted down to the next look), and a witness
+of a look that came from such passes. A warm spin may find the future woken from another thread just
+after the pass looked at it (`SpinWoken`): the spin's first look asks the poller before it looks at
+the future again, so a spin that finds work has always looked, and its hit starts the count over
+rightly. 2 more configurations: the bound with such spins (`L_spin_woken`), and a mutation, the
+first look reading the future's flag first and stopping there, as it did before
+(`M_spin_woken_unlooked`: the count of runs started over with no look, and a future woken in that
+window, again and again, kept the poller from being looked at, breaking `BoundedGap`).
 
 ## The order a shard takes its runnables in
 

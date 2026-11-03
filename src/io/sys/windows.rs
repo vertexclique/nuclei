@@ -31,8 +31,8 @@ use crate::syscore::windows::{
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
     SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
     SOL_SOCKET, STATUS_SUCCESS, SetFileInformationByHandle, SetFilePointerEx, ULONG,
-    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAIoctl, WSASocketW, WriteFile, bind,
-    getsockname, getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, wsa_error,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile,
+    bind, getsockname, getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, wsa_error,
 };
 
 fn socket_of(raw: Raw) -> SOCKET {
@@ -192,7 +192,8 @@ pub(crate) fn recv_ready(raw: Raw, buf: &mut [u8], peek: bool) -> io::Result<usi
 /// datagram socket `raw` into `buf`, made only once a zero-byte look said a
 /// datagram (or an error) came: the socket blocks, and holding one it answers
 /// at once. A datagram longer than `buf` answers `WSAEMSGSIZE`, `buf` holding the bytes that fit
-/// and the datagram consumed (a peek leaves it), as std's receive does.
+/// and the datagram consumed (a peek leaves it), as std's receive does; a peek into an empty `buf`
+/// (a sender look) takes that answer for success, the sender being filled in.
 pub(crate) fn recv_from_ready(
     raw: Raw,
     buf: &mut [u8],
@@ -214,10 +215,15 @@ pub(crate) fn recv_from_ready(
             &mut from_len,
         )
     };
-    if n == SOCKET_ERROR {
-        return Err(wsa_error());
-    }
-    let n = n as usize;
+    let n = if n == SOCKET_ERROR {
+        let err = wsa_error();
+        if !(peek && buf.is_empty() && err.raw_os_error() == Some(WSAEMSGSIZE)) {
+            return Err(err);
+        }
+        0
+    } else {
+        n as usize
+    };
     // SAFETY: the kernel wrote the sender's address and its length.
     let from = unsafe { socket_addr(core::ptr::from_ref(&from).cast(), from_len) }?;
     Ok((n, from))

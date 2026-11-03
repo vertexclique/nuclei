@@ -17,8 +17,9 @@
 (* moment run before it is polled again: each of those turns runs a task  *)
 (* and counts as one, so the counts below are the same. The spin looks     *)
 (* first and starts its clock after that look failed (`Spin::run`,         *)
-(* src/rt/shard/spin.rs): the model sees the spin as the look, whatever    *)
-(* order it makes its looks in.                                            *)
+(* src/rt/shard/spin.rs), and that first look asks the poller before it    *)
+(* looks at anything else: the model sees a spin that found work as a      *)
+(* look.                                                                   *)
 (*                                                                          *)
 (* A turn driven by hand (`Mode = "turn"`) runs the tasks ready, at most N  *)
 (* of them, looks at the timers and the poller, runs the tasks ready again, *)
@@ -33,11 +34,16 @@
 (* count of runs where it was, and counts like a turn in which the future  *)
 (* woke itself: every `N` of them bring a look without waiting. Before, it *)
 (* started the count over: work posted at that moment, again and again,   *)
-(* kept the poller from ever being looked at. A warm spin that finds the   *)
-(* future woken at its very first look, before it asked the poller, still  *)
-(* starts the count over (`SpinWoken`, a stated limit: counting it too     *)
-(* adds a look every `N` such passes, about 70 instructions a round trip   *)
-(* on the socket rows, for a race a few instructions wide).                *)
+(* kept the poller from ever being looked at.                              *)
+(*                                                                         *)
+(* A warm spin may find the future woken from another thread just after    *)
+(* the pass looked at it (`SpinWoken`). The spin's first look asks the     *)
+(* poller before it looks at the future again (src/rt/shard/run.rs,        *)
+(* `run_loop`), so a spin that finds work has looked, and the count starts *)
+(* over rightly. Before, the first look read the future's flag first and   *)
+(* stopped there: the count started over with no look, and a future woken  *)
+(* in that window, again and again, kept the poller from being looked at   *)
+(* (`M_spin_woken_unlooked`).                                              *)
 (*                                                                          *)
 (* What is modelled: the four kinds of turn, in any order the environment   *)
 (* picks, and the two counts (`Shard::since_drive`, which the code keeps   *)
@@ -51,7 +57,7 @@ EXTENDS Integers
 CONSTANTS
     N,         \* DRIVER_INTERVAL
     BackOut,   \* an idle pass may look at no driver: a park that backs out with the spin cold
-    SpinWoken, \* a warm spin may find the future woken at its first look, before it asks the poller
+    SpinWoken, \* a warm spin may find the future woken from another thread, after the pass looked at it
     Mode,      \* "loop": the run loop; "turn": turns driven by hand
     Mutation   \* "none", or the name of the one rule this run takes away
 
@@ -178,11 +184,20 @@ L_turn:
                 gap := gap + 1;                                 \* a turn without a look
             end if;
         or
-            \* The stated limit: a warm spin finds the future woken at its first look, before it
-            \* asks the poller, and the code counts the pass as a look: the count starts over.
-            await SpinWoken;                                    \* only where the limit is checked
-            since := 0;                                         \* the count of runs started over
-            gap := gap + 1;                                     \* a turn without a look
+            \* Nothing to run, and a warm spin finds the future woken from another thread after
+            \* the pass looked at it (src/rt/shard/run.rs, `run_loop`, the spin's looks).
+            await SpinWoken;                                    \* only where such a wake is checked
+            if Mutation = "spin_woken_unlooked" then
+                \* MUTATION spin_woken_unlooked: the spin's first look reads the future's flag
+                \* before it asks the poller, as the code did before, and stops there.
+                since := 0;                                     \* the count of runs started over
+                gap := gap + 1;                                 \* a turn without a look
+            else
+                \* The fix: the first look asks the poller before it looks at the future, so
+                \* the spin that finds the wake has looked.
+                since := 0;                                     \* the look starts the count of runs over
+                gap := 0;                                       \* the driver was looked at
+            end if;
         end either;
         end if;
     end while;

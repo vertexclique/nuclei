@@ -11,4 +11,5 @@ M_backout_resets               MC_RunLoop           violated:BoundedGap
 M_backout_uncounted            MC_RunLoop           violated:BoundedGap
 M_no_run_count                 MC_RunLoop           violated:BoundedGap
 W_unlooked_look                MC_RunLoop           violated:NoUnlookedLook
-Q_spin_woken                   MC_RunLoop           violated:BoundedGap
+L_spin_woken                   MC_RunLoop           pass
+M_spin_woken_unlooked          MC_RunLoop           violated:BoundedGap

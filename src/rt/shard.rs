@@ -72,6 +72,7 @@ mod children;
 mod detached;
 mod ending;
 mod foreign;
+pub(crate) use foreign::Visiting;
 mod going;
 pub(crate) mod locals;
 mod made;
@@ -674,6 +675,10 @@ pub(crate) struct Shard {
     foreign_poll: Cell<bool>,
     /// Counts the sets of side wheels made, for their tags.
     side_seq: Cell<u64>,
+    /// A thread's own shard: its visiting mark, the runtime its loop serves now (the outermost
+    /// `block_on`'s, or the innermost foreign frame's), null outside both
+    /// (`foreign::Shard::serving`).
+    serving: Cell<*const super::runtime::Inner>,
 
     /// The waker the last `block_on` here left, for the next one's future.
     signal: Cell<Option<Arc<signal::Signal>>>,
