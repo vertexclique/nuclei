@@ -128,7 +128,71 @@ impl Dice {
 async fn within<F: core::future::Future>(what: &str, fut: F) -> F::Output {
     match nuclei::time::timeout(DEADLINE, fut).await {
         Ok(out) => out,
-        Err(_) => panic!("soak: {what} had no answer in {DEADLINE:?}"),
+        Err(_) => hung(&format!("soak: {what} had no answer in {DEADLINE:?}")),
+    }
+}
+
+/// The soak's counters, kept where `hung` can reach them from any task.
+static TOTALS: std::sync::OnceLock<Arc<Totals>> = std::sync::OnceLock::new();
+
+/// Fails the soak as hung. The first caller dumps the runtime's state, the
+/// soak's counters and a stack sample of the process first, so a hang on a
+/// runner leaves evidence; later callers only panic.
+fn hung(message: &str) -> ! {
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    if !DUMPED.swap(true, Ordering::SeqCst) {
+        eprintln!("soak: hung, runtime state:\n{:#?}", nuclei::stats());
+        if let Some(t) = TOTALS.get() {
+            eprintln!(
+                "soak: totals: connections={} resets={} cancelled={} bytes={} datagrams={} files={} timers={} blocking={}",
+                t.connections.load(Ordering::Relaxed),
+                t.resets.load(Ordering::Relaxed),
+                t.cancelled.load(Ordering::Relaxed),
+                t.bytes.load(Ordering::Relaxed),
+                t.datagrams.load(Ordering::Relaxed),
+                t.files.load(Ordering::Relaxed),
+                t.timers.load(Ordering::Relaxed),
+                t.blocking.load(Ordering::Relaxed),
+            );
+        }
+        sample_stacks();
+    }
+    panic!("{message}");
+}
+
+/// Best effort: a stack sample of this process from the platform's tool.
+fn sample_stacks() {
+    let pid = std::process::id().to_string();
+    #[cfg(target_os = "macos")]
+    let command = Some(("/usr/bin/sample", vec![pid, "3".into(), "-mayDie".into()]));
+    #[cfg(target_os = "linux")]
+    let command = ["/usr/bin/gdb", "/usr/local/bin/gdb"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|gdb| {
+            (
+                gdb,
+                vec![
+                    "-p".into(),
+                    pid,
+                    "-batch".into(),
+                    "-ex".into(),
+                    "thread apply all bt".into(),
+                ],
+            )
+        });
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let command: Option<(&str, Vec<String>)> = None;
+    let Some((program, args)) = command else {
+        return;
+    };
+    match std::process::Command::new(program).args(&args).output() {
+        Ok(out) => {
+            eprintln!("soak: {program} exited with {}", out.status);
+            eprintln!("{}", String::from_utf8_lossy(&out.stdout));
+            eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+        }
+        Err(e) => eprintln!("soak: {program} could not run: {e}"),
     }
 }
 
@@ -241,7 +305,9 @@ async fn churn(addr: std::net::SocketAddr, mut dice: Dice, totals: Arc<Totals>) 
         let mut buf = vec![0u8; 64 * 1024];
         let started = Instant::now();
         while got < len {
-            assert!(started.elapsed() < DEADLINE, "soak: an answer hung");
+            if started.elapsed() >= DEADLINE {
+                hung("soak: an answer hung");
+            }
             let patience = Duration::from_micros(50 + dice.below(2000));
             match nuclei::time::timeout(patience, conn.read(&mut buf)).await {
                 Err(_) => {
@@ -595,6 +661,7 @@ fn everything_at_once_for_a_long_time_holds_steady_and_checks_every_byte() {
         .build()
         .unwrap();
     let totals = Arc::new(Totals::default());
+    let _ = TOTALS.set(totals.clone());
     let dir = std::env::temp_dir().join(format!("nuclei-soak-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let start = Instant::now();
