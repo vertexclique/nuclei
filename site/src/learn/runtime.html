@@ -23,6 +23,7 @@
 <p><code>block_on</code> works anywhere, inside a task too. There it nests: the shard keeps running its other tasks, timers and IO until the future completes, so synchronous code deep in a call stack can wait on a future without holding the shard.</p>
 <!--example runtime_nested-->
 <p>Two rules come with it. The task that called <code>block_on</code> is not polled again until the call returns, so a future that waits for that very task never completes. And each level runs on the thread's stack, so the depth is bounded by <a href="api:nuclei::Builder::max_nesting"><code>max_nesting</code></a>; one level more panics with a message that says so.</p>
+<p>A <code>block_on</code> of another runtime nests the same way. The shard's loop keeps running under the shard's own runtime, so its tasks still spawn onto it and read its clock; only the nested future runs under the other one. A task that a runtime with no worker (<code>worker_threads(0)</code>) spawns there, inside its nested <code>block_on</code> or under its <code>enter()</code> guard, runs with that runtime current at every poll and as it is dropped.</p>
 
 <h2 id="own">A runtime of your own</h2>
 <p><code>Runtime::new()</code> starts one with every setting at its default; <code>Runtime::builder()</code> sets them (<a href="production.html#builder">every setting</a>). A runtime spawns, runs <code>block_on</code> and runs blocking work, as the free functions do on the default runtime.</p>
