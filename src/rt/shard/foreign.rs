@@ -54,9 +54,9 @@ const TAG_SHIFT: u32 = 48;
 impl Shard {
     /// The runtime this shard serves, against `inner`, the one a nested
     /// `block_on` is of. A worker knows its runtime. A thread's own shard knows it
-    /// from its visiting mark (`serving`): the runtime of the outermost `block_on`
-    /// running it, or of the innermost foreign frame. A loop run with no mark (a
-    /// blocking wait's) serves `found`, the runtime the call found.
+    /// from its visiting mark (`serving`), which whatever makes another runtime
+    /// current under its loop sets (a foreign frame, an enter guard, a visitor's
+    /// poll); with no mark, the runtime current is the loop's, `found`.
     fn serving(&self, found: Option<&Arc<Inner>>, inner: &Arc<Inner>) -> Serving {
         let addr = self.shared.runtime_addr.load(Ordering::Acquire);
         if addr != 0 {
@@ -86,7 +86,7 @@ impl Shard {
     }
 
     /// Whether this shard's loop serves a runtime other than `inner`: a task `inner` spawns here
-    /// is then a visitor ([`Visiting`]).
+    /// is then a visitor (`sched::Visiting`).
     pub(crate) fn serves_other(&self, inner: &Inner) -> bool {
         let addr = self.shared.runtime_addr.load(Ordering::Acquire);
         if addr != 0 {
@@ -96,10 +96,21 @@ impl Shard {
         !serving.is_null() && !core::ptr::eq(serving, inner)
     }
 
-    /// Marks `inner`, the runtime of the outermost `block_on` running this thread's own
-    /// shard, as the one the shard serves, until the guard drops.
-    pub(crate) fn serve<'a>(&'a self, inner: &Arc<Inner>) -> ServingSet<'a> {
-        ServingSet::enter(self, inner)
+    /// Marks `served`, the runtime this thread's own shard's loop runs under, as code of another
+    /// runtime is about to be made current here (an enter guard, a visitor's poll), unless a
+    /// mark is there already or this is a worker's shard, which knows its runtime. Answers
+    /// whether it marked, for [`unmark`](Self::unmark).
+    pub(crate) fn mark_served(&self, served: &Arc<Inner>) -> bool {
+        if self.shared.runtime_addr.load(Ordering::Relaxed) != 0 || !self.serving.get().is_null() {
+            return false;
+        }
+        self.serving.set(Arc::as_ptr(served));
+        true
+    }
+
+    /// Takes back the mark [`mark_served`](Self::mark_served) set.
+    pub(crate) fn unmark(&self) {
+        self.serving.set(core::ptr::null());
     }
 
     /// Runs `future`, of runtime `inner` that the call found as `found`, to its end
@@ -268,9 +279,8 @@ impl Drop for Swapped<'_> {
     }
 }
 
-/// The runtime an outermost `block_on`, or a foreign frame, runs its loop under is what its
-/// shard serves, until it ends.
-pub(crate) struct ServingSet<'a> {
+/// The runtime a foreign frame runs its loop under is what its shard serves, until it ends.
+struct ServingSet<'a> {
     shard: &'a Shard,
     previous: *const Inner,
 }
@@ -336,46 +346,5 @@ impl Drop for Frame<'_> {
         self.shard.count_side();
         // Dropped outside the borrow: the wakers it holds are user code.
         drop(gone);
-    }
-}
-
-/// A task that a runtime with no worker spawned onto a shard whose loop serves another runtime
-/// (a visitor): each poll, and its drop, runs with its own runtime current, so its spawns,
-/// clock reads and blocking jobs go to it (`proofs/tla/nested/Nested.tla`, `TaskSeesOwn`).
-/// Its sleeps wait in the wheels in place, the loop's (`W_visitor_wheels`).
-pub(crate) struct Visiting<F> {
-    inner: Arc<Inner>,
-    future: core::mem::ManuallyDrop<F>,
-}
-
-impl<F> Visiting<F> {
-    pub(crate) fn new(inner: Arc<Inner>, future: F) -> Self {
-        Self {
-            inner,
-            future: core::mem::ManuallyDrop::new(future),
-        }
-    }
-}
-
-impl<F> Future for Visiting<F>
-where
-    F: Future,
-{
-    type Output = F::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
-        // SAFETY: `future` is never moved out of its place; `drop` drops it there.
-        let this = unsafe { self.get_unchecked_mut() };
-        let _visiting = context::set_runtime(&this.inner);
-        // SAFETY: as above, the place is pinned with `self`.
-        unsafe { Pin::new_unchecked(&mut *this.future) }.poll(cx)
-    }
-}
-
-impl<F> Drop for Visiting<F> {
-    fn drop(&mut self) {
-        let _visiting = context::try_set_runtime(&self.inner);
-        // SAFETY: dropped once, here, in its place.
-        unsafe { core::mem::ManuallyDrop::drop(&mut self.future) };
     }
 }

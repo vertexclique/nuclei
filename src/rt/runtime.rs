@@ -544,10 +544,24 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    if context::current(|current| current.is_some_and(|shard| shard.serves_other(inner))) {
-        return spawn_here::<_, false>(super::shard::Visiting::new(inner.arc(), future));
-    }
-    spawn_here::<_, false>(future)
+    let hooks =
+        if context::current(|current| current.is_some_and(|shard| shard.serves_other(inner))) {
+            Some(visitor_hooks(inner))
+        } else {
+            context_hooks()
+        };
+    spawn_here::<_, false>(future, hooks)
+}
+
+/// The hooks of a visitor of `inner`: its runtime's own, and `inner` to make current around its
+/// polls. The visitor is a mark on its schedule, not a wrapper of its future, so a future's poll
+/// keeps the one caller it has.
+#[cold]
+#[inline(never)]
+fn visitor_hooks(inner: &Inner) -> Arc<super::tuning::TaskHooks> {
+    let mut hooks = inner.task_hooks.as_deref().cloned().unwrap_or_default();
+    hooks.visiting = Some(Arc::new(super::sched::Visiting::new(inner.arc())));
+    Arc::new(hooks)
 }
 
 /// Spawns `future` on `inner`'s worker `shard`.
@@ -613,7 +627,10 @@ fn lost_spawn(bound: bool) -> Option<Arc<Shared>> {
 /// Spawns `future` on the shard of the calling thread: the worker it runs,
 /// or the thread's own. `bound`: the future is not `Send` and must stay. A thread whose poll lost
 /// its worker's shard to the monitor spawns a task that is not bound onto that shard.
-fn spawn_here<F, const BOUND: bool>(future: F) -> Task<F::Output>
+fn spawn_here<F, const BOUND: bool>(
+    future: F,
+    hooks: Option<Arc<super::tuning::TaskHooks>>,
+) -> Task<F::Output>
 where
     F: Future + 'static,
     F::Output: 'static,
@@ -629,7 +646,6 @@ where
             Some(lost) => (lost, None),
             None => place(&own_shard()),
         });
-    let hooks = context_hooks();
     // One schedule type per spawn site, known at compile time: a future spawned bound has no
     // unbound task code made for it, and the other way round.
     let at = home.as_ref().map(Arc::as_ptr);
@@ -645,12 +661,16 @@ where
         }
         (runnable, task, at)
     } else {
+        let sched = match &hooks {
+            Some(visitor) if visitor.visiting.is_some() => {
+                Sched::<false>::visitor(shared, Arc::clone(visitor))
+            }
+            _ => Sched::<false>::counted(shared, None, hooks.clone()),
+        };
         // SAFETY: the task's schedule sends a woken task of this shard back
         // to it; the future is 'static, and `Send` (a caller with `BOUND`
         // false is `spawn`'s, whose future is).
-        let (runnable, task) = unsafe {
-            task::spawn_unchecked(future, Sched::<false>::counted(shared, None, hooks.clone()))
-        };
+        let (runnable, task) = unsafe { task::spawn_unchecked(future, sched) };
         (runnable, task, None)
     };
     spawned(hooks.as_deref(), &task);
@@ -695,7 +715,6 @@ fn block_on_here<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
     }
     let shard = own_shard();
     let _current = context::enter(&shard);
-    let _serving = shard.serve(inner);
     let _guest = super::paused::Guest::enter(inner, &shard.shared);
     // A seeded runtime's choices made here repeat, call after call.
     let _seeded = inner
@@ -780,7 +799,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    spawn_here::<_, true>(future)
+    spawn_here::<_, true>(future, context_hooks())
 }
 
 /// Runs `f` on the blocking pool of the runtime this thread is inside, or of

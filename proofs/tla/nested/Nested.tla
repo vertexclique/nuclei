@@ -3,15 +3,19 @@
 (* Which runtime the code on a thread sees as current, and whose timer    *)
 (* wheels are in place, while one runtime's `block_on` runs nested on the *)
 (* shard of another (src/rt/runtime.rs: `block_on_here`, `current`,        *)
-(* `with_clock`, `spawn`; src/rt/shard/foreign.rs: `Shard::block_on_nested`,*)
-(* `Shard::serving`, `Shard::block_on_foreign`, `poll_inside`, `Aside`,    *)
-(* `side_for`, `Frame`, `Visiting`; src/rt/runtime.rs: `spawn_unworked`;  *)
-(* src/rt/context.rs: `set_runtime`, `RuntimeSet`;                        *)
-(* src/rt/runtime/enter.rs: `Runtime::enter`, `worker_index`).             *)
+(* `with_clock`, `spawn`, `spawn_unworked`, `visitor_hooks`;              *)
+(* src/rt/shard/foreign.rs: `Shard::block_on_nested`, `Shard::serving`,   *)
+(* `Shard::serves_other`, `Shard::mark_served`, `Shard::block_on_foreign`, *)
+(* `poll_inside`, `Aside`, `side_for`, `Frame`; src/rt/sched.rs:          *)
+(* `Visiting`, `Sched::before_poll`, `after_poll`, `drop_future`;         *)
+(* src/rt/context.rs: `set_runtime`, `RuntimeSet`, `mark_own`,            *)
+(* `ServedMark`; src/rt/runtime/enter.rs: `Runtime::enter`,               *)
+(* `worker_index`).                                                        *)
 (*                                                                          *)
 (* Who acts. One thread T, running shard S. S serves runtime L: S is a      *)
 (* worker of L, or S is T's own shard and L is the runtime whose outermost *)
-(* `block_on` runs it (the shard's visiting mark). T's thread-local        *)
+(* `block_on` runs it (current under its loop; whatever makes another one  *)
+(* current there marks L: the shard's visiting mark). T's thread-local     *)
 (* "current runtime" (`RUNTIME`) is what every spawn, clock read, blocking *)
 (* job, handle lookup and worker index of the code running on T reads. S   *)
 (* has one set of timer wheels in place, L's own (set 0) unless a nested   *)
@@ -39,9 +43,9 @@
 (* a frame of X is still on S (its sleep would read as elapsed).           *)
 (*                                                                          *)
 (* A task of S is L's, or a visitor of X: spawned by X's code on S       *)
-(* because X has no worker (`spawn_unworked`), it runs wrapped so each     *)
-(* poll, and its drop, has X current (`Visiting`); its sleeps wait in the  *)
-(* wheels in place, L's (a limit: a witness says so).                      *)
+(* because X has no worker (`spawn_unworked`), it runs marked on its       *)
+(* schedule so each poll, and its drop, has X current (`Visiting`); its   *)
+(* sleeps wait in the wheels in place, L's (a limit: a witness says so).   *)
 (*                                                                          *)
 (* What is abstract. One shard; a task is one poll of code; how a set of   *)
 (* wheels fires                                                            *)
@@ -58,7 +62,7 @@ CONSTANTS                                                                    \* 
 
 \* What an element's guard puts back as it is popped, from current runtime c: a frame's guards
 \* the runtime its call found, an enter guard the one it found, a future poll's guard the loop's
-\* runtime (MUTATION no_restore: none), a task's poll the runtime its visitor's wrapper found (an L
+\* runtime (MUTATION no_restore: none), a task's poll the runtime its visitor's mark found (an L
 \* task's poll found L, and sets nothing).
 Restore(c, e) ==                                                             \* the runtime after e's guard
     CASE e.k = "fut" -> IF Mutation = "no_restore" THEN c ELSE e.saved       \* `poll_inside`'s guard
@@ -132,7 +136,7 @@ Step:                                                                        \* 
             await InLoop /\ Len(frames) < MaxStack;                          \* between polls, room left
             with x \in Runtimes do                                           \* L's task, or a visitor of x
                 frames := Append(frames, [k |-> "task", rt |-> x, saved |-> cur, held |-> inPlace]);  \* guards keep both
-                \* MUTATION visitor_unwrapped: a visitor polled with no wrapper keeps the loop's runtime.
+                \* MUTATION visitor_unwrapped: a visitor polled with no mark keeps the loop's runtime.
                 cur := IF x # L /\ Mutation # "visitor_unwrapped" THEN x ELSE cur;  \* `Visiting`: x current
             end with;                                                        \* the task's code runs now, wheels as they are
         or                                                                   \* S's loop polls its frame's future

@@ -31,6 +31,8 @@ impl fmt::Display for RuntimeId {
 /// It stays on the thread that made it.
 #[must_use = "the runtime is set only while the guard lives"]
 pub struct EnterGuard<'a> {
+    // Dropped first: the mark names the runtime `_set` holds.
+    _served: context::ServedMark,
     _set: context::RuntimeSet,
     _runtime: PhantomData<&'a ()>,
     _not_send: PhantomData<*const ()>,
@@ -67,8 +69,10 @@ impl std::error::Error for TryCurrentError {}
 
 fn enter(inner: &Arc<Inner>) -> EnterGuard<'_> {
     crate::buf::serve_with_cap(inner.buffer_cap);
+    let set = context::set_runtime(inner);
     EnterGuard {
-        _set: context::set_runtime(inner),
+        _served: context::ServedMark::new(set.previous()),
+        _set: set,
         _runtime: PhantomData,
         _not_send: PhantomData,
     }

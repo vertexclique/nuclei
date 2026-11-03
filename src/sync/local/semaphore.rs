@@ -444,17 +444,26 @@ mod tests {
 
     /// A semaphore the hooks may borrow for good, freed as the test ends: everything that
     /// borrows it is declared after it, so it goes first.
-    struct Leaked(&'static Semaphore);
+    struct Leaked(core::ptr::NonNull<Semaphore>);
+
+    impl Leaked {
+        fn sem(&self) -> &'static Semaphore {
+            // SAFETY: the semaphore lives until this guard drops, after every borrow of it.
+            unsafe { self.0.as_ref() }
+        }
+    }
 
     impl Drop for Leaked {
         fn drop(&mut self) {
-            // SAFETY: from `Box::leak` in `leaked`; every borrow of it went before this drop.
-            drop(unsafe { Box::from_raw(core::ptr::from_ref(self.0).cast_mut()) });
+            // SAFETY: from `Box::into_raw` in `leaked`; every borrow of it went before this drop.
+            drop(unsafe { Box::from_raw(self.0.as_ptr()) });
         }
     }
 
     fn leaked(permits: usize) -> Leaked {
-        Leaked(Box::leak(Box::new(Semaphore::new(permits))))
+        let sem = Box::into_raw(Box::new(Semaphore::new(permits)));
+        // SAFETY: `Box::into_raw` gives a pointer that is not null.
+        Leaked(unsafe { core::ptr::NonNull::new_unchecked(sem) })
     }
 
     fn boom() -> Waker {
@@ -477,7 +486,7 @@ mod tests {
     #[test]
     fn an_acquire_whose_clone_releases_a_permit_takes_it() {
         let owner = leaked(1);
-        let sem = owner.0;
+        let sem = owner.sem();
         let held = held(sem);
         let mut acquire = Box::pin(sem.acquire());
         let polled = acquire
@@ -493,7 +502,7 @@ mod tests {
     #[test]
     fn an_acquire_whose_clone_closes_the_semaphore_fails() {
         let owner = leaked(0);
-        let sem = owner.0;
+        let sem = owner.sem();
         let closer = hooked(Some(Box::new(move || sem.close())), None);
         let mut acquire = Box::pin(sem.acquire());
         let polled = acquire.as_mut().poll(&mut Context::from_waker(&closer));
@@ -503,7 +512,7 @@ mod tests {
     #[test]
     fn a_refresh_whose_clone_causes_the_grant_reports_it() {
         let owner = leaked(1);
-        let sem = owner.0;
+        let sem = owner.sem();
         let held = held(sem);
         let first = Polled::new(async {});
         let mut acquire = Box::pin(sem.acquire());
@@ -520,7 +529,7 @@ mod tests {
     #[test]
     fn a_close_whose_first_waker_panics_still_ends_every_other_wait() {
         let owner = leaked(0);
-        let sem = owner.0;
+        let sem = owner.sem();
         let mut first = Box::pin(sem.acquire());
         assert!(
             first
@@ -540,7 +549,7 @@ mod tests {
     #[test]
     fn a_serve_whose_first_waker_panics_still_serves_the_next_waiter() {
         let owner = leaked(0);
-        let sem = owner.0;
+        let sem = owner.sem();
         let mut first = Box::pin(sem.acquire());
         assert!(
             first

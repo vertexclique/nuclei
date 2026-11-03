@@ -874,6 +874,56 @@ pub(crate) fn try_set_runtime(inner: &Arc<Inner>) -> Option<RuntimeSet> {
     Some(RuntimeSet { previous })
 }
 
+/// Makes `inner` the runtime set on this thread and answers the one it replaced, for a caller
+/// that puts that back itself ([`put_runtime`]); `None` once this thread's locals are gone.
+pub(crate) fn swap_runtime(inner: &Arc<Inner>) -> Option<Option<Arc<Inner>>> {
+    RUNTIME
+        .try_with(|r| r.replace(Some(Arc::clone(inner))))
+        .ok()
+}
+
+/// Puts back the runtime [`swap_runtime`] replaced.
+pub(crate) fn put_runtime(previous: Option<Arc<Inner>>) {
+    drop(RuntimeSet { previous });
+}
+
+/// Marks `served` on this thread's own shard, if it is the shard this thread runs now and no
+/// mark is there (`Shard::mark_served`): code of another runtime is about to be current under
+/// its loop. Answers whether it marked, for [`unmark_own`].
+pub(crate) fn mark_own(served: &Arc<Inner>) -> bool {
+    let own = local().own.get();
+    current(|current| {
+        current.is_some_and(|shard| core::ptr::eq(shard, own) && shard.mark_served(served))
+    })
+}
+
+/// Takes back the mark [`mark_own`] set.
+pub(crate) fn unmark_own() {
+    // SAFETY: `Here::own` points at the thread's own shard while `OWN` holds it, and at none
+    // once it goes.
+    if let Some(own) = unsafe { local().own.get().as_ref() } {
+        own.unmark();
+    }
+}
+
+/// The visiting mark of an enter guard ([`mark_own`]), taken back as it drops.
+pub(crate) struct ServedMark(bool);
+
+impl ServedMark {
+    /// Marks `served`, the runtime current before the guard, if [`mark_own`] does.
+    pub(crate) fn new(served: Option<&Arc<Inner>>) -> Self {
+        Self(served.is_some_and(mark_own))
+    }
+}
+
+impl Drop for ServedMark {
+    fn drop(&mut self) {
+        if self.0 {
+            unmark_own();
+        }
+    }
+}
+
 /// Restores the runtime that was set before [`set_runtime`].
 pub(crate) struct RuntimeSet {
     previous: Option<Arc<Inner>>,

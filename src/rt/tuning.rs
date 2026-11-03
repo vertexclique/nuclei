@@ -197,6 +197,8 @@ pub(crate) struct TaskHooks {
     pub(crate) terminate: Option<TaskHook>,
     /// Weak: the runtime holds its tasks' hooks.
     pub(crate) shutdown: Option<std::sync::Weak<super::runtime::Inner>>,
+    /// The runtime of a visitor, current for its polls and its future's drop.
+    pub(crate) visiting: Option<Arc<super::sched::Visiting>>,
 }
 
 impl TaskHooks {

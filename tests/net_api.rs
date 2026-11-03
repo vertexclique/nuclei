@@ -67,9 +67,20 @@ fn a_datagrams_sender_is_peeked_and_it_stays_to_be_received() {
         );
         let mut storage = [0u8; 3];
         let mut buf = ReadBuf::new(&mut storage);
-        let (n, from) = b.recv_buf_from(&mut buf).await.unwrap();
-        assert_eq!((n, from), (3, a.local_addr().unwrap()), "cut to the buffer");
-        assert_eq!(buf.filled(), b"hel");
+        let got = b.recv_buf_from(&mut buf).await;
+        #[cfg(unix)]
+        {
+            let (n, from) = got.unwrap();
+            assert_eq!((n, from), (3, a.local_addr().unwrap()), "cut to the buffer");
+            assert_eq!(buf.filled(), b"hel");
+        }
+        // Windows answers a longer datagram `WSAEMSGSIZE`, as std's receive does; an error
+        // fills nothing.
+        #[cfg(windows)]
+        {
+            assert_eq!(got.unwrap_err().raw_os_error(), Some(10040));
+            assert!(buf.filled().is_empty());
+        }
 
         a.connect(b_addr).unwrap();
         b.connect(a.local_addr().unwrap()).unwrap();

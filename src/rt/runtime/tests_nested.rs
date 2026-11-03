@@ -222,3 +222,36 @@ fn a_task_spawned_under_an_enter_guard_on_an_own_shard_sees_the_guards_runtime()
     });
     assert_eq!(seen, (x_id, l.handle().id()));
 }
+
+/// A visitor's future is dropped with its own runtime current too: a cancel that its shard's
+/// loop ends drops it there, under the visitor's runtime.
+#[test]
+fn a_visitors_future_is_dropped_with_its_own_runtime_current() {
+    struct Report(mpsc::Sender<RuntimeId>);
+
+    impl Drop for Report {
+        fn drop(&mut self) {
+            let _ = self.0.send(here());
+        }
+    }
+
+    let l = runtime(1);
+    let x = Arc::new(runtime(0));
+    let x_id = x.handle().id();
+    let nested = Arc::clone(&x);
+    let (tx, rx) = mpsc::channel();
+    l.block_on(l.spawn(async move {
+        nested.block_on(async move {
+            let report = Report(tx);
+            let task = crate::spawn(async move {
+                let _report = report;
+                core::future::pending::<()>().await;
+            });
+            crate::task::yield_now().await;
+            drop(task);
+            crate::task::yield_now().await;
+        });
+        drop(nested);
+    }));
+    assert_eq!(rx.recv_timeout(LIMIT).unwrap(), x_id);
+}

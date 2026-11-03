@@ -24,10 +24,19 @@ pub(crate) struct Sched<const BOUND: bool> {
     home: ManuallyDrop<Option<Arc<Home>>>,
     /// Its runtime's task hooks, if it has any.
     hooks: ManuallyDrop<Option<Arc<super::tuning::TaskHooks>>>,
-    /// The task counts in its shard's live tasks (and, bound, in its home's)
-    /// until its future is dropped, which happens inside the shard's
-    /// runtime wherever that is (proofs/tla/going/Linger.tla).
-    counted: bool,
+    /// Whether the task counts in its shard's live tasks (and, bound, in its home's) until its
+    /// future is dropped, which happens inside the shard's runtime wherever that is
+    /// (proofs/tla/going/Linger.tla), or, a visitor's, inside the runtime it visits for.
+    kind: Kind,
+}
+
+/// What a schedule's task is, for the drop of its future: one test on the common kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Counted,
+    Uncounted,
+    /// Counted, and its hooks name the runtime it visits for ([`Visiting`]).
+    Visitor,
 }
 
 impl<const BOUND: bool> Sched<BOUND> {
@@ -45,8 +54,16 @@ impl<const BOUND: bool> Sched<BOUND> {
             shard: ManuallyDrop::new(shard),
             home: ManuallyDrop::new(home),
             hooks: ManuallyDrop::new(hooks),
-            counted: true,
+            kind: Kind::Counted,
         }
+    }
+
+    /// The runtime a visitor's future is dropped inside: the one it visits for.
+    #[cold]
+    #[inline(never)]
+    fn visited_runtime(&self) -> Option<context::RuntimeSet> {
+        let visiting = self.hooks.as_ref().as_ref()?.visiting.as_deref()?;
+        Some(context::set_runtime(&visiting.inner))
     }
 }
 
@@ -58,8 +75,17 @@ impl Sched<false> {
             shard: ManuallyDrop::new(shard),
             home: ManuallyDrop::new(None),
             hooks: ManuallyDrop::new(None),
-            counted: false,
+            kind: Kind::Uncounted,
         }
+    }
+
+    /// The schedule of a visitor on `shard`, counted as [`counted`](Sched::counted), whose
+    /// `hooks` name the runtime it visits for.
+    pub(crate) fn visitor(shard: Arc<Shared>, hooks: Arc<super::tuning::TaskHooks>) -> Self {
+        debug_assert!(hooks.visiting.is_some());
+        let mut sched = Self::counted(shard, None, Some(hooks));
+        sched.kind = Kind::Visitor;
+        sched
     }
 }
 
@@ -109,14 +135,16 @@ unsafe impl<const BOUND: bool> Schedule for Sched<BOUND> {
         } else if links.is_listed() {
             self.unlist(links);
         }
-        if !self.counted {
-            return drop();
-        }
         {
             // Woken after its shard stopped, a task is dropped on its
             // waker's thread: what its drop hands on (a dropped handle's
             // bytes) still goes to its runtime (proofs/tla/going/Linger.tla).
-            let _runtime = self.shard.enter_runtime();
+            // A visitor's goes to the runtime it visits for.
+            let _runtime = match self.kind {
+                Kind::Counted => self.shard.enter_runtime(),
+                Kind::Visitor => self.visited_runtime(),
+                Kind::Uncounted => return drop(),
+            };
             drop();
         }
         if self.shard.load.fetch_sub(1, Ordering::Release) == 1 {
@@ -127,6 +155,9 @@ unsafe impl<const BOUND: bool> Schedule for Sched<BOUND> {
     #[inline]
     fn before_poll(&self, id: super::task::Id) {
         if let Some(hooks) = &*self.hooks {
+            if let Some(visiting) = &hooks.visiting {
+                visiting.enter();
+            }
             super::tuning::call(hooks.before_poll.as_ref(), id);
         }
     }
@@ -139,7 +170,13 @@ unsafe impl<const BOUND: bool> Schedule for Sched<BOUND> {
     #[inline]
     fn after_poll(&self, id: super::task::Id) -> Option<Panic> {
         match &*self.hooks {
-            Some(hooks) => super::tuning::call_task_caught(hooks.after_poll.as_ref(), id),
+            Some(hooks) => {
+                let panic = super::tuning::call_task_caught(hooks.after_poll.as_ref(), id);
+                if let Some(visiting) = &hooks.visiting {
+                    visiting.leave();
+                }
+                panic
+            }
             None => None,
         }
     }
@@ -306,5 +343,72 @@ impl<const BOUND: bool> Sched<BOUND> {
             None => self.shard.push_remote(runnable),
         }
         drop(keep);
+    }
+}
+
+/// The runtime of a visitor: a task that a runtime with no worker spawned onto a shard whose
+/// loop serves another runtime. It is current for each poll of the task, what the poll found
+/// put back after it, and for the drop of the task's future (`proofs/tla/nested/Nested.tla`,
+/// `TaskSeesOwn`). Its sleeps wait in the wheels in place, the loop's (`W_visitor_wheels`).
+pub(crate) struct Visiting {
+    inner: Arc<super::runtime::Inner>,
+    /// What the poll running now found current (`Arc::into_raw`, 0 for none), or `OUT` between
+    /// polls: one poll of a task runs at a time.
+    found: core::sync::atomic::AtomicUsize,
+    /// The poll running now marked the thread's own shard with what it found (`mark_own`).
+    marked: core::sync::atomic::AtomicBool,
+}
+
+/// [`Visiting::found`] between polls.
+const OUT: usize = usize::MAX;
+
+impl Visiting {
+    pub(crate) fn new(inner: Arc<super::runtime::Inner>) -> Self {
+        Self {
+            inner,
+            found: core::sync::atomic::AtomicUsize::new(OUT),
+            marked: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Makes the visited runtime current for a poll; on a thread's own shard, what it found,
+    /// the loop's, is marked as the one the shard serves.
+    fn enter(&self) {
+        if let Some(found) = context::swap_runtime(&self.inner) {
+            let marked = found.as_ref().is_some_and(context::mark_own);
+            self.marked
+                .store(marked, core::sync::atomic::Ordering::Relaxed);
+            let raw = found.map_or(0, |found| Arc::into_raw(found) as usize);
+            self.found.store(raw, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Puts back what the poll found current, and takes back its mark.
+    fn leave(&self) {
+        if self
+            .marked
+            .swap(false, core::sync::atomic::Ordering::Relaxed)
+        {
+            context::unmark_own();
+        }
+        let raw = self.found.swap(OUT, core::sync::atomic::Ordering::Relaxed);
+        if raw != OUT {
+            context::put_runtime(Self::taken(raw));
+        }
+    }
+
+    /// The runtime `enter` kept as `raw`.
+    fn taken(raw: usize) -> Option<Arc<super::runtime::Inner>> {
+        // SAFETY: a nonzero `raw` came from `Arc::into_raw` in `enter`, taken back once.
+        (raw != 0).then(|| unsafe { Arc::from_raw(raw as *const super::runtime::Inner) })
+    }
+}
+
+impl Drop for Visiting {
+    fn drop(&mut self) {
+        let raw = *self.found.get_mut();
+        if raw != OUT {
+            drop(Self::taken(raw));
+        }
     }
 }

@@ -72,7 +72,6 @@ mod children;
 mod detached;
 mod ending;
 mod foreign;
-pub(crate) use foreign::Visiting;
 mod going;
 pub(crate) mod locals;
 mod made;
