@@ -162,6 +162,7 @@ fn hung(message: &str) -> ! {
 
 /// Best effort: a stack sample of this process from the platform's tool.
 fn sample_stacks() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let pid = std::process::id().to_string();
     #[cfg(target_os = "macos")]
     let command = Some(("/usr/bin/sample", vec![pid, "3".into(), "-mayDie".into()]));
