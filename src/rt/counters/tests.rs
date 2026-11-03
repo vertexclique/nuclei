@@ -8,7 +8,9 @@ use std::io::{self, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use super::snapshot;
+use proptest::prelude::*;
+
+use super::{Parked, snapshot};
 use crate::IoBackend;
 use crate::rt::backend::{self, Backend};
 use crate::rt::context;
@@ -633,4 +635,114 @@ fn a_kind_outside_the_table_counts_as_other() {
     for (i, kind) in super::KINDS.iter().enumerate() {
         assert_eq!(super::kind_index(*kind), i, "{kind:?} is counted apart");
     }
+}
+
+const FLAG: u64 = 1 << 63;
+
+proptest! {
+    /// An awake word reads as the total parked, whatever `now` is.
+    #[test]
+    fn an_awake_word_decodes_to_its_total(total in 0..FLAG, now in any::<u64>()) {
+        prop_assert_eq!(Parked::decode(Parked::Total(total).encode(), now), total);
+    }
+
+    /// A parked word reads as the time parked before plus the park so far.
+    #[test]
+    fn a_parked_word_decodes_to_the_park_so_far(
+        before in 0..FLAG / 2,
+        gap in 0..FLAG / 4,
+        so_far in 0..FLAG / 4,
+    ) {
+        let (began, now) = (before + gap, before + gap + so_far);
+        let word = Parked::Since { began, before }.encode();
+        prop_assert!(word & FLAG != 0);
+        let decoded = Parked::decode(word, now);
+        prop_assert_eq!(decoded, before + so_far);
+        prop_assert!(decoded <= now);
+    }
+
+    /// No word reads as more than the shard's age, and a total past 63 bits never sets the flag.
+    #[test]
+    fn a_decoded_word_is_at_most_now(
+        began in any::<u64>(),
+        before in any::<u64>(),
+        total in any::<u64>(),
+        gap in any::<u64>(),
+    ) {
+        let began = began.max(before);
+        let now = began.saturating_add(gap);
+        let word = Parked::Since { began, before }.encode();
+        prop_assert!(Parked::decode(word, now) <= now);
+        prop_assert_eq!(Parked::Total(total).encode() & FLAG, 0);
+    }
+}
+
+/// A one-worker runtime left idle sleeps: its busy time stays still and its parked time follows
+/// the clock, the park in progress included.
+#[test]
+fn an_idle_shard_reads_as_parked_not_busy() {
+    const CAP: usize = (8 << 20) + 4096;
+    let rt = crate::runtime::Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .handoff_after(None)
+        .io_buffer_cap(CAP)
+        .build()
+        .unwrap();
+    rt.block_on(rt.spawn(async {}));
+    let read = || {
+        rt.stats()
+            .shards
+            .into_iter()
+            .find(|s| s.buffer_cap == CAP)
+            .expect("the worker is listed")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut pause = Duration::from_millis(1);
+    while read().parked.is_zero() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never parked"
+        );
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
+    }
+    let before = read();
+    let start = std::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(300));
+    let took = start.elapsed();
+    let after = read();
+    let busy = after.busy.saturating_sub(before.busy);
+    let parked = after.parked.saturating_sub(before.parked);
+    assert!(
+        busy <= Duration::from_millis(50),
+        "an idle shard grew busy by {busy:?}"
+    );
+    assert!(
+        parked >= Duration::from_millis(200),
+        "the park in progress was not counted: parked grew by {parked:?}"
+    );
+    let age = (after.busy + after.parked).saturating_sub(before.busy + before.parked);
+    assert!(
+        age >= took && age <= took + Duration::from_millis(100),
+        "busy and parked add up to {age:?}, not the {took:?} that passed"
+    );
+}
+
+/// A shard driven by hand counts the park its turn makes.
+#[test]
+fn a_turn_that_waits_counts_its_park() {
+    let shard = context::own_shard().unwrap();
+    let _current = context::enter(&shard);
+    shard.publish_now();
+    let before = here();
+    shard.turn(64, Some(Duration::from_millis(20))).unwrap();
+    shard.publish_now();
+    let after = here();
+    assert_eq!(after.parks, before.parks + 1, "the park was not counted");
+    assert!(
+        after.parked > before.parked,
+        "the park's time was not counted: {:?}",
+        after.parked
+    );
 }

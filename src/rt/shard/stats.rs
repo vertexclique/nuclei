@@ -4,6 +4,10 @@
 use super::{Driver, Shard};
 use crate::rt::counters::Published;
 
+fn nanos(length: std::time::Duration) -> u64 {
+    u64::try_from(length.as_nanos()).unwrap_or(u64::MAX)
+}
+
 impl Driver {
     /// The kernel interface the driver runs IO on.
     pub(super) fn backend(&self) -> crate::IoBackend {
@@ -51,6 +55,20 @@ impl Shard {
         if tells_the_spin {
             self.spin.parked_for(slept);
         }
+    }
+
+    /// The shard parks, from `slept` on: `stats` counts the park as it goes.
+    pub(super) fn park_began(&self, slept: std::time::Instant) {
+        let counters = &self.shared.counters;
+        counters.park_began(
+            nanos(slept.duration_since(counters.born())),
+            nanos(self.slept.get()),
+        );
+    }
+
+    /// The shard woke, its park counted by `slept_for`.
+    pub(super) fn park_ended(&self) {
+        self.shared.counters.park_ended(nanos(self.slept.get()));
     }
 
     /// Publishes the polls, the sleeps, the queue, the remote wakes, the
