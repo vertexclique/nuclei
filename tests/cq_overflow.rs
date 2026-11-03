@@ -142,7 +142,15 @@ fn completions_past_the_queue_all_come_with_their_bytes() {
             addr
         })
         .collect();
-    let ring = nuclei::Proactor::backend() == nuclei::IoBackend::IoUring;
+    // A shard whose ring could not be made runs the poller whatever the process chose.
+    until("the server's shard listed", || {
+        nuclei::stats().shards.iter().any(|s| s.buffer_cap == CAP)
+    });
+    let ring = nuclei::stats()
+        .shards
+        .iter()
+        .find(|s| s.buffer_cap == CAP)
+        .is_some_and(|s| s.backend == nuclei::IoBackend::IoUring);
     // On a ring the shard's thread is held in one task, so no completion is taken until every
     // peer connected and sent its request.
     let release = Arc::new(AtomicBool::new(!ring));
