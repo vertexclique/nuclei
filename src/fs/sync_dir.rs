@@ -19,8 +19,13 @@ use super::ops::blocking;
 /// 4. `sync_dir` the directory they are in.
 ///
 /// On Windows the directory is opened with backup semantics for reading and
-/// writing and flushed (`FlushFileBuffers`); on Apple's systems a full flush
-/// of a directory the system refuses is made with `fsync`.
+/// writing and flushed (`FlushFileBuffers`). On Apple's systems the entries go
+/// through with `F_FULLFSYNC`, which flushes the drive's cache too: APFS,
+/// HFS+ and FAT take it for a directory (macOS 15 and 26). A file system
+/// that refuses it gets `F_BARRIERFSYNC`, or, refusing that as well,
+/// `fsync`. Neither of those flushes the drive's cache, so there the call
+/// answers `Ok` once the entries reached the drive, and a power loss may
+/// still lose them.
 ///
 /// # Errors
 ///
@@ -32,22 +37,46 @@ pub async fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
     blocking(move || sync_dir_now(&path)).await
 }
 
+/// std's `sync_all`, which is `F_FULLFSYNC` on Apple's systems; there a file system that
+/// refuses it gets the strongest call it takes after it, `F_BARRIERFSYNC` and then `fsync`
+/// (`proofs/tla/dirsync/DirSync.tla`). Any other error is the answer.
 #[cfg(unix)]
 fn sync_dir_now(path: &Path) -> io::Result<()> {
     let dir = std::fs::File::open(path)?;
     let synced = dir.sync_all();
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    if let Err(err) = &synced
-        && matches!(err.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL))
-    {
+    if synced.as_ref().is_err_and(refused) {
         use std::os::fd::AsRawFd;
-        // SAFETY: a plain call on the descriptor `dir` keeps open.
-        return match unsafe { libc::fsync(dir.as_raw_fd()) } {
-            0 => Ok(()),
-            _ => Err(io::Error::last_os_error()),
-        };
+        let fd = dir.as_raw_fd();
+        // SAFETY: plain calls on the descriptor `dir` keeps open.
+        let barrier = again(|| unsafe { libc::fcntl(fd, libc::F_BARRIERFSYNC) });
+        if !barrier.as_ref().is_err_and(refused) {
+            return barrier;
+        }
+        // SAFETY: as above.
+        return again(|| unsafe { libc::fsync(fd) });
     }
     synced
+}
+
+/// Whether a sync's error says the file system refuses that call.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn refused(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL))
+}
+
+/// `call`'s answer, made again while a signal cuts it short.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn again(mut call: impl FnMut() -> libc::c_int) -> io::Result<()> {
+    loop {
+        if call() != -1 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(err);
+        }
+    }
 }
 
 #[cfg(windows)]

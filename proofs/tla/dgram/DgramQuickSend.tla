@@ -21,6 +21,16 @@
 (* room it waits for the next writable edge. The driver lets a writable    *)
 (* edge go by while the word is clear: nobody waits for room then.         *)
 (*                                                                          *)
+(* A kernel may refuse a datagram it has no room for instead of saying     *)
+(* "not now" (FreeBSD's Unix datagram socket answers `ENOBUFS` at once,    *)
+(* sys/kern/uipc_usrreq.c `uipc_sosend_dgram`, and a read of its peer      *)
+(* raises no writable edge, `uipc_soreceive_dgram`): the call answers the  *)
+(* refusal, as std's does, since only "not now" (`EAGAIN`) waits           *)
+(* (src/io/sys/unix.rs `ready`), and the datagram never arrives. A         *)
+(* datagram larger than the system sends (`EMSGSIZE`: macOS's and          *)
+(* FreeBSD's send buffer, FreeBSD's `net.local.dgram.maxdgram`) is refused *)
+(* through the same answer, room or not: the step's refusal stands for it. *)
+(*                                                                         *)
 (* What must never happen: the task's datagrams reach the peer out of the  *)
 (* order it sent them, or a call that waits forever.                       *)
 (*                                                                          *)
@@ -33,6 +43,7 @@
 EXTENDS Integers, Sequences, TLC
 
 CONSTANTS
+    Refuses,   \* TRUE: the kernel refuses a datagram with no room, and reads raise no edge (FreeBSD)
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* How many datagrams the task sends.
@@ -43,6 +54,7 @@ Room == 1
 (* --algorithm DgramQuickSend
 variables
     socket = <<0>>,        \* datagrams the kernel holds for the peer, oldest first; 0 is from before
+    took = <<0>>,          \* every datagram the kernel took, in the order it took them
     wire = <<>>,           \* datagrams the peer read, in order
     event = FALSE,         \* a writable edge epoll has to report
     guard = "none",        \* who holds the side: "none" or "task" (the driver's turn is one step)
@@ -53,13 +65,17 @@ variables
     holds = FALSE,         \* the side's word: a send goes through the side, and an edge reaches it
     quickSent = FALSE,     \* (record) a call with no guard handed its datagram to the kernel
     skipped = FALSE,       \* (record) the driver let a writable edge go by
-    waited = FALSE;        \* (record) a call waited for room
+    waited = FALSE,        \* (record) a call waited for room
+    refused = FALSE;       \* (record) a call answered the kernel's refusal
 
 define
     \* The word a holder leaves as it lets go: raised while a call found no room and no edge
     \* came since, or a call waits.
     \* MUTATION forget_wait: the word left forgets a call that waits for room.
     Left(b, w) == IF Mutation = "forget_wait" THEN FALSE ELSE b \/ w
+    \* The kernel answers a datagram with no room by refusing it, and the call ends with that.
+    \* MUTATION refusal_waits: the call takes a refusal for "not now" and waits for room.
+    Refusal == Refuses /\ Mutation # "refusal_waits"
 end define;
 
 \* The driver's part for a writable edge, under the guard: a call that waits is woken.
@@ -80,7 +96,7 @@ P_read:
         await socket # <<>>;
         wire := Append(wire, Head(socket));
         socket := Tail(socket);
-        event := TRUE;
+        event := ~Refuses;
     end while;
 end process;
 
@@ -128,8 +144,14 @@ T_ask:
         if Len(socket) < Room then
             \* The kernel takes it, behind what the socket holds.
             socket := Append(socket, at);
+            took := Append(took, at);
             at := at + 1;
             quickSent := TRUE;
+            goto T_loop;
+        elsif Refusal then
+            \* No room, and the kernel refuses it: the call answers that, and the next one starts.
+            at := at + 1;
+            refused := TRUE;
             goto T_loop;
         else
             \* No room: the kernel says "not now", and the call goes to the side.
@@ -155,8 +177,14 @@ T_step:
         if ~blocked /\ ~(asked /\ Mutation = "no_retry") /\ Len(socket) < Room then
             \* The side's own call: the kernel takes the datagram.
             socket := Append(socket, at);
+            took := Append(took, at);
             at := at + 1;
             done := TRUE;
+        elsif Refusal /\ ~blocked then
+            \* No room, and the kernel refuses it: the call ends with the refusal.
+            at := at + 1;
+            done := TRUE;
+            refused := TRUE;
         else
             \* No room (or, mutated, no second ask): the call waits for the next writable edge.
             blocked := TRUE;
@@ -198,8 +226,10 @@ end algorithm; *)
 (* The properties.                                                         *)
 (***************************************************************************)
 
-\* The peer reads the task's datagrams in the order it sent them, after the one from before.
-InOrder == \A j \in 1..Len(wire) : wire[j] = j - 1
+\* The peer reads the datagrams the kernel took in the order it took them, after the one from
+\* before; with no refusal, every one the task sent.
+InOrder == /\ \A j \in 1..Len(wire) : wire[j] = took[j]
+           /\ ~Refuses => \A j \in 1..Len(took) : took[j] = j - 1
 
 \* Every call ends: the task hands the kernel every datagram.
 Termination == <>(pc["task"] = "Done")
@@ -215,4 +245,6 @@ NoQuickSent == ~quickSent
 NoSkip == ~skipped
 \* A call waited for room.
 NoWait == ~waited
+\* A call answered the kernel's refusal.
+NoRefusal == ~refused
 =============================================================================

@@ -120,6 +120,8 @@ pub(crate) struct Counters {
     cq_overflows: AtomicU64,
     /// Times the shard was handed to another thread, its runner blocked.
     handoffs: AtomicU64,
+    /// Times a handoff of the shard was given up because the heavy fence failed.
+    handoffs_failed: AtomicU64,
     /// The longest poll the runtime's monitor saw, in nanoseconds.
     longest_poll_nanos: AtomicU64,
     /// Times a task's poll spent its budget and yielded.
@@ -175,6 +177,7 @@ impl Counters {
             ops_in_flight: AtomicUsize::new(0),
             cq_overflows: AtomicU64::new(0),
             handoffs: AtomicU64::new(0),
+            handoffs_failed: AtomicU64::new(0),
             longest_poll_nanos: AtomicU64::new(0),
             budget_yields: AtomicU64::new(0),
             poll_times: OnceLock::new(),
@@ -228,6 +231,11 @@ impl Counters {
         self.handoffs.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A handoff of the shard was given up: the heavy fence it needs failed.
+    pub(crate) fn handoff_failed(&self) {
+        self.handoffs_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The monitor saw a poll of at least `length`.
     pub(crate) fn longest_poll(&self, length: std::time::Duration) {
         let nanos = u64::try_from(length.as_nanos()).unwrap_or(u64::MAX);
@@ -264,6 +272,17 @@ impl Counters {
     /// The runtime the shard is a worker of.
     pub(crate) fn runtime(&self) -> Option<u64> {
         self.owner.map(|(runtime, _)| runtime)
+    }
+
+    /// The shard's place among the workers of runtime `runtime`, if it is one of them.
+    pub(crate) fn worker_of(&self, runtime: u64) -> Option<usize> {
+        self.owner
+            .and_then(|(owner, place)| (owner == runtime).then_some(place))
+    }
+
+    /// The IO backend the shard was made with.
+    pub(crate) fn backend(&self) -> IoBackend {
+        self.backend
     }
 
     /// The shard went: `stats` lists it no more.
@@ -309,6 +328,7 @@ impl Counters {
             buffer_exhausted: self.buffer_exhausted.load(Ordering::Relaxed),
             timers: self.timers.load(Ordering::Relaxed),
             handoffs: self.handoffs.load(Ordering::Relaxed),
+            handoffs_failed: self.handoffs_failed.load(Ordering::Relaxed),
             longest_poll: std::time::Duration::from_nanos(
                 self.longest_poll_nanos.load(Ordering::Relaxed),
             ),
@@ -449,7 +469,10 @@ impl IoTimes {
 struct Errors {
     by_kind: [AtomicU64; KINDS.len()],
     refused_registrations: AtomicU64,
+    evictions_given_up: AtomicU64,
     accepts_out_of_descriptors: AtomicU64,
+    accepts_skipped: AtomicU64,
+    cut_datagrams_dropped: AtomicU64,
 }
 
 impl Errors {
@@ -457,7 +480,10 @@ impl Errors {
         Self {
             by_kind: [const { AtomicU64::new(0) }; KINDS.len()],
             refused_registrations: AtomicU64::new(0),
+            evictions_given_up: AtomicU64::new(0),
             accepts_out_of_descriptors: AtomicU64::new(0),
+            accepts_skipped: AtomicU64::new(0),
+            cut_datagrams_dropped: AtomicU64::new(0),
         }
     }
 
@@ -465,7 +491,10 @@ impl Errors {
         ErrorCounts {
             by_kind: core::array::from_fn(|i| self.by_kind[i].load(Ordering::Relaxed)),
             refused_registrations: self.refused_registrations.load(Ordering::Relaxed),
+            evictions_given_up: self.evictions_given_up.load(Ordering::Relaxed),
             accepts_out_of_descriptors: self.accepts_out_of_descriptors.load(Ordering::Relaxed),
+            accepts_skipped: self.accepts_skipped.load(Ordering::Relaxed),
+            cut_datagrams_dropped: self.cut_datagrams_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -476,10 +505,44 @@ static OFF_SHARD: Errors = Errors::new();
 /// Shards that started without their receive group for want of memory.
 static GROUPS_MISSING: AtomicU64 = AtomicU64::new(0);
 
+/// Completions the kernel dropped from a full io_uring completion queue for want of memory.
+static COMPLETIONS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Operations a going shard gave up on while the kernel still held them.
+static OPERATIONS_GIVEN_UP: AtomicU64 = AtomicU64::new(0);
+
+/// Files whose bytes written behind were given up with no caller to answer.
+static WRITE_BEHIND_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// A file's bytes written behind were given up with no caller to answer.
+pub(crate) fn write_behind_lost(files: u64) {
+    WRITE_BEHIND_LOST.fetch_add(files, Ordering::Relaxed);
+}
+
+/// Tasks a thread's exit or a runtime's shutdown could not cancel.
+static TASKS_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Tasks were left: their wake was still on its way at the shutdown deadline.
+pub(crate) fn tasks_left(tasks: u64) {
+    TASKS_LEFT.fetch_add(tasks, Ordering::Relaxed);
+}
+
 /// A shard started without its receive group for want of memory.
 #[cfg(ring)]
 pub(crate) fn receive_buffers_missing() {
     GROUPS_MISSING.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The kernel dropped `n` completions of an io_uring completion queue for want of memory.
+#[cfg(ring)]
+pub(crate) fn completions_dropped(n: u64) {
+    COMPLETIONS_DROPPED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// A going shard gave up on `n` operations the kernel still held.
+#[cfg(ring)]
+pub(crate) fn operations_given_up(n: u64) {
+    OPERATIONS_GIVEN_UP.fetch_add(n, Ordering::Relaxed);
 }
 
 /// Runs `f` with the error table of the shard this thread runs, or the one
@@ -488,6 +551,20 @@ fn errors_here(f: impl FnOnce(&Errors)) {
     super::context::current(|shard| match shard {
         Some(shard) => f(&shard.shared.counters.errors),
         None => f(&OFF_SHARD),
+    });
+}
+
+/// A shard that stopped gave up waiting for a holder of a source's side to let go: counted on
+/// the shard being let go of, else the one this thread runs, else the threads that run none.
+pub(crate) fn eviction_given_up() {
+    let count = |errors: &Errors| errors.evictions_given_up.fetch_add(1, Ordering::Relaxed);
+    super::context::letting_go_of(|shared| match shared {
+        Some(shared) => {
+            count(&shared.counters.errors);
+        }
+        None => errors_here(|errors| {
+            count(errors);
+        }),
     });
 }
 
@@ -504,6 +581,13 @@ pub(crate) fn io_error(err: &io::Error) {
     });
 }
 
+/// A datagram an owned receive whose task went away had cut to its buffer was dropped.
+pub(crate) fn cut_datagram_dropped() {
+    errors_here(|errors| {
+        errors.cut_datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 /// An accept ended in `err`, counted already by [`io_error`]: one that
 /// failed for want of descriptors is counted as such too.
 pub(crate) fn accept_error(err: &io::Error) {
@@ -516,13 +600,77 @@ pub(crate) fn accept_error(err: &io::Error) {
     }
 }
 
-/// Whether `err` says the process or the system has no descriptor left.
+/// A listener skipped a connection that was lost before it was accepted ([`lost_before_accept`]).
+/// Every skip site calls this, so none goes uncounted.
+pub(crate) fn accept_skipped() {
+    errors_here(|errors| {
+        errors.accepts_skipped.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Whether `err` says the process or the system has no descriptor left. Windows answers a socket
+/// it cannot make for that, the one an accept takes a connection into among them, with
+/// `WSAEMFILE` or `WSAENOBUFS` (`WSASocketW`), and an `AcceptEx` that ends for want of system
+/// resources with the status `status_error` names `ERROR_NO_SYSTEM_RESOURCES`.
 pub(crate) fn out_of_descriptors(err: &io::Error) -> bool {
     #[cfg(unix)]
     let codes = [libc::EMFILE, libc::ENFILE];
     #[cfg(windows)]
-    let codes = [crate::syscore::windows::WSAEMFILE];
+    let codes = {
+        use crate::syscore::windows::{ERROR_NO_SYSTEM_RESOURCES, WSAEMFILE, WSAENOBUFS};
+        [WSAEMFILE, WSAENOBUFS, ERROR_NO_SYSTEM_RESOURCES]
+    };
     err.raw_os_error().is_some_and(|code| codes.contains(&code))
+}
+
+/// Whether `err`, an accept's, is the error of the connection it took and not the listener's: its
+/// peer reset or aborted it while it waited in the backlog, or a network error was pending on it.
+/// The listener is as it was, so every accept skips the connection and takes the next one
+/// (proofs/tla/accept). On unix that is `ECONNABORTED` (macOS and the BSDs, and Linux when the
+/// connection's peer address is gone); on Linux and Android also the network errors accept(2)
+/// says to treat like `EAGAIN` by retrying (`EPROTO`, `ENETDOWN`, `ENOPROTOOPT`, `EHOSTDOWN`,
+/// `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETUNREACH`); `AcceptEx` ends with the reset's
+/// status, or with the Win32 error that status maps to.
+pub(crate) fn lost_before_accept(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    let lost = err.kind() == io::ErrorKind::ConnectionAborted || retried_by_accept(err);
+    #[cfg(windows)]
+    let lost = {
+        use crate::syscore::windows::{ERROR_NETNAME_DELETED, WSAECONNABORTED, WSAECONNRESET};
+        err.raw_os_error().is_some_and(|code| {
+            matches!(
+                code,
+                WSAECONNRESET | WSAECONNABORTED | ERROR_NETNAME_DELETED
+            )
+        })
+    };
+    lost
+}
+
+/// Whether `err` is one of the network errors Linux's accept(2) says to treat like `EAGAIN`.
+#[cfg(unix)]
+fn retried_by_accept(err: &io::Error) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        err.raw_os_error().is_some_and(|code| {
+            matches!(
+                code,
+                libc::EPROTO
+                    | libc::ENETDOWN
+                    | libc::ENOPROTOOPT
+                    | libc::EHOSTDOWN
+                    | libc::ENONET
+                    | libc::EHOSTUNREACH
+                    | libc::EOPNOTSUPP
+                    | libc::ENETUNREACH
+            )
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 /// Every shard made and not taken out yet, by the address of its `Shared`
@@ -579,6 +727,10 @@ pub(crate) fn snapshot() -> Stats {
         blocking_queue_depth: super::blocking::queued_everywhere(),
         off_shard_errors: OFF_SHARD.read(),
         receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
+        completions_dropped: COMPLETIONS_DROPPED.load(Ordering::Relaxed),
+        operations_given_up: OPERATIONS_GIVEN_UP.load(Ordering::Relaxed),
+        write_behind_lost: WRITE_BEHIND_LOST.load(Ordering::Relaxed),
+        tasks_left: TASKS_LEFT.load(Ordering::Relaxed),
     }
 }
 
@@ -596,6 +748,10 @@ pub(crate) fn runtime_snapshot(
         blocking_queue_depth: queued,
         off_shard_errors: OFF_SHARD.read(),
         receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
+        completions_dropped: COMPLETIONS_DROPPED.load(Ordering::Relaxed),
+        operations_given_up: OPERATIONS_GIVEN_UP.load(Ordering::Relaxed),
+        write_behind_lost: WRITE_BEHIND_LOST.load(Ordering::Relaxed),
+        tasks_left: TASKS_LEFT.load(Ordering::Relaxed),
     }
 }
 

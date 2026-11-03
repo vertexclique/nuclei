@@ -395,7 +395,7 @@ impl PermitWait {
         }
     }
 
-    #[inline]
+    /// Whether the wait holds a place in the queue.
     pub(super) fn is_queued(&self) -> bool {
         self.contend.is_queued()
     }

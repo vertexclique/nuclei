@@ -19,6 +19,13 @@
 //!   its waker and returns `Pending`, and the pusher wakes it after its push
 //!   returns, as it does for every push. (A sender that is still writing still
 //!   counts as a sender, so the receiver never reads that as the end.)
+//! - A value the receiver popped and could not keep (a panic reached it
+//!   before it left the receive) goes back with
+//!   [`put_back`](MessageQueue::put_back) into the receiver's stash, and the
+//!   next `try_pop` answers it first, as [`Popped::Stashed`]. Each queue
+//!   diverts to the stash through a branch its pop takes rarely anyway (the
+//!   ring's segment cache, the radix head's leaf cache), so a pop that finds
+//!   the stash empty pays nothing for it.
 //! - A push's mark (a stamp, a ready flag) is stored, and the receiver's look
 //!   at it loaded, sequentially consistently: the queue's half of the
 //!   channel's wake handshake (see `chan`).
@@ -37,6 +44,8 @@
 
 #![allow(unsafe_code)]
 
+use crate::sync::internal::{AtomicBool, Ordering, UnsafeCell};
+
 #[cfg(not(all(loom, test)))]
 mod radix;
 #[cfg(not(all(loom, test)))]
@@ -45,19 +54,83 @@ mod ring;
 #[cfg(not(all(loom, test)))]
 pub(super) use self::radix::Radix;
 
+/// What a pop found.
+pub(super) enum Popped<T> {
+    /// The oldest value, taken from the queue.
+    Value(T),
+    /// A value put back by [`put_back`](MessageQueue::put_back), whose
+    /// admission the limit already has back.
+    Stashed(T),
+    /// None yet, or the next one is still being written.
+    Nothing,
+}
+
+/// The value a receiver put back, held for its next pop: the receiver's
+/// alone, and a flag for [`len`](MessageQueue::len) to count it by.
+pub(super) struct Stash<T> {
+    value: UnsafeCell<Option<T>>,
+    held: AtomicBool,
+}
+
+impl<T> Stash<T> {
+    pub(super) fn new() -> Self {
+        Self {
+            value: UnsafeCell::new(None),
+            held: AtomicBool::new(false),
+        }
+    }
+
+    /// Holds `value`, the stash empty.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the queue's one receiver.
+    pub(super) unsafe fn put(&self, value: T) {
+        // SAFETY: the caller's contract: the cell is the receiver's.
+        self.value.with_mut(|slot| unsafe { *slot = Some(value) });
+        self.held.store(true, Ordering::Release);
+    }
+
+    /// Takes the held value, if any.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the queue's one receiver.
+    pub(super) unsafe fn take(&self) -> Option<T> {
+        self.held.store(false, Ordering::Release);
+        // SAFETY: the caller's contract: the cell is the receiver's.
+        self.value.with_mut(|slot| unsafe { (*slot).take() })
+    }
+
+    /// Whether a value is held, as a snapshot.
+    pub(super) fn is_held(&self) -> bool {
+        self.held.load(Ordering::Acquire)
+    }
+}
+
 /// What a channel needs of its queue.
 pub(super) trait MessageQueue<T> {
     /// Appends `value`.
     fn push(&self, value: T);
 
-    /// Takes the oldest value, without waiting: `None` when there is none
-    /// yet, or when the next one is still being written.
+    /// Takes the oldest value, without waiting: the stash first, then
+    /// [`Popped::Nothing`] when there is none yet, or when the next one is
+    /// still being written.
     ///
     /// # Safety
     ///
     /// The caller is the queue's one receiver: no two calls of this function
     /// on one queue run at once.
-    unsafe fn try_pop(&self) -> Option<T>;
+    unsafe fn try_pop(&self) -> Popped<T>;
+
+    /// Keeps `value`, which `try_pop` answered as [`Popped::Value`], for the
+    /// next `try_pop` to answer first, as [`Popped::Stashed`]. At most one
+    /// value is kept at a time. Runs no user code.
+    ///
+    /// # Safety
+    ///
+    /// As for [`try_pop`](Self::try_pop).
+    unsafe fn put_back(&self, value: T);
 
     /// How many values are queued, as a snapshot: a push in progress counts,
     /// a pop in progress does not.
@@ -96,12 +169,21 @@ impl<T> MessageQueue<T> for Bounded<T> {
     // Inlined at each of the receiver's looks: a look that finds the ring
     // empty is a few loads, which a call would double.
     #[inline(always)]
-    unsafe fn try_pop(&self) -> Option<T> {
+    unsafe fn try_pop(&self) -> Popped<T> {
         match self {
             // SAFETY: the caller's contract, passed on.
             Self::Ring(ring) => unsafe { ring.try_pop() },
             // SAFETY: as above.
             Self::Radix(radix) => unsafe { radix.try_pop() },
+        }
+    }
+
+    unsafe fn put_back(&self, value: T) {
+        match self {
+            // SAFETY: the caller's contract, passed on.
+            Self::Ring(ring) => unsafe { ring.put_back(value) },
+            // SAFETY: as above.
+            Self::Radix(radix) => unsafe { radix.put_back(value) },
         }
     }
 
@@ -121,9 +203,14 @@ impl<T> MessageQueue<T> for Radix<T> {
     }
 
     #[inline]
-    unsafe fn try_pop(&self) -> Option<T> {
+    unsafe fn try_pop(&self) -> Popped<T> {
         // SAFETY: the caller's contract, passed on.
         unsafe { Radix::try_pop(self) }
+    }
+
+    unsafe fn put_back(&self, value: T) {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { Radix::put_back(self, value) }
     }
 
     fn len(&self) -> usize {
@@ -157,6 +244,7 @@ pub(super) struct Queue<T> {
     tail: crate::sync::internal::AtomicU64,
     head: crate::sync::internal::AtomicU64,
     cells: [LoomCell<T>; LOOM_CELLS],
+    stash: Stash<T>,
 }
 
 // SAFETY: as for the real queue: values move between threads, which is all
@@ -179,6 +267,7 @@ impl<T> Queue<T> {
                 claimed: std::sync::atomic::AtomicBool::new(false),
                 value: crate::sync::internal::UnsafeCell::new(None),
             }),
+            stash: Stash::new(),
         }
     }
 
@@ -198,33 +287,47 @@ impl<T> Queue<T> {
         cell.ready.store(true, Ordering::SeqCst);
     }
 
-    /// As the real queue's: `None` for an empty queue and for a next cell
+    /// As the real queue's: `Nothing` for an empty queue and for a next cell
     /// claimed and not written yet (counted for the models).
     ///
     /// # Safety
     ///
     /// The caller is the queue's one receiver, as for the real queue.
-    pub(super) unsafe fn try_pop(&self) -> Option<T> {
+    pub(super) unsafe fn try_pop(&self) -> Popped<T> {
         use crate::sync::internal::Ordering;
+        // SAFETY: the caller's contract.
+        if let Some(value) = unsafe { self.stash.take() } {
+            return Popped::Stashed(value);
+        }
         let pos = self.head.load(Ordering::Relaxed) as usize;
-        let cell = self.cells.get(pos)?;
+        let Some(cell) = self.cells.get(pos) else {
+            return Popped::Nothing;
+        };
         if !cell.ready.load(Ordering::SeqCst) {
             if cell.claimed.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::sync::loom_model::busy_look();
             }
-            return None;
+            return Popped::Nothing;
         }
         // SAFETY: ready: its push wrote it; the receiver takes it once.
         let value = cell.value.with_mut(|v| unsafe { (*v).take() });
         self.head.store(pos as u64 + 1, Ordering::Relaxed);
-        value
+        value.map_or(Popped::Nothing, Popped::Value)
+    }
+
+    /// # Safety
+    ///
+    /// The caller is the queue's one receiver, as for the real queue.
+    pub(super) unsafe fn put_back(&self, value: T) {
+        // SAFETY: the caller's contract.
+        unsafe { self.stash.put(value) };
     }
 
     pub(super) fn len(&self) -> usize {
         use crate::sync::internal::Ordering;
         let front = self.head.load(Ordering::Acquire);
         let back = self.tail.load(Ordering::Acquire);
-        back.saturating_sub(front) as usize
+        back.saturating_sub(front) as usize + usize::from(self.stash.is_held())
     }
 }
 
@@ -249,9 +352,14 @@ impl<T> MessageQueue<T> for Queue<T> {
         Queue::push(self, value);
     }
 
-    unsafe fn try_pop(&self) -> Option<T> {
+    unsafe fn try_pop(&self) -> Popped<T> {
         // SAFETY: the caller's contract, passed on.
         unsafe { Queue::try_pop(self) }
+    }
+
+    unsafe fn put_back(&self, value: T) {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { Queue::put_back(self, value) }
     }
 
     fn len(&self) -> usize {

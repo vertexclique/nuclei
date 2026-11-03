@@ -21,4 +21,17 @@ OpsTwo == <<<<"send", "send">>>>
 OpsTwoSenders == <<<<"send">>, <<"send">>>>
 \* Two senders, one modify each.
 OpsTwoModifiers == <<<<"modify">>, <<"modify">>>>
+\* One sender: a send_replace whose clone of the old value panics, then a send it never
+\* reaches.
+OpsReplacePanic == <<<<"replace_panic", "send">>>>
+\* One sender: a send_replace, then a send.
+OpsReplace == <<<<"replace", "send">>>>
+\* One sender sends, subscribes a receiver, and sends again.
+OpsSubscribe == <<<<"send", "subscribe", "send">>>>
+\* One sender sends, then subscribes a receiver.
+OpsSendSubscribe == <<<<"send", "subscribe">>>>
+\* One sender clones itself, then sends; the clone sends once.
+OpsClone == <<<<"clone", "send">>>>
+\* One sender clones itself and goes; the clone sends once.
+OpsCloneOnly == <<<<"clone">>>>
 =============================================================================

@@ -469,7 +469,7 @@ impl UpgradeWait {
     pub(super) fn cancel(&mut self, lock: &RawRwLock) {
         let outcome = self.wait.cancel(&lock.queue);
         lock.upgradable_unlock();
-        if let Cancel::Withdrawn(_) = outcome {
+        if let Cancel::Withdrawn(..) = outcome {
             lock.withdrawn(false);
         }
     }

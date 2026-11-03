@@ -79,10 +79,58 @@ impl ThreadHooks {
     /// when the thread ends by a panic.
     pub(crate) fn started(&self) -> Stopping {
         if let Some(start) = &self.start {
-            start();
+            call_caught(start);
         }
         Stopping(self.stop.clone())
     }
+
+    /// Calls the park hook: the worker is about to sleep.
+    #[inline(always)]
+    pub(crate) fn parked(&self) {
+        if let Some(park) = &self.park {
+            call_caught(park);
+        }
+    }
+
+    /// Calls the unpark hook: the worker woke from its sleep.
+    #[inline(always)]
+    pub(crate) fn unparked(&self) {
+        if let Some(unpark) = &self.unpark {
+            call_caught(unpark);
+        }
+    }
+}
+
+/// Calls a thread hook; one that panics is let go of once the panic hook
+/// reported it, and the thread goes on. The thread holds what the runtime
+/// cannot lose (a shard and the tasks it queues, a pool thread's count, a
+/// park under way), and nothing waits for the hook to hand its panic to
+/// (proofs/tla/hooks, proofs/tla/pool/Start.tla).
+#[cold]
+#[inline(never)]
+fn call_caught(hook: &Hook) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
+}
+
+/// The name of a thread the runtime starts where nobody waits for a panic
+/// of the user's name function (a runner the monitor starts, a blocking-pool
+/// thread): `name`'s, or `fallback` once a panic in it was let go of, after
+/// the panic hook reported it. The run or count the start holds then is not
+/// lost (proofs/tla/hooks, proofs/tla/pool/Start.tla).
+#[cold]
+#[inline(never)]
+pub(crate) fn name_caught(name: &(dyn Fn() -> String + Send + Sync), fallback: &str) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(name))
+        .map_or_else(|_| fallback.to_string(), spawnable)
+}
+
+/// `name` as a thread takes it: cut at its first NUL byte, which no system's
+/// thread name holds and on which a thread's spawn panics.
+pub(crate) fn spawnable(mut name: String) -> String {
+    if let Some(at) = name.find('\0') {
+        name.truncate(at);
+    }
+    name
 }
 
 /// Calls a thread's stop hook when it drops.
@@ -91,7 +139,7 @@ pub(crate) struct Stopping(Option<Hook>);
 impl Drop for Stopping {
     fn drop(&mut self) {
         if let Some(stop) = &self.0 {
-            stop();
+            call_caught(stop);
         }
     }
 }
@@ -149,6 +197,8 @@ pub(crate) struct TaskHooks {
     pub(crate) terminate: Option<TaskHook>,
     /// Weak: the runtime holds its tasks' hooks.
     pub(crate) shutdown: Option<std::sync::Weak<super::runtime::Inner>>,
+    /// The runtime of a visitor, current for its polls and its future's drop.
+    pub(crate) visiting: Option<Arc<super::sched::Visiting>>,
 }
 
 impl TaskHooks {
@@ -181,10 +231,23 @@ pub enum UnhandledPanic {
     ShutdownRuntime,
 }
 
-/// Calls `hook`, if set, for the task `id`. A hook that panics aborts the
-/// process: it runs in the middle of a task's change of state.
+/// Calls `hook`, if set, for the task `id`. A panic of the hook unwinds to
+/// the caller: the spawner, for the spawn hook (the task, never run, is
+/// cancelled as the unwind drops it), and the poll's catch, for the
+/// before-poll hook.
 pub(crate) fn call(hook: Option<&TaskHook>, id: crate::task::Id) {
     if let Some(hook) = hook {
-        crate::rt::task::abort_on_panic(|| hook(&TaskMeta::new(id)));
+        hook(&TaskMeta::new(id));
     }
+}
+
+/// [`call`], catching a panic of the hook: the task it is about takes the
+/// panic as its outcome (the after-poll and terminate hooks, in the middle
+/// of a task's change of state).
+pub(crate) fn call_task_caught(
+    hook: Option<&TaskHook>,
+    id: crate::task::Id,
+) -> Option<super::caught::Panic> {
+    let hook = hook?;
+    super::caught::catch(|| hook(&TaskMeta::new(id)))
 }

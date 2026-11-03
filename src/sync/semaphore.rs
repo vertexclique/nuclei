@@ -246,12 +246,17 @@ impl Semaphore {
     /// Inside another runtime's task it blocks that task's executor thread,
     /// so do not.
     ///
+    /// A wait whose frame runs a task that opens another blocking frame gives
+    /// up its place in line and asks again, at the back, once its frame is on
+    /// top again, so nested blocking waits never wait on each other with the
+    /// resource free.
+    ///
     /// # Panics
     ///
     /// On `wasm32`, where no other thread can return a permit, when the
     /// permit is not free: the call could never end.
     pub fn blocking_acquire(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
-        internal::blocking(self.acquire())
+        internal::blocking_in_line(self.acquire())
     }
 
     /// [`acquire_many`](Self::acquire_many) for a thread that may block: see
@@ -262,7 +267,7 @@ impl Semaphore {
     /// As for [`blocking_acquire`](Self::blocking_acquire), and when `n`
     /// exceeds [`MAX_PERMITS`](Self::MAX_PERMITS).
     pub fn blocking_acquire_many(&self, n: u32) -> Result<SemaphorePermit<'_>, AcquireError> {
-        internal::blocking(self.acquire_many(n))
+        internal::blocking_in_line(self.acquire_many(n))
     }
 
     /// [`acquire_owned`](Self::acquire_owned) for a thread that may block:
@@ -272,7 +277,7 @@ impl Semaphore {
     ///
     /// As for [`blocking_acquire`](Self::blocking_acquire).
     pub fn blocking_acquire_owned(self: Arc<Self>) -> Result<OwnedSemaphorePermit, AcquireError> {
-        internal::blocking(self.acquire_owned())
+        internal::blocking_in_line(self.acquire_owned())
     }
 
     /// [`acquire_many_owned`](Self::acquire_many_owned) for a thread that may
@@ -286,7 +291,7 @@ impl Semaphore {
         self: Arc<Self>,
         n: u32,
     ) -> Result<OwnedSemaphorePermit, AcquireError> {
-        internal::blocking(self.acquire_many_owned(n))
+        internal::blocking_in_line(self.acquire_many_owned(n))
     }
 
     /// Closes the semaphore. Every wait still queued ends in an
@@ -519,6 +524,13 @@ impl Drop for Acquire<'_> {
     }
 }
 
+impl internal::Withdraw for Acquire<'_> {
+    fn withdraw(self: Pin<&mut Self>) {
+        let this = self.get_mut();
+        this.wait.cancel(&this.sem.raw, this.n);
+    }
+}
+
 impl fmt::Debug for Acquire<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Acquire").field("n", &self.n).finish()
@@ -555,6 +567,13 @@ impl Future for AcquireOwned {
 impl Drop for AcquireOwned {
     fn drop(&mut self) {
         self.wait.cancel(&self.sem.raw, self.n);
+    }
+}
+
+impl internal::Withdraw for AcquireOwned {
+    fn withdraw(self: Pin<&mut Self>) {
+        let this = self.get_mut();
+        this.wait.cancel(&this.sem.raw, this.n);
     }
 }
 
@@ -872,5 +891,31 @@ mod tests {
             thread.join().expect("worker");
         }
         assert_eq!(sem.available_permits(), 2);
+    }
+
+    #[test]
+    fn two_wakers_that_panic_in_one_wake_list_neither_abort_nor_strand_the_rest() {
+        use crate::sync::test_support::hooked;
+        let sem = Semaphore::new(0);
+        let boom = || -> Box<dyn FnOnce()> { Box::new(|| panic!("a waker panicked")) };
+        let (first, second) = (hooked(None, Some(boom())), hooked(None, Some(boom())));
+        let mut a = Box::pin(sem.acquire());
+        let mut b = Box::pin(sem.acquire());
+        assert!(
+            a.as_mut()
+                .poll(&mut Context::from_waker(&first))
+                .is_pending()
+        );
+        assert!(
+            b.as_mut()
+                .poll(&mut Context::from_waker(&second))
+                .is_pending()
+        );
+        let mut c = Polled::new(sem.acquire());
+        c.pending();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sem.add_permits(3)));
+        assert!(caught.is_err(), "the first panic reaches the caller");
+        assert_eq!(c.wakes(), 1, "the waiter behind both was woken");
+        assert!(c.ready().is_ok());
     }
 }

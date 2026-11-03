@@ -262,12 +262,17 @@ impl<T: ?Sized> RwLock<T> {
     /// so do not: the task that would release may be the one that thread was
     /// running.
     ///
+    /// A wait whose frame runs a task that opens another blocking frame gives
+    /// up its place in line and asks again, at the back, once its frame is on
+    /// top again, so nested blocking waits never wait on each other with the
+    /// resource free.
+    ///
     /// # Panics
     ///
     /// On `wasm32`, where no other thread can release, when the lock cannot
     /// be shared at once: the call could never end.
     pub fn blocking_read(&self) -> RwLockReadGuard<'_, T> {
-        internal::blocking(self.read())
+        internal::blocking_in_line(self.read())
     }
 
     /// [`write`](Self::write) for a thread that may block: see
@@ -278,7 +283,7 @@ impl<T: ?Sized> RwLock<T> {
     /// On `wasm32`, where no other thread can release, when the lock is held
     /// at all: the call could never end.
     pub fn blocking_write(&self) -> RwLockWriteGuard<'_, T> {
-        internal::blocking(self.write())
+        internal::blocking_in_line(self.write())
     }
 
     /// Waits for the upgradable read. It makes the progress
@@ -417,6 +422,13 @@ impl<T: ?Sized> Drop for Read<'_, T> {
     }
 }
 
+impl<T: ?Sized> internal::Withdraw for Read<'_, T> {
+    fn withdraw(self: Pin<&mut Self>) {
+        let this = self.get_mut();
+        this.wait.cancel(&this.lock.raw, READ);
+    }
+}
+
 impl<T: ?Sized> fmt::Debug for Read<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Read").finish_non_exhaustive()
@@ -476,6 +488,13 @@ impl<'a, T: ?Sized> Future for Write<'a, T> {
 impl<T: ?Sized> Drop for Write<'_, T> {
     fn drop(&mut self) {
         self.wait.cancel(&self.lock.raw, WRITE);
+    }
+}
+
+impl<T: ?Sized> internal::Withdraw for Write<'_, T> {
+    fn withdraw(self: Pin<&mut Self>) {
+        let this = self.get_mut();
+        this.wait.cancel(&this.lock.raw, WRITE);
     }
 }
 

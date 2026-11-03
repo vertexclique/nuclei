@@ -997,12 +997,18 @@ fn dropped_handles_with_unsent_bytes_leave_no_descriptor_open() {
 #[cfg(windows)]
 mod windows;
 
+mod datagram_cut;
+
 mod datagram_owned;
 
 #[cfg(unix)]
 mod emfile;
 
+mod reset;
+
 mod send_file;
+
+mod udp_ahead;
 
 mod zero_copy;
 

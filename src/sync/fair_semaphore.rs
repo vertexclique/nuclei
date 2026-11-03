@@ -270,26 +270,31 @@ impl FairWait {
     /// node.
     ///
     /// A first poll that completes spends one operation of the poll's budget
-    /// (see `coop`); with the budget spent, permits it took go back and it
-    /// yields. A grant to a queued wait spends nothing: that wait yielded.
+    /// (see `coop`), whether it took the permits itself or its queueing's own
+    /// pass granted them; with the budget spent, permits it got go back
+    /// through `give_back` and it yields. A grant to a wait that queued in an
+    /// earlier poll spends nothing: that wait yielded.
     pub(super) fn poll(
         &mut self,
         sem: &FairSemaphore,
         n: usize,
         waker: &Waker,
+        give_back: impl FnOnce(usize),
     ) -> Poll<Result<(), Closed>> {
-        self.poll_admitted(sem, n, waker, || crate::coop::spend(waker))
+        self.poll_admitted(sem, n, waker, crate::coop::try_spend, give_back)
     }
 
     /// [`poll`](Self::poll) with `admit` in place of the budget: asked once
-    /// a first poll would complete, and a `false` undoes it and answers
-    /// `Pending`.
+    /// a first poll would complete, and it wakes nobody. On `false` what the
+    /// poll got goes to `give_back` first, then the task is woken through the
+    /// budget's refusal, and the poll answers `Pending`.
     pub(super) fn poll_admitted(
         &mut self,
         sem: &FairSemaphore,
         n: usize,
         waker: &Waker,
         admit: impl FnOnce() -> bool,
+        give_back: impl FnOnce(usize),
     ) -> Poll<Result<(), Closed>> {
         let granted = if self.wait.is_queued() {
             self.wait.poll(&sem.queue, Some(waker))
@@ -299,20 +304,31 @@ impl FairWait {
                     if admit() {
                         return Poll::Ready(Ok(()));
                     }
-                    sem.release(n);
+                    give_back(n);
+                    crate::coop::refused(waker);
                     return Poll::Pending;
                 }
                 Err(seen) if observed_closed(seen) => {
                     return if admit() {
                         Poll::Ready(Err(Closed))
                     } else {
+                        crate::coop::refused(waker);
                         Poll::Pending
                     };
                 }
                 Err(_) => {}
             }
             sem.enqueue(&mut self.wait, n, waker);
-            self.wait.poll(&sem.queue, None)
+            match self.wait.poll(&sem.queue, None) {
+                Poll::Ready(payload) if !admit() => {
+                    if payload != CLOSED_GRANT {
+                        give_back(n);
+                    }
+                    crate::coop::refused(waker);
+                    return Poll::Pending;
+                }
+                granted => granted,
+            }
         };
         granted.map(|payload| {
             if payload == CLOSED_GRANT {
@@ -328,7 +344,7 @@ impl FairWait {
     pub(super) fn cancel(&mut self, sem: &FairSemaphore, n: usize) {
         match self.wait.cancel(&sem.queue) {
             Cancel::Idle => {}
-            Cancel::Withdrawn(_) => sem.withdrawn(false),
+            Cancel::Withdrawn(_, _shelved) => sem.withdrawn(false),
             // A grant made because the semaphore closed carries nothing.
             Cancel::Granted(payload) if payload == CLOSED_GRANT => {}
             Cancel::Granted(_) => {
@@ -431,7 +447,8 @@ mod tests {
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            this.wait.poll(this.sem, this.n, cx.waker())
+            let sem = this.sem;
+            this.wait.poll(sem, this.n, cx.waker(), |n| sem.release(n))
         }
     }
 

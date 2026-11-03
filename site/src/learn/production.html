@@ -33,7 +33,7 @@ nuclei::runtime::Builder::backend
 nuclei::runtime::Builder::io_uring
 nuclei::runtime::Builder::record_latencies
 -->
-<p>A busy worker looks at its timers and IO every <code>event_interval</code> task runs, and also, checked every 16 runs, whenever its last look is more than a millisecond old, so a run of slow tasks cannot keep IO waiting for long.</p>
+<p>A busy worker looks at its timers and IO every <code>event_interval</code> task runs, and also, checked every 16 runs, whenever its last look is more than a millisecond old, so a run of slow tasks cannot keep IO waiting for long. Every <code>global_queue_interval</code> runs it takes work other threads woke before its own queue, every other time the tasks bound to its thread first, so a full inbox does not hold them off.</p>
 
 <h2 id="hooks">Hooks</h2>
 <p>A runtime calls hooks of yours on its threads and around its tasks: for metrics, tracing or thread setup. Each task hook is given the task's <code>Id</code>.</p>
@@ -50,7 +50,7 @@ nuclei::runtime::Builder::on_after_task_poll
 nuclei::runtime::Builder::on_task_terminate
 nuclei::runtime::Builder::on_long_poll
 -->
-<p>A hook runs in the middle of the runtime's work: keep it short, and never panic in one. Task hooks get a <code>TaskMeta</code>: the task's <code>id()</code>, and its <code>name()</code> when <code>task::Builder</code> gave one.</p>
+<p>A hook runs in the middle of the runtime's work: keep it short. A thread hook that panics loses nothing: the panic is caught where the runtime calls it, once the panic hook reported it, and the thread goes on with the shard, tasks or jobs it holds. So is a panic of <code>thread_name_fn</code> where the runtime starts a thread of its own accord (a blocking-pool thread, a runner for a shard the handoff took), the thread then taking the default name; one as a worker starts reaches <code>build</code> or <code>spawn_more_threads</code> before anything is claimed. A task hook that panics panics its task, whose handle gets the panic as the task's outcome; a spawn hook's panic unwinds out of the spawn instead, and the task never runs. Task hooks get a <code>TaskMeta</code>: the task's <code>id()</code>, and its <code>name()</code> when <code>task::Builder</code> gave one.</p>
 <p><code>on_long_poll</code> finds the task that holds a worker up: it is called, on the watch's own thread, for each poll that runs past <code>handoff_after</code> (<a href="tasks.html#handoff">Tasks</a>).</p>
 <!--example prod_long_poll-->
 
@@ -68,7 +68,7 @@ nuclei::config::IoUringConfiguration::per_numa_bounded_worker_count
 nuclei::config::IoUringConfiguration::per_numa_unbounded_worker_count
 nuclei::config::IoUringConfiguration::aggressive_poll
 -->
-<p>Four presets fill the struct from a queue length: <code>interrupt_driven</code> (the one to pick when unsure), <code>low_latency_driven</code> and <code>kernel_poll_only</code> (a kernel submission thread), and <code>io_poll</code>. <code>NucleiConfig::backend</code> is the backend of every runtime that names none.</p>
+<p>Four presets fill the struct from a queue length: <code>interrupt_driven</code> (the one to pick when unsure), <code>low_latency_driven</code> and <code>kernel_poll_only</code> (a kernel submission thread), and <code>io_poll</code>, whose ring takes only the reads and writes of files opened with <code>O_DIRECT</code>: a file's syncs, <code>sync_range</code>, <code>allocate</code> and a buffered file's reads and writes, which the kernel refuses there, are made on the blocking pool. <code>NucleiConfig::backend</code> is the backend of every runtime that names none.</p>
 <p>The sizes are checked where they take effect: <code>queue_len</code> at least 64, <code>recv_buffers</code> 0 or a power of two below twice <code>queue_len</code>, and <code>recv_buffer_size</code> from 512 bytes to 1 GiB while there are receive buffers. A value outside fails the first runtime built with it, with <code>InvalidInput</code> naming the setting.</p>
 
 <h2 id="stats">Counters</h2>
@@ -93,6 +93,7 @@ nuclei::stats::ShardStats::buffer_cap
 nuclei::stats::ShardStats::buffer_exhausted
 nuclei::stats::ShardStats::timers
 nuclei::stats::ShardStats::handoffs
+nuclei::stats::ShardStats::handoffs_failed
 nuclei::stats::ShardStats::longest_poll
 nuclei::stats::ShardStats::budget_yields
 nuclei::stats::ShardStats::poll_times
@@ -119,6 +120,6 @@ nuclei::stats::ShardStats::errors
 <p><code>#[nuclei::bench]</code> does the same for a benchmark on the nightly test harness.</p>
 
 <h2 id="compat">The earlier entry points</h2>
-<p>Programs written against earlier versions set up the default runtime with <code>init</code> or <code>init_with_config</code>; both still work, on the shards. <code>GlobalExecutorConfig</code> sets the workers to start (<code>with_min_threads</code>, or from an environment variable with <code>with_env_var</code>), the most to run (<code>with_max_threads</code>) and their names. <code>spawn_more_threads</code> starts more workers, up to the maximum, and <code>stop_thread</code> drains one: it takes no new task and exits once its tasks are done.</p>
+<p>Programs written against earlier versions set up the default runtime with <code>init</code> or <code>init_with_config</code>; both still work, on the shards. <code>GlobalExecutorConfig</code> sets the workers to start (<code>with_min_threads</code>, or from an environment variable with <code>with_env_var</code>), the most to run (<code>with_max_threads</code>) and their names. <code>spawn_more_threads</code> starts more workers, up to the maximum (none once the runtime's drop took its threads), and <code>stop_thread</code> drains one: it takes no new task and exits once its tasks are done.</p>
 <!--example prod_compat-->
 <p>Code that drove the proactor by hand still can: <code>Proactor::get().wait(max_events, timeout)</code> drives the calling thread's shard once, and <code>wake</code> ends every wait in progress.</p>

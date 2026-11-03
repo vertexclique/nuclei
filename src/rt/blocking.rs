@@ -69,6 +69,8 @@ pub(crate) struct PoolConfig {
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
     /// The mask the runtime was built with; a pool thread runs on it.
     pub(crate) cpu_mask: Option<super::runtime::CpuMask>,
+    /// The runtime's `io_buffer_cap`: what a pool thread's own IO buffers may hold.
+    pub(crate) buffer_cap: usize,
 }
 
 /// A slot's states.
@@ -324,7 +326,8 @@ impl Pool {
             return;
         }
         let pool = Arc::clone(self);
-        let mut builder = std::thread::Builder::new().name((self.config.name)());
+        let name = super::tuning::name_caught(&*self.config.name, "nuclei-blocking");
+        let mut builder = std::thread::Builder::new().name(name);
         if let Some(size) = self.config.stack_size {
             builder = builder.stack_size(size);
         }
@@ -406,11 +409,13 @@ impl Pool {
     /// A pool thread's life.
     fn work(self: Arc<Self>) {
         let _alive = Alive::new();
+        ON_POOL.with(|on| on.set(true));
         // A thread inherits its creator's mask, and a pinned worker often
         // creates pool threads.
         if let Some(mask) = &self.config.cpu_mask {
             super::runtime::apply_mask(mask);
         }
+        crate::buf::serve_with_cap(self.config.buffer_cap);
         let _stopping = self.config.hooks.started();
         let mut me = self.claim_slot();
         loop {
@@ -495,6 +500,17 @@ impl Drop for Pool {
 
 /// Threads of every blocking pool alive now.
 static ALIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+std::thread_local! {
+    /// This thread is one of a blocking pool's.
+    static ON_POOL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Whether this thread is one of a blocking pool's, where a wait for work the
+/// pool does could be a wait for this very thread.
+pub(crate) fn on_pool_thread() -> bool {
+    ON_POOL.with(core::cell::Cell::get)
+}
 
 /// Every pool made, by address (which the entry's allocation keeps from
 /// reuse), for `stats`. A pool that went is taken out at the next pool's
@@ -587,6 +603,7 @@ mod tests {
             stack_size: None,
             name: Arc::new(|| "test-blocking".to_string()),
             cpu_mask: None,
+            buffer_cap: crate::buf::DEFAULT_CAP,
         })
     }
 
@@ -602,7 +619,9 @@ mod tests {
 
     #[test]
     fn idle_threads_exit_after_the_keep_alive() {
-        let pool = pool(4, Duration::from_millis(20));
+        // Under Miri a 20 ms keep-alive runs out before the look that the threads are still there.
+        const KEEP_ALIVE: Duration = Duration::from_millis(if cfg!(miri) { 2_000 } else { 20 });
+        let pool = pool(4, KEEP_ALIVE);
         let tasks: Vec<_> = (0..4).map(|i| pool.spawn(move || i)).collect();
         for task in tasks {
             crate::sync::internal::block_on(task);
@@ -646,7 +665,7 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let pool = pool(1, Duration::from_secs(30));
         let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for i in 0..20_000usize {
+        for i in 0..if cfg!(miri) { 500 } else { 20_000usize } {
             let ran = Arc::clone(&done);
             pool.spawn(move || ran.store(i + 1, SeqCst)).detach();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -668,7 +687,7 @@ mod tests {
     fn every_job_runs_once_while_threads_come_and_go() {
         use std::sync::atomic::Ordering::SeqCst;
         const SUBMITTERS: usize = 4;
-        const EACH: usize = 2_000;
+        const EACH: usize = if cfg!(miri) { 200 } else { 2_000 };
         let pool = pool(2, Duration::from_millis(1));
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let submitters: Vec<_> = (0..SUBMITTERS)
@@ -713,7 +732,7 @@ mod tests {
     fn every_job_runs_once_at_the_cap() {
         use std::sync::atomic::Ordering::SeqCst;
         const SUBMITTERS: usize = 8;
-        const EACH: usize = 500;
+        const EACH: usize = if cfg!(miri) { 50 } else { 500 };
         for max in [8, 70] {
             let pool = pool(max, Duration::from_secs(5));
             let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -755,13 +774,14 @@ mod tests {
     #[test]
     fn a_thread_going_idle_while_submitters_race_loses_no_job() {
         use std::sync::atomic::Ordering::SeqCst;
+        const EACH: usize = if cfg!(miri) { 500 } else { 5_000 };
         let pool = pool(2, Duration::from_secs(30));
         let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let submitters: Vec<_> = (0..2)
             .map(|_| {
                 let (pool, done) = (Arc::clone(&pool), Arc::clone(&done));
                 std::thread::spawn(move || {
-                    for _ in 0..5_000 {
+                    for _ in 0..EACH {
                         let before = done.load(SeqCst);
                         let ran = Arc::clone(&done);
                         pool.spawn(move || ran.fetch_add(1, SeqCst)).detach();
@@ -777,7 +797,7 @@ mod tests {
         for s in submitters {
             s.join().unwrap();
         }
-        wait_for("every job to run", || done.load(SeqCst) == 10_000);
+        wait_for("every job to run", || done.load(SeqCst) == 2 * EACH);
         wait_for("the jobs to be counted out", || pool.jobs() == 0);
     }
 

@@ -21,13 +21,17 @@
 //! One task registers at a time (the oneshot channel takes `&mut self` for
 //! it). A second concurrent registrant is not an error: it loses the slot,
 //! its waker is woken at once, and the caller polls again.
+//!
+//! A waker whose clone panics during a registration gives the cell back as
+//! it was before the panic goes on; a wake that landed meanwhile is delivered
+//! to the waker the cell held.
 
 #![allow(unsafe_code)]
 
 use core::fmt;
 use core::task::Waker;
 
-use super::internal::{AtomicUsize, Ordering, UnsafeCell};
+use super::internal::{AtomicUsize, Ordering, UnsafeCell, during_unwind};
 
 /// No registration and no wake is in progress; the slot may hold a waker.
 const WAITING: usize = 0;
@@ -112,6 +116,7 @@ impl AtomicWaker {
     /// Registers `waker`: kept (with the different waker it replaced), left
     /// alone because the cell was in use, or woken at once because a wake
     /// came while it was being stored.
+    #[inline]
     fn register_returning(&self, waker: &Waker) -> Registered {
         // Acquire: pairs with the Release that last gave the slot up.
         if self
@@ -125,7 +130,16 @@ impl AtomicWaker {
         let displaced = self.waker.with_mut(|slot| unsafe {
             match &*slot {
                 Some(old) if old.will_wake(waker) => None,
-                _ => (*slot).replace(waker.clone()),
+                _ => {
+                    // A clone that panics gives the cell back, as the failure
+                    // path does, with the slot as it was. The guard's drop
+                    // touches the slot inside this borrow; only an unwind runs
+                    // it, which the loom models do not exercise.
+                    let abandon = Abandon(self);
+                    let fresh = waker.clone();
+                    core::mem::forget(abandon);
+                    (*slot).replace(fresh)
+                }
             }
         });
         // Release: publishes the slot to the next wake. It fails only when a
@@ -135,23 +149,33 @@ impl AtomicWaker {
             .compare_exchange(REGISTERING, WAITING, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            // SAFETY: the state is REGISTERING | WAKING, which no other
-            // thread changes, and the wake did not touch the slot.
-            let taken = self.waker.with_mut(|slot| unsafe { (*slot).take() });
-            // Release: hands the empty slot to whoever takes the cell next.
-            self.state.swap(WAITING, Ordering::AcqRel);
-            if let Some(taken) = taken {
-                taken.wake();
-            }
-            // A different waker this registration replaced belongs to a task
-            // that still waits: the wake that met the registration did not
-            // take it, so it is woken here rather than lost.
-            if let Some(displaced) = displaced {
-                displaced.wake();
-            }
+            self.woken_while_registering(displaced);
             return Registered::WokenNow;
         }
         Registered::Kept(displaced)
+    }
+
+    /// The registration lost to a wake that came while the slot was written:
+    /// the slot is ours to empty, and both wakers it concerned are woken.
+    #[cold]
+    #[inline(never)]
+    fn woken_while_registering(&self, displaced: Option<Waker>) {
+        // SAFETY: the state is REGISTERING | WAKING, which no other thread
+        // changes, and the wake did not touch the slot.
+        let taken = self.waker.with_mut(|slot| unsafe { (*slot).take() });
+        // Release: hands the empty slot to whoever takes the cell next.
+        self.state.swap(WAITING, Ordering::AcqRel);
+        // A different waker this registration replaced belongs to a task
+        // that still waits: the wake that met the registration did not take
+        // it, so it is woken here rather than lost, even when the wake of
+        // `taken` panics.
+        let mut displaced = WakeOnUnwind(displaced);
+        if let Some(taken) = taken {
+            taken.wake();
+        }
+        if let Some(displaced) = displaced.0.take() {
+            displaced.wake();
+        }
     }
 
     /// Takes the registered waker, if a task is registered, leaving the
@@ -175,6 +199,44 @@ impl AtomicWaker {
     pub fn wake(&self) {
         if let Some(waker) = self.take() {
             waker.wake();
+        }
+    }
+}
+
+/// Gives the cell back when the clone of a waker panics while it registers:
+/// the slot is as it was, and a wake that came meanwhile, which left the slot
+/// to the registration, is delivered to the waker the slot holds.
+struct Abandon<'a>(&'a AtomicWaker);
+
+impl Drop for Abandon<'_> {
+    #[cold]
+    fn drop(&mut self) {
+        let cell = self.0;
+        if cell
+            .state
+            .compare_exchange(REGISTERING, WAITING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // SAFETY: the state is REGISTERING | WAKING, which no other
+            // thread changes, and the wake did not touch the slot.
+            let taken = cell.waker.with_mut(|slot| unsafe { (*slot).take() });
+            cell.state.swap(WAITING, Ordering::AcqRel);
+            if let Some(taken) = taken {
+                during_unwind(|| taken.wake());
+            }
+        }
+    }
+}
+
+/// A waker woken when this drops, which only an unwind makes happen: the
+/// normal path takes it out first.
+struct WakeOnUnwind(Option<Waker>);
+
+impl Drop for WakeOnUnwind {
+    #[cold]
+    fn drop(&mut self) {
+        if let Some(waker) = self.0.take() {
+            during_unwind(|| waker.wake());
         }
     }
 }
@@ -435,5 +497,64 @@ mod tests {
             }
             waking.join().expect("waking thread");
         }
+    }
+
+    fn boom() -> Box<dyn FnOnce()> {
+        Box::new(|| panic!("a waker panicked"))
+    }
+
+    #[test]
+    fn a_register_whose_clone_panics_leaves_the_cell_usable() {
+        let cell = AtomicWaker::new();
+        let bad = crate::sync::test_support::hooked(Some(boom()), None);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cell.register(&bad)));
+        assert!(caught.is_err(), "the panic reaches the caller");
+        let (counter, waker) = counting();
+        cell.register(&waker);
+        assert_eq!(wakes(&counter), 0, "the cell stayed in use");
+        cell.wake();
+        assert_eq!(wakes(&counter), 1, "the registration was kept");
+    }
+
+    #[test]
+    fn a_wake_during_a_clone_that_panics_reaches_the_waker_the_cell_held() {
+        let cell = Arc::new(AtomicWaker::new());
+        let (held, held_waker) = counting();
+        cell.register(&held_waker);
+        let waking = Arc::clone(&cell);
+        let bad = crate::sync::test_support::hooked(
+            Some(Box::new(move || {
+                waking.wake();
+                panic!("a clone panicked");
+            })),
+            None,
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cell.register(&bad)));
+        assert!(caught.is_err(), "the panic reaches the caller");
+        assert_eq!(wakes(&held), 1, "the wake that met the registration");
+        let (counter, waker) = counting();
+        cell.register(&waker);
+        assert_eq!(wakes(&counter), 0);
+        cell.wake();
+        assert_eq!(wakes(&counter), 1, "the cell works after it");
+    }
+
+    #[test]
+    fn a_panicking_wake_in_the_failure_path_still_wakes_the_displaced_waker() {
+        let cell = Arc::new(AtomicWaker::new());
+        let (displaced, displaced_waker) = counting();
+        cell.register(&displaced_waker);
+        let waking = Arc::clone(&cell);
+        let new =
+            crate::sync::test_support::hooked(Some(Box::new(move || waking.wake())), Some(boom()));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cell.register_displacing(&new)
+        }));
+        assert!(caught.is_err(), "the panic reaches the caller");
+        assert_eq!(wakes(&displaced), 1, "the displaced task was woken");
+        let (counter, waker) = counting();
+        cell.register(&waker);
+        cell.wake();
+        assert_eq!(wakes(&counter), 1);
     }
 }

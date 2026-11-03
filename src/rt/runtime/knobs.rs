@@ -8,40 +8,47 @@ use super::{Builder, RngSeed, TaskMeta, UnhandledPanic};
 
 impl Builder {
     /// Called on each thread the runtime starts (workers and blocking-pool
-    /// threads), on that thread, before it does anything else.
+    /// threads), on that thread, before it does anything else. A panic in it
+    /// is caught (after the panic hook reported it) and the thread goes on,
+    /// as it does for every thread hook: the thread still holds what it was
+    /// started for.
     pub fn on_thread_start(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.tuning.hooks.start = Some(Arc::new(f));
         self
     }
 
     /// Called on each thread the runtime starts, on that thread, as it ends
-    /// (after a panic too).
+    /// (after a panic too). A panic in it is caught.
     pub fn on_thread_stop(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.tuning.hooks.stop = Some(Arc::new(f));
         self
     }
 
     /// Called on a worker thread just before it sleeps with nothing to run.
+    /// A panic in it is caught, and the worker sleeps all the same.
     pub fn on_thread_park(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.tuning.hooks.park = Some(Arc::new(f));
         self
     }
 
-    /// Called on a worker thread just after it wakes from a sleep.
+    /// Called on a worker thread just after it wakes from a sleep. A panic
+    /// in it is caught, and the worker runs on.
     pub fn on_thread_unpark(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.tuning.hooks.unpark = Some(Arc::new(f));
         self
     }
 
     /// Called with each task this runtime spawns (not the blocking pool's
-    /// jobs), on the spawning thread, once the task exists.
+    /// jobs), on the spawning thread, once the task exists. A panic in it
+    /// unwinds out of the spawn, and the task is cancelled before it runs.
     pub fn on_task_spawn(mut self, f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static) -> Self {
         self.task_hooks.spawn = Some(Arc::new(f));
         self
     }
 
     /// Called just before each poll of a task of this runtime, on the thread
-    /// that polls it.
+    /// that polls it. A panic in it is the poll's: the task completes with
+    /// it, unpolled, for its handle.
     pub fn on_before_task_poll(
         mut self,
         f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static,
@@ -51,14 +58,19 @@ impl Builder {
     }
 
     /// Called just after each poll of a task of this runtime, on the thread
-    /// that polled it.
+    /// that polled it. A panic in it completes the task with that panic, for
+    /// its handle (a value the poll gave is dropped), unless the poll
+    /// panicked first: that panic stays the task's, and the hook's is logged
+    /// at error.
     pub fn on_after_task_poll(mut self, f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static) -> Self {
         self.task_hooks.after_poll = Some(Arc::new(f));
         self
     }
 
     /// Called when a task of this runtime is done with: its future completed
-    /// or was dropped by a cancel, on the thread that dropped it.
+    /// or was dropped by a cancel, on the thread that dropped it. A panic in
+    /// it goes as a panic of the future's drop does: to the task's handle as
+    /// its outcome, or, with no handle, to the log at error.
     pub fn on_task_terminate(mut self, f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static) -> Self {
         self.task_hooks.terminate = Some(Arc::new(f));
         self
@@ -92,7 +104,9 @@ impl Builder {
     }
 
     /// Task runs between the times a worker takes from its inbox (tasks
-    /// woken by other threads) before its own queue (default 31). At least 1;
+    /// woken by other threads) before its own queue (default 31); every
+    /// other such time it takes first from its thread's bound tasks, so a
+    /// full inbox does not hold them off. At least 1;
     /// [`build`](Builder::build) fails with `InvalidInput` at 0.
     pub fn global_queue_interval(mut self, runs: u32) -> Self {
         self.tuning.inbox_interval = runs;

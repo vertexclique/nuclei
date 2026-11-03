@@ -220,7 +220,8 @@ pub(crate) enum Outcome {
     },
     RecvLent(OwnedBuf, Answer<usize>),
     RecvFrom(PoolBuf, Answer<(usize, Addr)>),
-    RecvLentFrom(OwnedBuf, Answer<(usize, Addr)>),
+    /// A datagram received into a lent buffer, and whether the kernel cut it to the buffer.
+    RecvLentFrom(OwnedBuf, Answer<(usize, Addr)>, bool),
     Connect(Dial, Answer<()>),
     Send(PoolBuf, Answer<usize>),
     SendLent(OwnedBuf, Answer<usize>),
@@ -239,6 +240,10 @@ pub(crate) enum Outcome {
         to: usize,
         answer: Answer<usize>,
     },
+    /// The operation's shard went before the kernel ended it, and gave up on it: it ends with
+    /// this error, and its memory stays with the kernel for good.
+    #[cfg(ring)]
+    Forsaken(io::Error),
 }
 
 impl Outcome {
@@ -346,12 +351,12 @@ impl Source {
         self.ops_out.load(Ordering::SeqCst) == 0
     }
 
-    /// The kernel completed one of the source's operations: its side takes
-    /// the completion at once if free, else its holder does as it lets go.
-    pub(crate) fn op_done(self: &Arc<Self>, done: Done, shard: Option<&crate::rt::shard::Shard>) {
-        // SeqCst, with the flags after it: against a retire, or a
-        // registration, that raises its flag and then looks at the count
-        // (see `retire`, `waits_for_ops`).
+    /// One of the sides' operations left the kernel: whether none is in its hands now. A retire
+    /// that waits for that is woken.
+    #[inline(always)]
+    fn op_ended(&self) -> bool {
+        // SeqCst, with the flags after it: against a retire, or a registration, that raises its
+        // flag and then looks at the count (see `retire`, `waits_for_ops`).
         let idle = self.ops_out.fetch_sub(1, Ordering::SeqCst) == 1;
         if idle
             && self.ask.awaits_ops.load(Ordering::SeqCst)
@@ -359,6 +364,25 @@ impl Source {
         {
             waker.wake();
         }
+        idle
+    }
+
+    /// An operation of the source's that no side has out any more left the kernel (a zombie a
+    /// shard's new runner cancelled, `ShardRing::bury`): it is no longer counted.
+    #[cfg(ring)]
+    pub(crate) fn op_gone(&self) {
+        self.op_ended();
+    }
+
+    /// The kernel completed one of the source's operations: its side takes
+    /// the completion at once if free, else its holder does as it lets go.
+    pub(crate) fn op_done(self: &Arc<Self>, done: Done, shard: Option<&crate::rt::shard::Shard>) {
+        #[cfg(port)]
+        let idle = self.op_ended();
+        #[cfg(not(port))]
+        self.op_ended();
+        #[cfg(port)]
+        let read = done.read;
         let mut after = After::default();
         let hooks = self.hooks_in(shard);
         if done.read {
@@ -404,6 +428,14 @@ impl Source {
                 .defer(super::write_work::LOOK, &mut after, &hooks);
         }
         self.settle(after);
+        // A source left on the port it could not move off: once none of its operations is out,
+        // or its send ended (a read left out is cancelled as the eviction goes), it is evicted
+        // and registered again where its tasks poll, and the move is made
+        // (proofs/tla/port/PortKeep.tla, `Duplex`).
+        #[cfg(port)]
+        if (idle || !read) && self.moving() {
+            self.evict();
+        }
     }
 
     /// A registration with a port could not bind the source's handle:

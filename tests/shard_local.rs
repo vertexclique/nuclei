@@ -1,6 +1,10 @@
 //! `shard_local!` values: one per worker of each runtime, made on first use,
 //! out of reach off a worker, dropped with the runtime, moving with a shard at
-//! a handoff, and keeping the shard where it is while a `with` runs.
+//! a handoff, keeping the shard where it is while a `with` runs, and lent back
+//! to a `with` whose poll lost the shard, never while the lender's own `with`
+//! runs, each thread's bound tasks kept on it. A poll that stalls past the
+//! watch (a preemption, a long loop) may lose its shard before any call in it:
+//! every test here passes whether or not that happens.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -11,6 +15,10 @@ use std::time::{Duration, Instant};
 use nuclei::runtime::{Runtime, worker_index};
 
 const SAFETY: Duration = Duration::from_secs(10);
+/// How long a call that holds a value watches for a loan that must not come meanwhile.
+const WINDOW: Duration = Duration::from_millis(100);
+/// Tasks bound to a lender that keep yielding through its loan.
+const BOUND_TASKS: usize = 4;
 
 nuclei::shard_local! {
     static COUNT: Cell<u64> = Cell::new(0);
@@ -56,6 +64,20 @@ nuclei::shard_local! { static HELD: Dropper = Dropper }
 
 nuclei::shard_local! { static SURVIVOR: Cell<u64> = Cell::new(0) }
 nuclei::shard_local! { static PINNED: Cell<u64> = Cell::new(0) }
+nuclei::shard_local! {
+    static LENT: Cell<u64> = Cell::new(0);
+    static LENT_INNER: Cell<u64> = Cell::new(0);
+    static NESTED: Cell<u64> = Cell::new(0);
+    static BOUND: Cell<u64> = Cell::new(0);
+    static PANICKY: Cell<u64> = Cell::new(0);
+    static CLOSED: Cell<u64> = Cell::new(0);
+    static CLOSED_PIN: Cell<u64> = Cell::new(0);
+    static LENT_LOOP: Cell<u64> = Cell::new(0);
+    static HELD_BY_RUNNER: Cell<u64> = Cell::new(0);
+    static HELD_BY_BORROWER: Cell<u64> = Cell::new(0);
+    static KEPT_OFF: Cell<u64> = Cell::new(0);
+    static SPAWNED_IN: Cell<u64> = Cell::new(0);
+}
 
 fn runtime(workers: usize) -> Runtime {
     Runtime::builder()
@@ -83,12 +105,14 @@ struct Gate {
 impl Gate {
     fn hold(&self) {
         let deadline = Instant::now() + SAFETY;
+        let mut pause = Duration::from_micros(50);
         while !self.open.load(Ordering::SeqCst) {
             if Instant::now() >= deadline {
                 self.gave_up.store(true, Ordering::SeqCst);
                 return;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(1));
         }
     }
 
@@ -108,6 +132,23 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "{what} never happened");
         std::thread::sleep(pause);
         pause = (pause * 2).min(Duration::from_millis(20));
+    }
+}
+
+/// Whether `done` holds within `within`, waited on through the runtime's timers, so the loop
+/// that polls the caller runs its other tasks meanwhile.
+async fn came_within(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    let mut pause = Duration::from_micros(200);
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        nuclei::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_millis(5));
     }
 }
 
@@ -305,12 +346,9 @@ fn values_are_dropped_when_the_runtime_is() {
 fn a_value_survives_a_handoff_of_its_shard() {
     let rt = on();
     let h = rt.handle();
-    let first: ThreadId = rt.block_on(
-        h.spawn_on_worker(0, async {
-            SURVIVOR.with(|v| v.set(41));
-            std::thread::current().id()
-        })
-        .unwrap(),
+    rt.block_on(
+        h.spawn_on_worker(0, async { SURVIVOR.with(|v| v.set(41)) })
+            .unwrap(),
     );
 
     let gate = Arc::new(Gate::default());
@@ -336,12 +374,8 @@ fn a_value_survives_a_handoff_of_its_shard() {
         .unwrap();
     let (seen, probe_on) = rt.block_on(probe);
     gate.release_after("the task placed on the worker");
-    let blocked_on = rt.block_on(blocked);
+    let blocked_on: ThreadId = rt.block_on(blocked);
     assert_eq!(seen, 42, "the shard's value did not go with it");
-    assert_eq!(
-        blocked_on, first,
-        "the worker's first thread was the blocked one"
-    );
     assert_ne!(probe_on, blocked_on, "the shard did not move");
     let after = rt.block_on(
         h.spawn_on_worker(0, async { SURVIVOR.with(Cell::get) })
@@ -371,12 +405,19 @@ fn a_with_that_blocks_in_a_nested_block_on_keeps_its_shard_and_without_it_the_sh
         })
         .unwrap();
     wait_for("the pinned block", || started.load(Ordering::SeqCst));
+    // A stall before the `with` may have let the shard go, and the `with` then ran on the
+    // shard lent back: either way nothing takes it while the block holds the value.
+    let pinned_at = handoffs();
     std::thread::sleep(Duration::from_millis(250));
-    assert_eq!(handoffs(), 0, "the shard was handed off under a with");
+    assert_eq!(
+        handoffs(),
+        pinned_at,
+        "the shard was handed off under a with"
+    );
     gate.release_after("the pinned block");
     rt.block_on(pinned);
-    assert_eq!(handoffs(), 0);
 
+    let free_at = handoffs();
     let gate = Arc::new(Gate::default());
     let (held, started) = (Arc::clone(&gate), Arc::new(AtomicBool::new(false)));
     let up = Arc::clone(&started);
@@ -389,8 +430,485 @@ fn a_with_that_blocks_in_a_nested_block_on_keeps_its_shard_and_without_it_the_sh
         })
         .unwrap();
     wait_for("the free block", || started.load(Ordering::SeqCst));
-    wait_for("the handoff", || handoffs() >= 1);
+    wait_for("the handoff", || handoffs() > free_at);
     gate.release_after("the handoff");
     rt.block_on(free);
-    assert!(handoffs() >= 1);
+}
+
+/// A task on worker 0 of `rt` that says it started, then holds its thread in `gate`'s block.
+fn stall_then<F, T>(
+    rt: &Runtime,
+    gate: &Arc<Gate>,
+    then: F,
+) -> (nuclei::task::Task<T>, Arc<AtomicBool>)
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (held, started) = (Arc::clone(gate), Arc::new(AtomicBool::new(false)));
+    let up = Arc::clone(&started);
+    let task = rt
+        .handle()
+        .spawn_on_worker(0, async move {
+            up.store(true, Ordering::SeqCst);
+            held.hold();
+            then()
+        })
+        .unwrap();
+    (task, started)
+}
+
+/// Waits until `started` and then until worker 0's shard was taken once more.
+fn wait_for_the_take(rt: &Runtime, started: &AtomicBool, before: u64) {
+    wait_for("the stalled task", || started.load(Ordering::SeqCst));
+    wait_for("the take", || rt.stats().shards[0].handoffs > before);
+}
+
+#[test]
+fn a_with_after_its_poll_lost_the_shard_runs_on_the_shard_lent_back() {
+    let rt = on();
+    let h = rt.handle();
+    rt.block_on(
+        h.spawn_on_worker(0, async { LENT.with(|v| v.set(41)) })
+            .unwrap(),
+    );
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (stalled, started) = stall_then(&rt, &gate, || {
+        // The same poll, after its shard was taken: each call asks for it back.
+        let tried = LENT.try_with(|v| {
+            v.set(v.get() * 10);
+            v.get()
+        });
+        let nested = LENT.with(|v| {
+            LENT_INNER.with(|inner| inner.set(v.get() + 1));
+            v.set(v.get() + 1);
+            v.get()
+        });
+        (tried, nested, LENT_INNER.with(Cell::get))
+    });
+    wait_for_the_take(&rt, &started, before);
+    // The shard runs on its new thread meanwhile, with its value.
+    let probe = h
+        .spawn_on_worker(0, async {
+            LENT.with(|v| {
+                v.set(v.get() + 1);
+                v.get()
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        rt.block_on(probe),
+        42,
+        "the value did not go with the shard"
+    );
+    gate.release_after("the take");
+    let (tried, nested, inner) = rt.block_on(stalled);
+    assert_eq!(tried, Ok(420), "try_with after the take");
+    assert_eq!(nested, 421, "with after the take");
+    assert_eq!(inner, 421, "a with nested in the lent call");
+    let after = h
+        .spawn_on_worker(0, async {
+            (LENT.with(Cell::get), LENT_INNER.with(Cell::get))
+        })
+        .unwrap();
+    assert_eq!(
+        rt.block_on(after),
+        (421, 421),
+        "the calls' writes stayed with the shard"
+    );
+}
+
+#[test]
+fn a_with_in_a_nested_block_on_that_lost_the_shard_and_after_it_runs_on_the_shard() {
+    let rt = on();
+    let h = rt.handle();
+    rt.block_on(
+        h.spawn_on_worker(0, async { NESTED.with(|v| v.set(1)) })
+            .unwrap(),
+    );
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (held, started) = (Arc::clone(&gate), Arc::new(AtomicBool::new(false)));
+    let up = Arc::clone(&started);
+    let task = h
+        .spawn_on_worker(0, async move {
+            let inner = nuclei::block_on(async move {
+                up.store(true, Ordering::SeqCst);
+                held.hold();
+                // In the nested poll that lost the shard.
+                let lost_in = NESTED.with(|v| {
+                    v.set(v.get() * 10);
+                    v.get()
+                });
+                // On the thread's own shard, where the nested future goes on.
+                nuclei::task::yield_now().await;
+                let moved = NESTED.with(|v| {
+                    v.set(v.get() + 1);
+                    v.get()
+                });
+                (lost_in, moved)
+            });
+            // Back in the outer poll, which lost the shard too.
+            let outer = NESTED.with(|v| {
+                v.set(v.get() + 1);
+                v.get()
+            });
+            (inner, outer)
+        })
+        .unwrap();
+    wait_for_the_take(&rt, &started, before);
+    gate.release_after("the take");
+    assert_eq!(rt.block_on(task), ((10, 11), 12));
+    let after = h
+        .spawn_on_worker(0, async { NESTED.with(Cell::get) })
+        .unwrap();
+    assert_eq!(rt.block_on(after), 12);
+}
+
+#[test]
+fn a_block_on_inside_a_with_on_the_lent_shard_runs_on_that_shard() {
+    let rt = on();
+    let h = rt.handle();
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (stalled, started) = stall_then(&rt, &gate, move || {
+        let got = LENT_LOOP.with(|v| {
+            v.set(v.get() + 1);
+            // A nested loop on the lent shard: its polls are its own, not the ones that lost it.
+            nuclei::block_on(async {
+                nuclei::task::yield_now().await;
+                LENT_LOOP.with(|inner| {
+                    inner.set(inner.get() + 1);
+                    inner.get()
+                })
+            })
+        });
+        let _ = tx.send(got);
+    });
+    stalled.detach();
+    wait_for_the_take(&rt, &started, before);
+    gate.release_after("the take");
+    let got = rx
+        .recv_timeout(SAFETY)
+        .expect("the block_on on the lent shard never ended");
+    assert_eq!(got, 2, "the nested future's with");
+    let after = h
+        .spawn_on_worker(0, async { LENT_LOOP.with(Cell::get) })
+        .unwrap();
+    assert_eq!(rt.block_on(after), 2);
+}
+
+#[test]
+fn a_bound_task_finished_after_its_thread_lost_the_shard_runs_its_with_on_the_shard() {
+    let rt = on();
+    let h = rt.handle();
+    rt.block_on(
+        h.spawn_on_worker(0, async { BOUND.with(|v| v.set(5)) })
+            .unwrap(),
+    );
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (held, started) = (Arc::clone(&gate), Arc::new(AtomicBool::new(false)));
+    let up = Arc::clone(&started);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let task = h
+        .spawn_on_worker(0, async move {
+            let (go, wait) = nuclei::sync::oneshot::channel::<()>();
+            nuclei::spawn_local(async move {
+                let _ = wait.await;
+                let _ = tx.send(BOUND.try_with(|v| {
+                    v.set(v.get() + 1);
+                    v.get()
+                }));
+            })
+            .detach();
+            up.store(true, Ordering::SeqCst);
+            held.hold();
+            let _ = go.send(());
+        })
+        .unwrap();
+    wait_for_the_take(&rt, &started, before);
+    gate.release_after("the take");
+    rt.block_on(task);
+    let seen = rx.recv_timeout(SAFETY).expect("the bound task never ran");
+    assert_eq!(seen, Ok(6), "the bound task's with");
+    let after = h
+        .spawn_on_worker(0, async { BOUND.with(Cell::get) })
+        .unwrap();
+    assert_eq!(rt.block_on(after), 6);
+}
+
+#[test]
+fn a_panic_in_a_with_on_the_lent_shard_gives_it_back_and_reaches_the_caller() {
+    let rt = on();
+    let h = rt.handle();
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (stalled, started) = stall_then(&rt, &gate, || {
+        let caught = std::panic::catch_unwind(|| {
+            PANICKY.with(|v| {
+                v.set(7);
+                panic!("in the lent call");
+            })
+        });
+        let text = caught
+            .expect_err("the panic did not reach the caller")
+            .downcast_ref::<&str>()
+            .copied()
+            .unwrap_or_default();
+        (text, PANICKY.with(Cell::get))
+    });
+    wait_for_the_take(&rt, &started, before);
+    gate.release_after("the take");
+    assert_eq!(rt.block_on(stalled), ("in the lent call", 7));
+    let after = h
+        .spawn_on_worker(0, async { PANICKY.with(|v| v.get() + 1) })
+        .unwrap();
+    assert_eq!(rt.block_on(after), 8, "the shard was not given back");
+}
+
+#[test]
+fn a_with_still_waiting_for_its_shard_as_the_runtime_shuts_down_is_told_so() {
+    let rt = on();
+    let h = rt.handle();
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (stalled, started) = stall_then(&rt, &gate, move || {
+        let _ = tx.send(CLOSED.try_with(|_| ()));
+    });
+    stalled.detach();
+    wait_for_the_take(&rt, &started, before);
+    // The shard's new runner blocks under a `with`, which keeps the shard on it: it polls no
+    // request, so the call still waits as the runtime shuts down.
+    let pin = Arc::new(Gate::default());
+    let (held, pinned) = (Arc::clone(&pin), Arc::new(AtomicBool::new(false)));
+    let up = Arc::clone(&pinned);
+    h.spawn_on_worker(0, async move {
+        CLOSED_PIN.with(|_| {
+            nuclei::block_on(async {
+                up.store(true, Ordering::SeqCst);
+                held.hold();
+            });
+        });
+    })
+    .unwrap()
+    .detach();
+    wait_for("the pinned block", || pinned.load(Ordering::SeqCst));
+    gate.release_after("the take");
+    drop(h);
+    let dropper = std::thread::spawn(move || drop(rt));
+    let told = rx
+        .recv_timeout(SAFETY)
+        .expect("the waiting with never ended");
+    let err = told.expect_err("a with was lent a shard by a runner that polled nothing");
+    assert!(!err.is_initializing());
+    assert!(err.to_string().contains("shut down"), "{err}");
+    pin.release_after("the shutdown");
+    dropper.join().expect("the runtime's drop");
+}
+
+#[test]
+fn a_runner_whose_with_awaits_in_a_nested_block_on_lends_the_shard_only_once_the_with_ends() {
+    let rt = on();
+    let h = rt.handle();
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (asking, lent) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (ask, ran) = (Arc::clone(&asking), Arc::clone(&lent));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (stalled, started) = stall_then(&rt, &gate, move || {
+        ask.store(true, Ordering::SeqCst);
+        let _ = tx.send(HELD_BY_RUNNER.with(|v| {
+            ran.store(true, Ordering::SeqCst);
+            v.set(v.get() * 10);
+            v.get()
+        }));
+    });
+    stalled.detach();
+    wait_for_the_take(&rt, &started, before);
+    // The shard's new runner holds the value across a nested `block_on` that waits on timers,
+    // so its loop polls the call's request meanwhile: the loan waits for the `with` to end.
+    let in_with = Arc::new(AtomicBool::new(false));
+    let up = Arc::clone(&in_with);
+    let runner = h
+        .spawn_on_worker(0, async move {
+            HELD_BY_RUNNER.with(|v| {
+                v.set(1);
+                nuclei::block_on(async {
+                    up.store(true, Ordering::SeqCst);
+                    let asked = came_within(SAFETY, || asking.load(Ordering::SeqCst)).await;
+                    let lent = came_within(WINDOW, || lent.load(Ordering::SeqCst)).await;
+                    (asked, lent, v.get())
+                })
+            })
+        })
+        .unwrap();
+    wait_for("the runner's with", || in_with.load(Ordering::SeqCst));
+    gate.release_after("the take");
+    assert_eq!(
+        rt.block_on(runner),
+        (true, false, 1),
+        "the shard was lent while its runner's with held the value"
+    );
+    let seen = rx.recv_timeout(SAFETY).expect("the waiting with never ran");
+    assert_eq!(seen, 10, "the call's with after the runner's");
+}
+
+#[test]
+fn a_borrower_whose_with_awaits_in_a_nested_block_on_lends_the_shard_to_no_other_call() {
+    let rt = on();
+    let first = rt.stats().shards[0].handoffs;
+    let (gate, again) = (Arc::new(Gate::default()), Arc::new(Gate::default()));
+    let (asking, lent) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (ask, ran) = (Arc::clone(&asking), Arc::clone(&lent));
+    let in_with = Arc::new(AtomicBool::new(false));
+    let up = Arc::clone(&in_with);
+    let (to_first, at_first) = std::sync::mpsc::channel();
+    let (to_second, at_second) = std::sync::mpsc::channel();
+    // The first call is lent the shard and holds its value across a nested `block_on` that waits
+    // on timers, so its loop, on the lent shard, polls the second call's request meanwhile.
+    let (stalled, started) = stall_then(&rt, &gate, move || {
+        let _ = to_first.send(HELD_BY_BORROWER.with(|v| {
+            v.set(1);
+            nuclei::block_on(async {
+                up.store(true, Ordering::SeqCst);
+                let asked = came_within(SAFETY, || asking.load(Ordering::SeqCst)).await;
+                let lent = came_within(WINDOW, || lent.load(Ordering::SeqCst)).await;
+                (asked, lent, v.get())
+            })
+        }));
+    });
+    stalled.detach();
+    wait_for_the_take(&rt, &started, first);
+    // The shard's new runner stalls in turn and loses it too.
+    let second = rt.stats().shards[0].handoffs;
+    let (stalled, started) = stall_then(&rt, &again, move || {
+        ask.store(true, Ordering::SeqCst);
+        let _ = to_second.send(HELD_BY_BORROWER.with(|v| {
+            ran.store(true, Ordering::SeqCst);
+            v.set(v.get() + 100);
+            v.get()
+        }));
+    });
+    stalled.detach();
+    wait_for_the_take(&rt, &started, second);
+    gate.release_after("the first take");
+    wait_for("the first call's with", || in_with.load(Ordering::SeqCst));
+    again.release_after("the second take");
+    let held = at_first
+        .recv_timeout(SAFETY)
+        .expect("the first call's with never ended");
+    assert_eq!(
+        held,
+        (true, false, 1),
+        "a call lent the shard lent it on while its with held the value"
+    );
+    let seen = at_second
+        .recv_timeout(SAFETY)
+        .expect("the second call's with never ran");
+    assert_eq!(seen, 101, "the second call's with after the first's");
+}
+
+#[test]
+fn a_runner_lending_its_shard_keeps_the_tasks_bound_to_it_off_the_borrowers_loop() {
+    let rt = on();
+    let h = rt.handle();
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let alive = Arc::new(AtomicUsize::new(0));
+    let (stop, astray) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let alive_then = Arc::clone(&alive);
+    let (stalled, started) = stall_then(&rt, &gate, move || {
+        KEPT_OFF.with(|_| {
+            // A nested loop on the lent shard: it runs whatever the shard's own queues hold.
+            let alive = alive_then.load(Ordering::SeqCst);
+            nuclei::block_on(async {
+                for _ in 0..8 {
+                    nuclei::task::yield_now().await;
+                }
+            });
+            alive
+        })
+    });
+    wait_for_the_take(&rt, &started, before);
+    // Tasks bound to the shard's new runner, each yielding until told to stop: they are in the
+    // shard's own queues as the runner lends it.
+    let (told, off, spawned) = (Arc::clone(&stop), Arc::clone(&astray), Arc::clone(&alive));
+    let spawner = h
+        .spawn_on_worker(0, async move {
+            let home = std::thread::current().id();
+            for _ in 0..BOUND_TASKS {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                let (stop, off, alive) =
+                    (Arc::clone(&told), Arc::clone(&off), Arc::clone(&spawned));
+                nuclei::spawn_local(async move {
+                    let deadline = Instant::now() + SAFETY;
+                    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        if std::thread::current().id() != home {
+                            off.fetch_add(1, Ordering::SeqCst);
+                        }
+                        nuclei::task::yield_now().await;
+                    }
+                    alive.fetch_sub(1, Ordering::SeqCst);
+                })
+                .detach();
+            }
+        })
+        .unwrap();
+    rt.block_on(spawner);
+    gate.release_after("the take");
+    let alive_in_call = rt.block_on(stalled);
+    stop.store(true, Ordering::SeqCst);
+    wait_for("the bound tasks' ends", || {
+        alive.load(Ordering::SeqCst) == 0
+    });
+    assert_eq!(
+        alive_in_call, BOUND_TASKS,
+        "the bound tasks ended before the loan"
+    );
+    assert_eq!(
+        astray.load(Ordering::SeqCst),
+        0,
+        "a task bound to the lender ran on the borrower's thread"
+    );
+}
+
+#[test]
+fn a_task_spawned_local_in_a_lent_call_runs_on_the_borrowers_thread() {
+    let rt = on();
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (stalled, started) = stall_then(&rt, &gate, move || {
+        SPAWNED_IN.with(|v| {
+            v.set(v.get() + 1);
+            // Queued on the lent shard and bound to this thread: it must not be left in the
+            // queues the lender runs once the shard is back.
+            nuclei::spawn_local(async move {
+                let _ = tx.send(std::thread::current().id());
+            })
+            .detach();
+        });
+        std::thread::current().id()
+    });
+    wait_for_the_take(&rt, &started, before);
+    gate.release_after("the take");
+    let borrower = rt.block_on(stalled);
+    let ran_on = rx.recv_timeout(SAFETY).expect("the bound task never ran");
+    assert_eq!(
+        ran_on, borrower,
+        "a task bound to the borrower ran on the lender's thread"
+    );
 }

@@ -4,7 +4,14 @@
 use super::*;
 use crate::buf::owned::{IoBuf, OwnedBuf};
 use crate::io::side::OwnerPoll;
-use crate::rt::context;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Runs once on this thread, for a test, between an owner's straight send that found the socket
+    /// full and the rest of its poll.
+    pub(crate) static AFTER_FULL_SEND: core::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::Cell::new(None) };
+}
 
 impl Source {
     /// A caller's descriptor: `Ready` with the write side's edge count while
@@ -15,22 +22,30 @@ impl Source {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<u32>> {
         let kind = self.kind;
-        self.poll_write_side(cx, false, |st, io, waker, after| {
-            st.fd_ready(io, kind, waker, after)
-        })
+        self.poll_write_side(
+            || cx.waker(),
+            false,
+            |st, io, waker, after| st.fd_ready(io, kind, waker, after),
+        )
     }
 
     /// A caller's descriptor would block on a write: the side waits for its
-    /// next edge, unless one came after `tick`.
+    /// next edge, unless one came after `tick`; as
+    /// [`fd_clear_read`](Self::fd_clear_read) for a held side.
     #[cfg(unix)]
     pub(crate) fn fd_clear_write(self: &Arc<Self>, tick: u32) {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        // Nothing to wait for and nothing to fail: a registration that
-        // failed is the next readiness call's to report.
-        let _ = self.poll_write_side(&mut cx, false, |st, _io, _waker, _after| {
-            st.fd_clear(tick);
-            Poll::Ready(Ok(()))
+        let mut after = After::default();
+        // Nothing to fail: a registration that failed is the next readiness call's to report.
+        let _ = self.with_io(|io| {
+            self.write.run_or_defer(
+                super::super::write_work::CLEAR,
+                &mut after,
+                &self.hooks_in(io.shard),
+                |st| st.fd_clear(tick),
+                || self.write_clear.leave(tick),
+            );
         });
+        self.settle(after);
     }
 
     /// Ready once a write would be taken at once (see `WriteState::ready`);
@@ -89,21 +104,26 @@ impl Source {
             cx,
             #[inline(always)]
             |cx| {
-                // Whether the owner's send below found the socket full, so the step does not
-                // ask the kernel again.
+                let cx_waker = cx.waker();
+                // Whether the owner's send below found the socket full, so the owner's step does
+                // not ask the kernel again.
                 #[cfg(unix)]
                 let mut asked = false;
                 #[cfg(unix)]
                 if let Some(result) = self.send_as_owner(bufs, &mut asked) {
                     return Poll::Ready(result);
                 }
+                #[cfg(all(test, unix))]
+                if asked && let Some(then) = AFTER_FULL_SEND.take() {
+                    then();
+                }
                 #[cfg(not(unix))]
                 let asked = false;
                 if let Some(io) = self.here(&self.write) {
-                    owner_poll!(self, self.write, io, cx, |st, after, waker| self
+                    owner_poll!(self, self.write, io, cx_waker, |st, after, waker| self
                         .write_step(st, io, waker, after, bufs, wait, asked));
                 }
-                self.poll_write_any(cx, bufs, wait, asked)
+                self.poll_write_any(cx_waker, bufs, wait)
             },
         )
     }
@@ -116,7 +136,8 @@ impl Source {
     /// the poll's own way. The biased hold is refused once a foreign thread came, so every release
     /// since the bit's was this shard's own, and none was since. The hold changes
     /// nothing of the side, so nothing is published as it lets go: a socket found full is the
-    /// poll's to record (`asked`), which then does not ask the kernel again.
+    /// owner's poll's to record (`asked`), which then does not ask the kernel again; a poll whose
+    /// shard was taken since asks it itself (`poll_write_any`).
     #[cfg(unix)]
     #[inline(always)]
     fn send_as_owner(
@@ -124,25 +145,7 @@ impl Source {
         bufs: &[io::IoSlice<'_>],
         asked: &mut bool,
     ) -> Option<io::Result<usize>> {
-        self.send_on(
-            context::running_inside(context::local())?,
-            bufs,
-            asked,
-            || {},
-        )
-    }
-
-    /// [`send_as_owner`](Self::send_as_owner) on `shard`, the shard this thread runs as a call
-    /// into it finds it; `leave` lets go of the shard before what the hold left is settled.
-    #[cfg(unix)]
-    #[inline(always)]
-    fn send_on(
-        self: &Arc<Self>,
-        shard: &crate::rt::shard::Shard,
-        bufs: &[io::IoSlice<'_>],
-        asked: &mut bool,
-        leave: impl FnOnce(),
-    ) -> Option<io::Result<usize>> {
+        let shard = crate::rt::context::running(crate::rt::context::local())?;
         if !self.kind.streams() {
             return None;
         }
@@ -153,6 +156,10 @@ impl Source {
             return None;
         }
         let mut after = After::default();
+        // Marked until the settle, as the owner's poll is (`owner_poll`).
+        if !after.enter() {
+            return None;
+        }
         let sent = self.write.with_owner(
             &mut after,
             &self.hooks_in(Some(shard)),
@@ -171,8 +178,7 @@ impl Source {
                 Some(sys::ready(sys::send_bufs(fd, bufs)))
             },
         );
-        leave();
-        self.settle(after);
+        self.settle_owned(after);
         match sent?? {
             Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
             Some(result) => {
@@ -187,37 +193,23 @@ impl Source {
     }
 
     /// [`poll_write_bufs`](Self::poll_write_bufs) for every poll [`here`](Self::here) does not
-    /// take.
+    /// take, given the poll's waker, all of its context a write looks at. Its step asks the kernel
+    /// itself, whatever the owner's send found: a poll comes here after that send when its shard
+    /// was taken in between, and the shard's driver on its new thread may have passed over the
+    /// edge the refusal owed, the side still saying it was only ever its owner's and idle
+    /// (proofs/tla/sendsnow/TakenFull.tla).
     #[inline(never)]
     fn poll_write_any(
         self: &Arc<Self>,
-        cx: &mut Context<'_>,
+        waker: &Waker,
         bufs: &[io::IoSlice<'_>],
         wait: bool,
-        asked: bool,
     ) -> Poll<io::Result<usize>> {
-        // From a task's code on a shard the monitor watches, the owner's send and poll first, in
-        // a bracket that ends before what they left is settled.
-        #[cfg(unix)]
-        let mut asked = asked;
-        if context::unbracketed(context::local()).is_err() {
-            let held = context::bracketed();
-            if let Some(shard) = held.shard() {
-                #[cfg(unix)]
-                if let Some(result) = self.send_on(shard, bufs, &mut asked, || held.end()) {
-                    return Poll::Ready(result);
-                }
-                if let Some(io) = self.here_on(shard, &self.write) {
-                    owner_poll!(self, self.write, io, cx, |st, after, waker| self
-                        .write_step(st, io, waker, after, bufs, wait, asked), then held.end());
-                }
-            }
-            held.end();
-        }
-        self.poll_writing(
-            cx,
+        self.poll_write_side(
+            || waker,
+            true,
             #[inline(always)]
-            |st, io, waker, after| self.write_step(st, io, waker, after, bufs, wait, asked),
+            |st, io, waker, after| self.write_step(st, io, waker, after, bufs, wait, false),
         )
     }
 
@@ -254,20 +246,21 @@ impl Source {
     /// Polls the write side with `step` for the handle's own writes, given
     /// the way this thread reaches the descriptor.
     #[inline(always)]
-    fn poll_writing<R>(
+    pub(super) fn poll_writing<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         step: impl FnMut(&mut WriteState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
-        self.poll_write_side(cx, true, step)
+        self.poll_write_side(|| cx.waker(), true, step)
     }
 
     /// Polls the write side with `step`: for the handle's own writes when
-    /// `drive`, else for its caller's calls.
+    /// `drive`, else for its caller's calls. `waker` gives the poll's waker
+    /// where it is used, as the read side's does.
     #[inline(always)]
-    fn poll_write_side<R>(
+    fn poll_write_side<'w, R>(
         self: &Arc<Self>,
-        cx: &mut Context<'_>,
+        waker: impl Fn() -> &'w Waker,
         drive: bool,
         mut step: impl FnMut(&mut WriteState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
@@ -277,7 +270,7 @@ impl Source {
             |io| {
                 self.write.poll(
                     &mut after,
-                    cx.waker(),
+                    waker(),
                     &self.hooks_in(io.shard),
                     #[inline(always)]
                     |st, after| {
@@ -287,7 +280,7 @@ impl Source {
                         }
                         #[cfg(not(unix))]
                         let _ = drive;
-                        step(st, io, cx.waker(), after)
+                        step(st, io, waker(), after)
                     },
                 )
             },

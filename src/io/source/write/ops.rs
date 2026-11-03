@@ -130,7 +130,7 @@ impl WriteState {
         let Some(issuer) = route.issuer(after) else {
             return;
         };
-        #[cfg(ring)]
+        #[cfg(completion)]
         if self.poll_first {
             self.polling = true;
             self.out = Some(issuer.issue(Want::Ready { read: false }, kind, self.epoch, after));
@@ -159,10 +159,7 @@ impl WriteState {
 
     /// Whether the next operation waits for the socket to be ready first.
     fn not_ready_first(&self) -> bool {
-        #[cfg(ring)]
-        return self.poll_first;
-        #[cfg(not(ring))]
-        false
+        self.poll_first
     }
 
     /// The kernel gave an operation back because the socket was not ready
@@ -181,10 +178,7 @@ impl WriteState {
     /// source's descriptor, for a connect's end.
     pub(crate) fn op_done(&mut self, done: Done, fd: Option<Raw>, after: &mut After) {
         self.out = None;
-        #[cfg(ring)]
-        {
-            self.polling = false;
-        }
+        self.polling = false;
         // An operation of a descriptor that is gone: what it holds is
         // dropped.
         let stale = done.epoch != self.epoch;
@@ -263,8 +257,19 @@ impl WriteState {
                 let result = result.and_then(|()| fd.map_or(Ok(()), sys::adopt_connected));
                 self.connected(result);
             }
-            #[cfg(ring)]
+            // A poll for room ended (a port's ends once its socket has room, or with the
+            // socket's error, which the call's next try hears from the socket itself).
             Outcome::Ready(answer) => {
+                #[cfg(port)]
+                if !stale && let Answer::Done(result) = answer {
+                    self.poll_first = false;
+                    // A poll the system refused is the next call's error, so no call waits on
+                    // it for good nor tries again in a loop.
+                    if let Err(err) = result {
+                        self.error = Some(err);
+                    }
+                }
+                #[cfg(ring)]
                 if !stale && let Answer::Done(_) = answer {
                     self.poll_first = false;
                     if self.user_fd {
@@ -281,10 +286,41 @@ impl WriteState {
                     }
                 }
             }
+            #[cfg(ring)]
+            Outcome::Forsaken(_) if stale => {}
+            #[cfg(ring)]
+            Outcome::Forsaken(err) => self.forsaken(err, after),
             // The read side's.
             other => other.release(after),
         }
         after.wake(&mut self.waiters);
+    }
+
+    /// The side's operation was given up on as its shard went, the kernel still holding it: a
+    /// connect under way fails with `err`, a lent buffer's write ends with it (the buffer stays
+    /// with the kernel), and any other write fails the side, its bytes behind dropped, as a send
+    /// that failed does: what reached the peer is unknown.
+    #[cfg(ring)]
+    #[cold]
+    #[inline(never)]
+    fn forsaken(&mut self, err: io::Error, after: &mut After) {
+        if self.connecting {
+            self.connected(Err(err));
+            return;
+        }
+        match self.lent.as_mut().filter(|l| l.out) {
+            Some(lent) => {
+                lent.out = false;
+                lent.done = Some(Err(err));
+                self.lent_finished(after);
+            }
+            None => {
+                self.failed = Some(Failure::of(&err));
+                if let Some(behind) = self.behind.take() {
+                    after.drop_buf(behind);
+                }
+            }
+        }
     }
 
     /// The operation to cancel for a lent buffer whose task went before

@@ -22,3 +22,7 @@ W_send_refused                 MC_Oneshot      violated:NoSendRefused
 W_rx_woken                     MC_Oneshot      violated:NoRxWake
 W_tx_woken                     MC_Oneshot      violated:NoTxWake
 W_value_dropped                MC_Oneshot      violated:NoValueDroppedByRx
+BC_close_drop                  MC_Oneshot      pass
+BC_reclose                     MC_Oneshot      pass
+M_reclose                      MC_Oneshot      violated:ValueReadOnce
+M_close_note_stale             MC_Oneshot      violated:ValueConserved

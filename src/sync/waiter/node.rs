@@ -6,6 +6,7 @@
 
 #![allow(unsafe_code)]
 
+use core::mem;
 use core::ptr::{self, NonNull};
 use core::task::Waker;
 
@@ -53,6 +54,29 @@ pub(super) enum Touch {
     Pending,
     /// It did nothing: the node left the waiting phase.
     Skipped,
+}
+
+/// Settles a node whose waker clone panicked while it was registering: the
+/// registering bit goes and the node is armed, with its nudge and phase
+/// untouched, for the future's cancel, which runs as the panic unwinds, to
+/// see them.
+struct Settle<'a>(&'a AtomicUsize);
+
+impl Drop for Settle<'_> {
+    #[cold]
+    fn drop(&mut self) {
+        let mut state = self.0.load(Ordering::Acquire);
+        loop {
+            let next = (state & !REGISTERING) | ARMED;
+            match self
+                .0
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(actual) => state = actual,
+            }
+        }
+    }
 }
 
 /// What a future found when it looked at its node.
@@ -187,6 +211,7 @@ impl Waiter {
     /// pending nudge. With no waker, settles a node fresh from
     /// [`arm`](Self::arm), whose waker is already in the slot.
     pub(super) fn park(&self, waker: Option<&Waker>) -> Seen {
+        let mut stale = None;
         if let Some(waker) = waker {
             let mut state = self.state.load(Ordering::Acquire);
             let target = loop {
@@ -227,25 +252,33 @@ impl Waiter {
             };
             // SAFETY: the registering bit makes the current slot this
             // future's, and a take reads only the other one (module docs).
-            self.slot(target, CURRENT).with_mut(|slot| unsafe {
-                if !(*slot).as_ref().is_some_and(|w| w.will_wake(waker)) {
-                    *slot = Some(waker.clone());
+            stale = self.slot(target, CURRENT).with_mut(|slot| unsafe {
+                if (*slot).as_ref().is_some_and(|w| w.will_wake(waker)) {
+                    None
+                } else {
+                    let settle = Settle(&self.state);
+                    let fresh = waker.clone();
+                    mem::forget(settle);
+                    (*slot).replace(fresh)
                 }
             });
         }
         let mut state = self.state.load(Ordering::Acquire);
-        loop {
+        let seen = loop {
             let next = (state & !(REGISTERING | NUDGED)) | ARMED;
             match self
                 .state
                 .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) if state & PHASE == GRANTED => return Seen::Granted,
-                Ok(_) if state & NUDGED != 0 => return Seen::Nudged,
-                Ok(_) => return Seen::Pending,
+                Ok(_) if state & PHASE == GRANTED => break Seen::Granted,
+                Ok(_) if state & NUDGED != 0 => break Seen::Nudged,
+                Ok(_) => break Seen::Pending,
                 Err(actual) => state = actual,
             }
-        }
+        };
+        // Dropping the old waker is user code: after the node is settled.
+        drop(stale);
+        seen
     }
 
     /// Readies the node for its future to spin on, inside a poll: a grant

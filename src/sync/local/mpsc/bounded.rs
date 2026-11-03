@@ -22,18 +22,24 @@ pub(super) struct Bounded {
 }
 
 impl Limit for Bounded {
+    #[inline(always)]
     fn release(&self, n: usize) {
         if n > 0 {
-            self.slots.add_permits(n);
+            self.slots.release(n);
         }
     }
 
+    #[inline]
     fn is_idle(&self) -> bool {
-        self.slots.available_permits() == self.max
+        self.slots.holds(self.max)
     }
 
     fn close(&self) {
         self.slots.close();
+    }
+
+    fn debit(&self, n: usize) {
+        self.slots.debit(n);
     }
 }
 

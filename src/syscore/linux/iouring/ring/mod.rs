@@ -247,15 +247,12 @@ const REQUIRED_FEATURES: [(u32, &str); 4] = [
     (IORING_FEAT_FAST_POLL, "fast poll"),
 ];
 
-/// The caller-facing result of an enter: an expired wait is not an error, and completions the
-/// kernel had to drop are reported in words. Everything else, `EINTR` and `EBUSY` included, is
-/// passed through for the caller to handle.
+/// The caller-facing result of an enter: an expired wait is not an error. Everything else,
+/// `EINTR` and `EBUSY` included, is passed through for the caller to handle; so is `EBADR`, which
+/// the kernel reports once after it dropped completions (see [`Ring::completions_dropped`]).
 fn enter_outcome(r: io::Result<u32>) -> io::Result<u32> {
     match r {
         Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
-        Err(e) if e.raw_os_error() == Some(libc::EBADR) => Err(io::Error::other(
-            "completions were lost because the completion queue overflowed",
-        )),
         r => r,
     }
 }
@@ -397,6 +394,12 @@ impl Ring {
         self.sq.ready()
     }
 
+    /// Hands `f` the user data of each entry queued that the kernel has not consumed yet (see
+    /// [`queue::Sq::pending`]).
+    pub(crate) fn pending(&self, f: impl FnMut(u64)) {
+        self.sq.pending(f);
+    }
+
     /// Queues `sqe`; nothing reaches the kernel until [`Ring::submit`] or [`Ring::submit_and_wait`].
     pub(crate) fn push(&mut self, sqe: &Sqe) -> Result<(), SqFull> {
         self.sq.push(sqe)
@@ -411,6 +414,13 @@ impl Ring {
     /// [`Ring::submit_and_wait`] flushes them into the queue as space frees up.
     pub(crate) fn cq_overflow_pending(&self) -> bool {
         self.sq.cq_overflow_pending()
+    }
+
+    /// The kernel's count of completions it dropped since the ring was made (wrapping): the
+    /// completion queue was full and it had no memory for an overflow entry. It reports the
+    /// loss once as `EBADR` from an enter, and the ring works after.
+    pub(crate) fn completions_dropped(&self) -> u32 {
+        self.cq.dropped()
     }
 
     /// For a ring with a kernel submission thread: whether the thread has gone to sleep.

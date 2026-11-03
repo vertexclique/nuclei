@@ -83,7 +83,7 @@
 
 use core::ptr::{self, NonNull};
 
-use super::internal::{AtomicPtr, AtomicUsize, Ordering};
+use super::internal::{AtomicPtr, AtomicUsize, OnUnwind, Ordering};
 use super::spin::Budget;
 use super::waiter::{Pool, Wait, Waiter, WakeList, release_queued};
 
@@ -417,11 +417,13 @@ pub(super) trait Policy {
     /// finds barging shut and leaves what it frees for the drain to hand
     /// over. A take, or a handoff already owed to someone else (then the
     /// loss does not count), leaves the waiter un-owed. On failure, the
-    /// state the attempt saw.
+    /// state the attempt saw. `undo` gives back what a take took; it runs
+    /// only if the pass that follows a take unwinds.
     fn owe_or_take(
         &self,
         wait: &Wait,
         mut take: impl FnMut(usize) -> Option<usize>,
+        undo: impl FnOnce(),
     ) -> Result<(), usize> {
         let queue = self.queue();
         // Counted before the node is marked, so the drainer that settles
@@ -458,7 +460,11 @@ pub(super) trait Policy {
             // for it, so one more pass decides. A read-modify-write, to
             // see that drain's exit if it came first.
             if queue.state.fetch_or(0, Ordering::AcqRel) & HANDOFF != 0 {
+                let undo = took.then(|| OnUnwind::new(undo));
                 self.transition(Step::Drain);
+                if let Some(undo) = undo {
+                    undo.disarm();
+                }
             }
         }
         if took { Ok(()) } else { Err(seen) }

@@ -6,3 +6,7 @@ M_shard_fence_only    Handshake   violated:AllEnd
 M_waker_fence_only    Handshake   violated:AllEnd
 W_both_see            Handshake   violated:NotBothSee
 W_notify              Handshake   violated:NoNotify
+PL_seqcst             ParkLook    pass
+PL_seqcst_inbox       ParkLook    pass
+PL_plain_masked       ParkLook    pass
+MPL_plain_count_first ParkLook    violated:AllEnd

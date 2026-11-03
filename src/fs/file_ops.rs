@@ -12,6 +12,7 @@ use core::pin::Pin;
 use std::fs::{File, FileTimes, Metadata, Permissions};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures_io::AsyncWrite;
@@ -72,10 +73,19 @@ impl Handle<File> {
     /// # Errors
     ///
     /// A write that failed (reported here as by a flush), or the sync's own
-    /// failure. Once a sync of the handle failed, every later one fails with
-    /// that error: the system reports a failure to write data back once, so
-    /// a later sync that succeeded would not mean the data reached the
-    /// device. Open the file again to start over.
+    /// failure. Once a sync of the handle failed, or a write the handle had
+    /// accepted failed (reported by a flush, by another call of the handle,
+    /// or by nobody, the handle dropped or handed back), every sync called
+    /// later fails with that error: the system reports a failure to write
+    /// data back once, so a later sync that succeeded would not mean the data
+    /// reached the device. A clone ([`try_clone`](Self::try_clone)) shares
+    /// this with the handle, as it shares the open file. Opening the file
+    /// again starts over, and says nothing of whether the earlier writes
+    /// landed. The handle and its clones make one sync call at a time across
+    /// them all (a sync called while another's call is out waits for that
+    /// call's end, and fails if it failed), and a call whose future was
+    /// dropped (a timeout) still counts: the next sync of any of them takes
+    /// its end and fails with its failure.
     pub async fn sync_all(&self) -> io::Result<()> {
         if !self.is_regular() {
             return self.on_pool(File::sync_all).await;
@@ -131,12 +141,21 @@ impl Handle<File> {
     /// future dropped while the call is out leaves it to the file, which
     /// every later call of the handle waits for. On io_uring it is an
     /// operation of the shard's ring (`fallocate(2)`); elsewhere a job of the
-    /// blocking pool (`fcntl` on macOS, `DeviceIoControl` and
-    /// `SetFileInformationByHandle` on Windows).
+    /// blocking pool (`fcntl` on macOS, `posix_fallocate` and `fspacectl` on
+    /// FreeBSD, `DeviceIoControl` and `SetFileInformationByHandle` on
+    /// Windows).
     ///
-    /// A system that cannot do `mode` answers `Unsupported` (macOS cannot
-    /// zero a range in place), and a file system may refuse a mode as the
-    /// system says.
+    /// A system that cannot do `mode` answers `Unsupported`: macOS cannot
+    /// zero a range in place, and FreeBSD cannot reserve space past the end
+    /// of a file without growing it, so `KeepSize` there takes a range inside
+    /// the file only. A file system may refuse a mode as the system says:
+    /// FreeBSD's ZFS reserves no space, so `Extend` and `KeepSize` answer
+    /// `Unsupported` on it. On FreeBSD a file system that cannot free a range
+    /// (UFS) writes zeros over it for `PunchHole`: the range reads as zeros
+    /// and keeps its space. On macOS a reservation is made from the end of
+    /// what the file has allocated, so holes inside the file are not
+    /// reserved, and HFS+ frees what was reserved past the end of the file
+    /// when the file is closed.
     ///
     /// # Errors
     ///
@@ -185,9 +204,16 @@ impl Handle<File> {
 
     /// A second handle to the same open file, with a cursor of its own
     /// starting where the file's offset is (writes in flight landed first).
+    /// The two share what their syncs answer: once a sync of either failed,
+    /// or a write either accepted failed, every later sync of both fails (see
+    /// [`sync_all`](Self::sync_all)), since the system reports a lost
+    /// write-back of the open file to one call only. Their syncs make one
+    /// call at a time across the handle and its clones, for the same reason.
     pub async fn try_clone(&self) -> io::Result<Handle<File>> {
         let file = self.on_pool(File::try_clone).await?;
-        Handle::new(file)
+        let clone = Handle::new(file)?;
+        let _ = clone.lost.set(Arc::clone(self.lost()));
+        Ok(clone)
     }
 
     /// Runs `call` on the blocking pool once the writes in flight landed, on

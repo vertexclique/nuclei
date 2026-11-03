@@ -38,6 +38,18 @@
 (* edge comes; the mode switch it stored before its locked take of the   *)
 (* word is in memory by then, so the look sees the side shared.          *)
 (*                                                                          *)
+(* With `Writer = "owner"` the writer is the owner thread itself, whose   *)
+(* polls run on the driver's thread between its events: a write the      *)
+(* socket takes leaves the side idle (`published`, with no look, since a  *)
+(* write straight from the task needs that state), and one it refuses     *)
+(* blocks the side, whose release publishes that an edge is wanted. With  *)
+(* `Writer = "away"` the side's claim stayed with a thread that no longer  *)
+(* runs the driver (the source's home moved, `Side::role` keeps the first *)
+(* claimant), whose plain stores wait in its own buffer: the driver passes *)
+(* over an edge only for a side biased to its own thread                  *)
+(* (`biased_to(who)` compares the claim), so it never reads that thread's *)
+(* stale idle.                                                             *)
+(*                                                                          *)
 (* What is abstract. The owner thread's own polls run on the driver's    *)
 (* thread, between its events, so its releases come before the driver's  *)
 (* look in program order: the model starts from its last one, which said *)
@@ -49,6 +61,7 @@ EXTENDS Integers, Sequences, TLC                                             \* 
 CONSTANTS                                                                    \* what each configuration sets:
     Biased,     \* TRUE: the side starts biased to its owner; FALSE: shared (no heavy fence)
     Spurious,   \* TRUE: an edge comes first that no write asked for (epoll reports room with every read)
+    Writer,     \* "foreign" (another thread's handle), "owner" (the driver's own thread) or "away" (a claim left on another thread)
     Mutation    \* "none", or the name of the one rule this run takes away
 
 Range(s) == {s[k] : k \in DOMAIN s}                                          \* the stores a buffer holds
@@ -64,8 +77,15 @@ variables                                                                    \* 
     blocked = FALSE,          \* the write side waits for an edge (a write was refused)
     nospace = FALSE,          \* the kernel owes an edge: room comes after the refusal
     edge = FALSE,             \* a write edge waits for the driver
-    done = FALSE,             \* the foreign write went out
+    done = FALSE,             \* the write went out
+    bufA = <<>>,              \* the store buffer of the thread the claim stayed with ("away")
+    holding = FALSE,          \* that thread holds the side biased now
     skipped = FALSE;          \* (record) the driver passed over an edge
+
+define
+    \* The writer of this run is done (the others are done at once).
+    WriterDone == pc["W"] = "Done" /\ pc["OW"] = "Done" /\ pc["AW"] = "Done"
+end define;
 
 \* A locked instruction of the writer: its buffer lands first.
 macro drain() begin
@@ -74,10 +94,13 @@ macro drain() begin
     bufW := <<>>;                                                            \* and the buffer is empty
 end macro;
 
+
 \* The foreign writer: a poll of `write` from another thread.
 fair process writer = "W"                                                    \* weakly fair, like every process
 variables refused = FALSE;                                                   \* the socket refused this write once
 begin                                                                        \* the writer's steps:
+W_which:                                                                     \* only the runs with a foreign writer
+    if Writer # "foreign" then goto Done; end if;
 W_come:                                                                      \* `take_foreign`: intent up, with a locked instruction
     if ~shared then                                                          \* a biased side:
         drain();                                                             \* the locked instruction drains the buffer
@@ -119,13 +142,66 @@ W_wait:                                                                      \* 
     end if;                                                                  \* done
 end process;                                                                 \* end of the writer
 
+\* The owner thread's own write: one poll between the driver's events (program order), biased.
+fair process ownerWriter = "OW"                                              \* weakly fair, like every process
+variables oRefused = FALSE;                                                  \* the socket refused this write once
+begin                                                                        \* the owner's steps:
+OW_poll:                                                                     \* its poll: the hold, the write, the release
+    while Writer = "owner" /\ ~done do                                       \* until the write goes out
+        if oRefused then                                                     \* refused before: the edge came, room is there
+            done := TRUE;                                                    \* the write goes out
+        else either                                                          \* the socket takes it, straight from the task:
+            done := TRUE;                                                    \* out; `published` keeps the side idle, with no look
+        or                                                                   \* the socket is full:
+            oRefused := TRUE;                                                \* refused,
+            blocked := TRUE;                                                 \* the side waits for an edge,
+            nospace := TRUE;                                                 \* and the kernel owes one after room comes;
+            \* the release publishes that an edge is wanted.
+            \* MUTATION publish_idle_blocked: the release's look publishes idle though the side is blocked.
+            \* MUTATION shortcut_after_refusal: `published` is taken after a refused write too, idle with no look.
+            idle := Mutation \in {"publish_idle_blocked", "shortcut_after_refusal"};
+        end either;
+        end if;                                                              \* the poll is over
+OW_wait:                                                                     \* it waits for its wake
+        if ~done then await ~blocked; end if;                                \* the driver serves the edge
+    end while;                                                               \* done
+end process;                                                                 \* end of the owner's write
+
+\* A write by the thread the side's claim stayed with, after the home moved: its own store buffer.
+fair process awayWriter = "AW"                                               \* weakly fair, like every process
+variables aRefused = FALSE;                                                  \* the socket refused this write once
+begin                                                                        \* its steps:
+AW_take:                                                                     \* the biased hold: own := 1, a plain store
+    if Writer # "away" then goto Done; else holding := TRUE; end if;
+AW_send:                                                                     \* the write
+    if aRefused then                                                         \* refused before: room came
+        done := TRUE;                                                        \* out
+    else either
+        done := TRUE;                                                        \* out
+    or
+        aRefused := TRUE;                                                    \* refused:
+        blocked := TRUE;                                                     \* the side waits for an edge,
+        nospace := TRUE;                                                     \* and the kernel owes one
+    end either;
+    end if;
+AW_publish:                                                                  \* `releasing`: whether an edge is wanted, a plain store
+    if blocked then bufA := Append(bufA, "busy"); end if;                    \* not idle: buffered on this thread
+AW_release:                                                                  \* own := 0, a plain store
+    holding := FALSE;
+AW_wait:                                                                     \* the poll waits for its wake
+    if ~done then                                                            \* the write did not go out:
+        await ~blocked;                                                      \* until the driver serves the edge
+        goto AW_take;                                                        \* then it polls again
+    end if;
+end process;                                                                 \* end of that write
+
 \* The kernel: room comes after a refused write, and it posts the edge.
 fair process kernel = "K"                                                    \* weakly fair, like every process
 begin                                                                        \* the kernel's steps:
 K_spurious:                                                                  \* an edge for nobody, first
     if Spurious then edge := TRUE; end if;                                   \* room reported with a read's edge
 K_post:                                                                      \* an edge owed, or none will be
-    await nospace \/ pc["W"] = "Done";                                       \* owed, or the write is done
+    await nospace \/ WriterDone;                                             \* owed, or the write is done
     if nospace then                                                          \* owed:
         nospace := FALSE;                                                    \* paid,
         edge := TRUE;                                                        \* as a write edge for the driver
@@ -136,7 +212,7 @@ end process;                                                                 \* 
 fair process driver = "D"                                                    \* weakly fair, like every process
 begin                                                                        \* the driver's steps:
 D_wait:                                                                      \* the next edge
-    await edge \/ (pc["W"] = "Done" /\ pc["K"] = "Done");                    \* an edge, or none will come
+    await edge \/ (WriterDone /\ pc["K"] = "Done");                          \* an edge, or none will come
     if edge then                                                             \* an edge:
         edge := FALSE;                                                       \* it is taken
     else                                                                     \* none will come:
@@ -145,14 +221,23 @@ D_wait:                                                                      \* 
 D_look:                                                                      \* `write_wants_no_edge`: plain loads, from memory
     \* MUTATION skip_idle_only: the look leaves out the side's mode and `intent`, `write_idle` alone.
     \* MUTATION skip_no_shared: the look leaves out the side's mode.
+    \* MUTATION skip_no_owner: the look leaves out the claim's compare with the driver's own thread.
     if idle
        /\ (~intent \/ Mutation = "skip_idle_only")
-       /\ (~shared \/ Mutation \in {"skip_idle_only", "skip_no_shared"}) then   \* only its own thread held it, idle:
+       /\ (~shared \/ Mutation \in {"skip_idle_only", "skip_no_shared"})
+       /\ (Writer # "away" \/ Mutation \in {"skip_idle_only", "skip_no_owner"}) then \* only its own thread held it, idle:
         skipped := TRUE;                                                     \* (record) the edge is passed over
         goto D_wait;                                                         \* and the driver goes on
     end if;                                                                  \* else the edge is served
-D_drive:                                                                     \* `Side::drive` through the word
-    if word = "free" then                                                    \* free: the driver holds it for the step,
+D_drive:                                                                     \* `Side::drive`
+    if Writer = "away" then                                                  \* a side biased to another thread:
+        \* the driver's take is foreign: its heavy fence drains that thread's buffer; held, the edge is
+        \* left for the holder, who serves it as it lets go: here, served once that thread lets go.
+        await ~holding;
+        if "busy" \in Range(bufA) then idle := FALSE; end if;
+        bufA := <<>>;
+        blocked := FALSE;
+    elsif word = "free" then                                                 \* free: the driver holds it for the step,
         blocked := FALSE;                                                    \* serves it (the blocked write may go again),
                                                                              \* lets go and wakes the writer
     else                                                                     \* held by the writer:
@@ -165,9 +250,12 @@ end process;                                                                 \* 
 fair process flusher = "F"                                                   \* weakly fair, like every process
 begin                                                                        \* the flusher's step:
 F_land:                                                                      \* the oldest store lands
-    while bufW # <<>> \/ pc["W"] # "Done" do                                 \* while stores may come
-        await bufW # <<>> \/ pc["W"] = "Done";                               \* one is buffered, or none will be
-        if bufW # <<>> then                                                  \* the oldest:
+    while bufW # <<>> \/ bufA # <<>> \/ ~WriterDone do                       \* while stores may come
+        await bufW # <<>> \/ bufA # <<>> \/ WriterDone;                      \* one is buffered, or none will be
+        if bufA # <<>> then                                                  \* the claimant's oldest:
+            idle := FALSE;                                                   \* its `write_idle` lands
+            bufA := Tail(bufA);                                              \* and leaves its buffer
+        elsif bufW # <<>> then                                               \* the writer's oldest:
             if Head(bufW) = "shared" then shared := TRUE;                    \* the mode switch lands,
             else idle := FALSE;                                              \* or `write_idle` lands
             end if;                                                          \* in memory

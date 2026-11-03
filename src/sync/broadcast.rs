@@ -154,7 +154,22 @@ pub mod error {
 struct Node<T> {
     retired: RetiredNode,
     pos: u64,
-    value: T,
+    value: core::mem::ManuallyDrop<T>,
+}
+
+impl<T> Drop for Node<T> {
+    /// A value whose drop panics is logged: the reclamation frees the node only once its drop
+    /// returns, so a panic let through would lose the node.
+    fn drop(&mut self) {
+        // SAFETY: the value is dropped once, here, as its node goes.
+        let dropped = || unsafe { core::mem::ManuallyDrop::drop(&mut self.value) };
+        if let Some(panic) = crate::rt::caught::catch(dropped) {
+            crate::rt::caught::lost(
+                format_args!("a broadcast value panicked as it was dropped"),
+                panic,
+            );
+        }
+    }
 }
 
 /// Where a receiver is: the position of the next value it takes. Only its
@@ -363,7 +378,7 @@ impl<T: Send + Sync + 'static> Sender<T> {
         let node = alloc_node(Node {
             retired: RetiredNode::new(),
             pos,
-            value,
+            value: core::mem::ManuallyDrop::new(value),
         });
         let guard = pin();
         let mut current = slot.load(Ordering::Acquire, &guard);
@@ -661,7 +676,7 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
                 if !admit() {
                     return Err(Look::Refused);
                 }
-                let value = node.value.clone();
+                let value = T::clone(&node.value);
                 drop(guard);
                 self.advance(next + 1);
                 return Ok(value);
@@ -786,5 +801,79 @@ impl<T: Send + Sync + 'static> fmt::Debug for Receiver<T> {
         f.debug_struct("Receiver")
             .field("next", &self.next())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// A value whose stored copies panic as they are dropped on the thread
+    /// that made them (reclamation may drop one elsewhere, where a panic
+    /// would break an unrelated test); the copies a receiver clones do not.
+    struct Boom {
+        id: u32,
+        stored: bool,
+        home: std::thread::ThreadId,
+    }
+
+    impl Boom {
+        fn stored(id: u32) -> Self {
+            Self {
+                id,
+                stored: true,
+                home: std::thread::current().id(),
+            }
+        }
+    }
+
+    impl Clone for Boom {
+        fn clone(&self) -> Self {
+            Self {
+                id: self.id,
+                stored: false,
+                home: self.home,
+            }
+        }
+    }
+
+    impl Drop for Boom {
+        fn drop(&mut self) {
+            if self.stored && !std::thread::panicking() && std::thread::current().id() == self.home
+            {
+                panic!("a stored value panicked as it dropped");
+            }
+        }
+    }
+
+    #[test]
+    fn values_that_panic_as_they_are_retired_do_not_stop_the_channel() {
+        let (tx, mut rx) = channel::<Boom>(2);
+        let mut other = tx.subscribe();
+        for id in 0..8 {
+            let value = Boom::stored(id);
+            // The panic of a retired value is logged as its node goes; the
+            // send went through.
+            let _ = catch_unwind(AssertUnwindSafe(|| tx.send(value)));
+        }
+        let mut last = None;
+        loop {
+            match other.try_recv() {
+                Ok(value) => last = Some(value.id),
+                Err(TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        assert_eq!(last, Some(7), "the newest value reached the receiver");
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(tx)));
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(rx.try_recv())));
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(rx)));
+        assert!(matches!(
+            other.try_recv(),
+            Err(TryRecvError::Closed | TryRecvError::Empty)
+        ));
+        // The last handle drops the values still stored.
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(other)));
     }
 }

@@ -1,7 +1,8 @@
 //! Running one test alone in a process of its own: for a case that needs
 //! the whole process (the next descriptor number, a seccomp filter, a
-//! resource limit that cannot be raised again); and a watchdog that ends the
-//! process of a test that hangs.
+//! resource limit that cannot be raised again); a watchdog that ends the
+//! process of a test that hangs; and what the process and the system allow a
+//! test (the descriptors open, the largest Unix datagram).
 
 use std::io::Read;
 #[cfg(unix)]
@@ -15,12 +16,18 @@ const ALONE: &str = "NUCLEI_TEST_ALONE";
 /// and checks that it ran and passed there. Returns true in that process,
 /// where the caller then runs its case.
 pub(crate) fn alone(name: &str) -> bool {
+    alone_with(name, &[])
+}
+
+/// As [`alone`], the new process given the environment variables `vars`.
+pub(crate) fn alone_with(name: &str, vars: &[(&str, &std::ffi::OsStr)]) -> bool {
     if std::env::var_os(ALONE).is_some() {
         return true;
     }
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--test-threads=1"])
         .env(ALONE, "1")
+        .envs(vars.iter().copied())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -86,6 +93,33 @@ pub(crate) fn open_descriptors() -> Vec<i32> {
     (0..soft)
         .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
         .collect()
+}
+
+/// The largest datagram a Unix datagram socket may send: FreeBSD refuses
+/// one past `net.local.dgram.maxdgram` (8 KiB by default) whatever the
+/// socket's buffers (sys/kern/uipc_usrreq.c, `uipc_sosend_dgram`); elsewhere
+/// a send buffer sized for it takes any a test sends.
+#[cfg(unix)]
+pub(crate) fn largest_unix_datagram() -> usize {
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut max: libc::c_ulong = 0;
+        let mut len = size_of::<libc::c_ulong>();
+        // SAFETY: the kernel writes the limit, an unsigned long, into our own.
+        let got = unsafe {
+            libc::sysctlbyname(
+                c"net.local.dgram.maxdgram".as_ptr(),
+                (&raw mut max).cast(),
+                &mut len,
+                core::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(got, 0, "{}", std::io::Error::last_os_error());
+        usize::try_from(max).unwrap_or(usize::MAX)
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    usize::MAX
 }
 
 /// A test's watchdog: unless dropped within `limit`, it writes `what` and

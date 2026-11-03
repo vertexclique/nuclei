@@ -4,3 +4,8 @@ E_shared                       MC_EdgeSkip          pass
 M_skip_idle_only               MC_EdgeSkip          deadlock
 M_skip_no_shared               MC_EdgeSkip          deadlock
 W_skip                         MC_EdgeSkip          violated:NoSkip
+E_owner                        MC_EdgeSkip          pass
+E_away                         MC_EdgeSkip          pass
+M_publish_idle_blocked         MC_EdgeSkip          deadlock
+M_shortcut_after_refusal       MC_EdgeSkip          deadlock
+M_skip_no_owner                MC_EdgeSkip          deadlock

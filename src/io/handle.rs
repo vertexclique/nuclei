@@ -46,6 +46,16 @@
 //! stream's then resets its connection, so the peer never reads a cut stream
 //! as a whole one (`proofs/tla/close`). A runtime that drops waits for those
 //! tasks (see `rt::linger`), and none starts a runtime to run them.
+//!
+//! A file dropped on a worker or a thread of the blocking pool leaves such a
+//! task too, and the process's exit waits for it as well (the process
+//! default runtime is never dropped); a file dropped on any other thread
+//! (`block_on`'s, one of the application's) writes its write-behind before
+//! its drop returns.
+//! Bytes a file's write-behind gives up with nobody left to answer (a write
+//! that failed, a linger's time run out) are said at warn and counted in
+//! [`Stats::write_behind_lost`](crate::stats::Stats::write_behind_lost)
+//! (`proofs/tla/going/Linger.tla`).
 
 /// How long a dropped handle's unsent bytes may take to reach the kernel, by
 /// default (see [`Builder::write_behind_linger`](crate::runtime::Builder::write_behind_linger)).
@@ -68,7 +78,7 @@ use std::time::Duration;
 use super::raw::Raw;
 use super::source::{Kind, Source};
 use super::sys;
-use crate::fs::file::FileIo;
+use crate::fs::file::{FileIo, Lost};
 
 mod sealed {
     /// Only nuclei says what an [`IoObject`](super::IoObject) is.
@@ -175,11 +185,17 @@ pub struct Handle<T> {
     pub(crate) source: Arc<Source>,
     /// A regular file's IO state, made on its first operation.
     pub(crate) file: OnceLock<Arc<FileIo>>,
+    /// A regular file's record of a byte it accepted that may not be on the
+    /// device: kept across the IO states `get_mut` ends, and shared with
+    /// the handle's clones.
+    pub(crate) lost: OnceLock<Arc<Lost>>,
 }
 
 impl<T: IoObject> Handle<T> {
     /// Takes `io` over: what kind of object it is (a socket, a file, a
-    /// pipe) decides how its IO runs. On unix it is made non-blocking.
+    /// pipe) decides how its IO runs. On unix it is made non-blocking, and
+    /// so is a socket on Windows (`FIONBIO`): std's own calls on it answer
+    /// `WouldBlock` where they would block.
     ///
     /// # Errors
     ///
@@ -199,6 +215,11 @@ impl<T: IoObject> Handle<T> {
                 sys::set_nosigpipe(fd);
             }
         }
+        // A socket's own calls (a datagram's send from the task) answer at once, as on unix.
+        #[cfg(windows)]
+        if !matches!(kind, Kind::Bytes | Kind::File) {
+            sys::set_nonblocking(io.raw_io())?;
+        }
         Ok(Self::from_nonblocking(io, kind))
     }
 
@@ -210,6 +231,7 @@ impl<T: IoObject> Handle<T> {
             io: ManuallyDrop::new(io),
             source,
             file: OnceLock::new(),
+            lost: OnceLock::new(),
         }
     }
 
@@ -222,17 +244,31 @@ impl<T: IoObject> Handle<T> {
             io: ManuallyDrop::new(io),
             source,
             file: OnceLock::new(),
+            lost: OnceLock::new(),
         }
     }
 
     /// A regular file's IO state, made now on its first use, on a lease of
     /// the handle's own descriptor.
+    #[inline]
     pub(crate) fn file(&self) -> io::Result<&Arc<FileIo>> {
-        if let Some(file) = self.file.get() {
-            return Ok(file);
+        match self.file.get() {
+            Some(file) => Ok(file),
+            None => self.make_file(),
         }
-        let file = FileIo::new(self.source().lease()?)?;
+    }
+
+    /// [`file`](Self::file)'s first use, out of line.
+    #[cold]
+    #[inline(never)]
+    fn make_file(&self) -> io::Result<&Arc<FileIo>> {
+        let file = FileIo::new(self.source().lease()?, Arc::clone(self.lost()))?;
         Ok(self.file.get_or_init(|| file))
+    }
+
+    /// The record a regular file's syncs answer, made now on its first use.
+    pub(crate) fn lost(&self) -> &Arc<Lost> {
+        self.lost.get_or_init(Arc::default)
     }
 
     /// The source, with the object's descriptor in place: after a
@@ -255,7 +291,8 @@ impl<T> Handle<T> {
     /// first (this waits for them), then the handle's IO stops, and every
     /// call still out on its descriptor ends; its next operation takes the
     /// object as it is then (another descriptor discards what the old one
-    /// left).
+    /// left), and registers it again where it runs: a registration still
+    /// under way when the IO stopped is given up, and fails nothing.
     pub fn get_mut(&mut self) -> &mut T {
         self.deliver_unsent();
         self.hand_file_back();
@@ -277,6 +314,7 @@ impl<T> Handle<T> {
         unsafe {
             drop(core::ptr::read(&this.source));
             drop(core::ptr::read(&this.file));
+            drop(core::ptr::read(&this.lost));
             ManuallyDrop::take(&mut this.io)
         }
     }
@@ -305,10 +343,7 @@ impl<T> Handle<T> {
             ));
         }
         if let Some(file) = self.file.get().filter(|f| f.has_unsent()) {
-            let _ = crate::sync::internal::blocking(crate::time::timeout(
-                crate::rt::linger::time(),
-                core::future::poll_fn(|cx| file.poll_flush(cx)),
-            ));
+            crate::sync::internal::blocking(deliver_file(file));
         }
     }
 
@@ -318,33 +353,35 @@ impl<T> Handle<T> {
         let mut this = ManuallyDrop::new(self);
         // SAFETY: `this` is never used or dropped again; each field is moved
         // out once.
-        let (io, source, file) = unsafe {
+        let (io, source, file, lost) = unsafe {
             (
                 ManuallyDrop::take(&mut this.io),
                 core::ptr::read(&this.source),
                 core::ptr::read(&this.file),
+                core::ptr::read(&this.lost),
             )
         };
-        drop(file);
+        drop((file, lost));
         source.close(io);
     }
 }
 
 impl<T> Drop for Handle<T> {
-    /// Never waits: the source closes the object once no call can use its
-    /// descriptor (at once, or as the last lease or the driver lets go of
-    /// it).
+    /// Waits only for a file's write-behind, off a worker: the source closes
+    /// the object once no call can use its descriptor (at once, or as the
+    /// last lease or the driver lets go of it).
     fn drop(&mut self) {
         // A file's writes in flight hold leases on its descriptor; what waits
-        // behind them is handed to a task, the file's state with its lease.
+        // behind them goes before the drop returns, or is handed to a task, the
+        // file's state with its lease: on a worker, which must not wait, and
+        // on a thread of the blocking pool, whose writes the wait would need
+        // (proofs/tla/going/Linger.tla, `pool_delivers`).
         if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
-            crate::rt::linger::hand(async move {
-                let _ = crate::time::timeout(
-                    crate::rt::linger::time(),
-                    core::future::poll_fn(|cx| file.poll_flush(cx)),
-                )
-                .await;
-            });
+            if crate::runtime::worker_index().is_some() || crate::rt::blocking::on_pool_thread() {
+                crate::rt::linger::hand_file(async move { deliver_file(&file).await });
+            } else {
+                crate::sync::internal::blocking(deliver_file(&file));
+            }
         }
         // SAFETY: taken once, here; the field is never used again.
         let io = unsafe { ManuallyDrop::take(&mut self.io) };
@@ -352,17 +389,41 @@ impl<T> Drop for Handle<T> {
             .source
             .raw_fd()
             .ok()
-            .filter(|_| self.source.has_unsent())
+            .filter(|&fd| self.source.has_unsent() || self.source.waits_for_acks(fd))
         else {
             // The registration goes before the descriptor closes.
             self.source.close(io);
             return;
         };
         // The object itself stays with a task until the unsent bytes are
-        // out, and closes then: the drain needs no descriptor of its own
-        // (and on Windows, closing a socket would cancel its sends).
+        // out and, for a stream set to zero linger, acknowledged, and closes
+        // then: the drain needs no descriptor of its own (and on Windows,
+        // closing a socket would cancel its sends).
         self.source.linger(own);
         crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io), own));
+    }
+}
+
+/// Writes what `file`'s write-behind holds, for at most the linger's time.
+/// A failure, or the time running out, is said at warn and counted: nobody
+/// is left to answer it (the handle's syncs would, but it was dropped or
+/// handed back).
+async fn deliver_file(file: &Arc<FileIo>) {
+    let linger = crate::rt::linger::time();
+    let flushed =
+        crate::time::timeout(linger, core::future::poll_fn(|cx| file.poll_flush(cx))).await;
+    match flushed {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            crate::rt::counters::write_behind_lost(1);
+            log::warn!("bytes a file handle had accepted could not be written: {err}");
+        }
+        Err(_) => {
+            crate::rt::counters::write_behind_lost(1);
+            log::warn!(
+                "bytes a file handle had accepted were not all written within {linger:?}: those still waiting were given up"
+            );
+        }
     }
 }
 
@@ -370,10 +431,21 @@ impl<T> Drop for Handle<T> {
 /// object itself (whose descriptor is `own`), then closes it. Bytes still
 /// behind as the drain ends (its time ran out, or it failed) are given up,
 /// and a TCP stream resets: its peer must not read the end of the stream
-/// after a cut one.
+/// after a cut one. A Unix stream has no reset: it closes, and its peer
+/// reads the end after the bytes that reached it (proofs/tla/close,
+/// `W_unix_cut`). A TCP stream set to zero linger then resets at once; only where
+/// `Source::waits_for_acks` says (macOS, a loopback peer) it first waits, for what is left of the
+/// same time, for the peer to acknowledge what it sent, whether it was dropped with bytes behind or
+/// with none behind but bytes its kernel holds unacknowledged: a reader slow to take them keeps the
+/// reset from overtaking them (proofs/tla/close/AbortAcks.tla).
 async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
+    let budget = crate::rt::linger::time();
+    let start = std::time::Instant::now();
     let drain = core::future::poll_fn(|cx| source.poll_drain(cx));
-    let _ = crate::time::timeout(crate::rt::linger::time(), drain).await;
+    let _ = crate::time::timeout(budget, drain).await;
+    if !source.has_unsent() && source.waits_for_acks(own) {
+        wait_for_acks(own, budget.saturating_sub(start.elapsed())).await;
+    }
     if source.has_unsent()
         && source.kind() == Kind::Tcp
         && let Err(err) = crate::net::opt::set_linger_time(own, Some(Duration::ZERO))
@@ -384,6 +456,27 @@ async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
         );
     }
     source.close(kept);
+}
+
+/// Waits until the kernel holds no byte of the socket `own` its peer has not acknowledged, or
+/// `time` passed: a zero-linger close resets the connection, and a reset sent while data is
+/// still on the wire may overtake it on a loopback (macOS's does), where the peer takes the reset
+/// for a stale one and its stream stays open for good (proofs/tla/close/AbortAcks.tla). Where
+/// the system has no such count (`sys::unacked` is `None`) it returns at once.
+pub(crate) async fn wait_for_acks(own: Raw, time: Duration) {
+    const FIRST: Duration = Duration::from_micros(50);
+    const LAST: Duration = Duration::from_millis(20);
+    let deadline = std::time::Instant::now() + time;
+    let mut pause = FIRST;
+    while sys::unacked(own).is_some_and(|n| n > 0) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        // No kernel event says "all acknowledged", so the count is polled with a bounded backoff.
+        crate::time::sleep(pause.min(left)).await;
+        pause = (pause * 2).min(LAST);
+    }
 }
 
 /// A dropped handle's object, kept open while its unsent bytes go out.

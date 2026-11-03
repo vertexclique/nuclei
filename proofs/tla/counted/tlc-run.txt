@@ -1,0 +1,17 @@
+TLC run of every configuration in proofs/tla/counted, as CI ran them: TLA+ run 41461594872 on 608d5671, 2026-11-02.
+Rows written by proofs/tla/run_tlc.sh in the share jobs of .github/workflows/tla.yml, gathered from the run's log.
+Version 2.19 of 08 August 2024. Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3480 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+C_returns                        29847      11784      2  pass                                  pass                                  yes
+C_arrivals                        7452       3671      2  pass                                  pass                                  yes
+C_drains                       1726005     501596     29  pass                                  pass                                  yes
+M_count_first                      110         60      1  violated:NoPastEnd                    violated:NoPastEnd                    yes
+M_sub_read                        1181        506      1  violated:AllTaken                     violated:AllTaken                     yes
+M_no_look                          393        231      1  violated:InOrder                      violated:InOrder                      yes
+M_count_late                      1643        868      1  violated:AllTaken                     violated:AllTaken                     yes
+W_busy                             443        198      1  violated:NoBusy                       violated:NoBusy                       yes
+W_queued_first                      81         57      1  violated:NoQueuedFirst                violated:NoQueuedFirst                yes
+W_below_zero                     11216       3977      1  violated:NeverBelowZero               violated:NeverBelowZero               yes
+
+results matching EXPECTED.txt: 10 of 10

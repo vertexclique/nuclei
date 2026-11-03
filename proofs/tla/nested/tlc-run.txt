@@ -1,0 +1,19 @@
+TLC run of every configuration in proofs/tla/nested, 2026-11-03 06:32 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+N_safe                          842881     319208      8  pass                                  pass                                  yes
+M_no_switch                         12         11      1  violated:LoopSeesOwn                  violated:LoopSeesOwn                  yes
+M_previous_decides                  20         17      1  violated:LoopSeesOwn                  violated:LoopSeesOwn                  yes
+M_no_restore                       304        216      1  violated:LoopSeesOwn                  violated:LoopSeesOwn                  yes
+M_future_under_loop                 82         67      1  violated:FutureSeesOwn                violated:FutureSeesOwn                yes
+M_no_aside                         441        351      1  violated:LoopWheelsOwn                violated:LoopWheelsOwn                yes
+M_no_reuse                       19108       9786      1  violated:NoTimerLost                  violated:NoTimerLost                  yes
+M_visitor_unwrapped                  3          3      1  violated:TaskSeesOwn                  violated:TaskSeesOwn                  yes
+W_foreign_in_foreign               414        333      1  violated:NoForeignInForeign           violated:NoForeignInForeign           yes
+W_unwound_foreign                  444        354      1  violated:NoUnwoundForeign             violated:NoUnwoundForeign             yes
+W_reuse                            414        333      1  violated:NoReuse                      violated:NoReuse                      yes
+W_visitor_wheels                    80         65      1  violated:VisitorWheelsOwn             violated:VisitorWheelsOwn             yes
+
+results matching EXPECTED.txt: 12 of 12

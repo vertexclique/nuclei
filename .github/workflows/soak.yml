@@ -1,0 +1,90 @@
+name: Soak
+
+# The soak (tests/soak.rs) on every system and backend: every kind of work at once, with peer
+# faults among it, every byte checked, and the process's memory, descriptors and threads held
+# flat. It runs on each PR update, which covers a release head, and on master and the tags.
+on:
+  pull_request:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      secs:
+        description: Length of each soak, in seconds
+        default: '1200'
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NUCLEI_SOAK_SECS: ${{ inputs.secs || '1200' }}
+
+jobs:
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            backend: io_uring
+          - toolchain: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            backend: epoll
+          - toolchain: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            backend: io_uring
+          - toolchain: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            backend: epoll
+          - toolchain: aarch64-apple-darwin
+            os: macos-latest
+            backend: kqueue
+          - toolchain: x86_64-apple-darwin
+            os: macos-15-intel
+            backend: kqueue
+          - toolchain: x86_64-pc-windows-msvc
+            os: windows-latest
+            backend: iocp
+
+    name: soak - ${{ matrix.toolchain }} - ${{ matrix.backend }}
+    runs-on: ${{ matrix.os }}
+    # The soak's own length plus its build: a hang fails it here, not at the runner's six hours.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.toolchain }}
+
+      - name: soak
+        run: cargo test -p nuclei --release --test soak -- --ignored --nocapture
+        env:
+          # Only Linux reads it; the other systems have one backend each.
+          NUCLEI_BACKEND: ${{ matrix.backend == 'epoll' && 'epoll' || '' }}
+
+  # FreeBSD's kqueue, in a VM on a Linux runner.
+  soak_freebsd:
+    name: soak - x86_64-unknown-freebsd - kqueue
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: soak in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          copyback: false
+          envs: NUCLEI_SOAK_SECS
+          prepare: |
+            pkg install -y curl
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            cargo test -p nuclei --release --test soak -- --ignored --nocapture

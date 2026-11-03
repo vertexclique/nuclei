@@ -7,7 +7,8 @@
 (* In plain words: a submitter pushes its job into the pool's queue (the  *)
 (* inbox's, linked through the tasks: checked in `inbox`), then, if the   *)
 (* count of idle threads says one waits, claims an idle slot (idle to     *)
-(* woken) and unparks its thread; if it claims none, it starts a thread   *)
+(* woken: the bitmap's candidate, PoolIndex.tla) and unparks its thread;  *)
+(* if it claims none, it starts a thread                                   *)
 (* while the pool has room for one. A thread takes jobs until the queue   *)
 (* is empty, then counts itself idle, marks its slot idle, and looks at   *)
 (* the queue once more: a job there, it takes its slot back (idle to busy)*)
@@ -21,7 +22,9 @@
 (*                                                                          *)
 (* What is abstract: the queue is a count (one taker at a time, as the     *)
 (* inbox's role makes it), a thread's park is its wait for its slot, and  *)
-(* a start hands a token to a thread not running.                         *)
+(* a start hands a token to a thread not running; a start never fails     *)
+(* here (tla/pool/Start.tla checks one that fails, and a start hook that   *)
+(* panics).                                                                *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 

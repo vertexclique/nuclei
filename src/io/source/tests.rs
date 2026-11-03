@@ -308,6 +308,37 @@ fn a_peek_leaves_the_bytes_for_the_read() {
     });
 }
 
+#[cfg(completion)]
+#[test]
+fn a_receive_completing_after_the_drop_ahead_brings_no_bytes() {
+    use super::ops::{Answer, Done, Outcome};
+    let rt = runtime(None);
+    let (_a, b) = pair();
+    rt.block_on(async {
+        within(poll_fn(|cx| b.src.poll_drop_ahead(cx)))
+            .await
+            .unwrap();
+        // A receive made before the shut, completing after it.
+        let mut buf = crate::buf::with_pool(|pool| pool.and_then(|p| p.get(16))).unwrap();
+        buf.spare()[..5].copy_from_slice(b"late!");
+        buf.set_filled(5);
+        b.src.ops_out.fetch_add(1, Ordering::SeqCst);
+        b.src.op_done(
+            Done {
+                outcome: Outcome::Recv(buf, Answer::Done(Ok(5))),
+                epoch: 0,
+                read: true,
+            },
+            None,
+        );
+        let mut out = [0u8; 8];
+        for _ in 0..2 {
+            assert_eq!(within(read(&b.src, &mut out)).await.unwrap(), 0);
+        }
+        assert_eq!(out, [0u8; 8], "no late byte reached the caller");
+    });
+}
+
 #[test]
 fn the_end_of_a_stream_reads_as_zero() {
     let rt = runtime(None);
@@ -559,8 +590,12 @@ fn a_datagram_is_cut_to_the_buffer_as_the_kernel_cuts_it() {
         let mut recv = Box::pin(poll_fn(|cx| b.src.poll_receive(cx, &mut small, false)));
         pends(&mut recv).await;
         a.io().send(b"0123456789").unwrap();
-        let (n, _) = within(recv).await.unwrap();
-        assert_eq!(n, 4);
+        let got = within(recv).await;
+        #[cfg(unix)]
+        assert_eq!(got.unwrap().0, 4);
+        // Windows answers a longer datagram `WSAEMSGSIZE`, as std's receive does.
+        #[cfg(windows)]
+        assert_eq!(got.unwrap_err().raw_os_error(), Some(10040));
         assert_eq!(&small, b"0123");
         // The rest of that datagram is gone, as with the kernel's own cut.
         a.io().send(b"next").unwrap();
@@ -851,8 +886,15 @@ fn a_thread_that_runs_no_shard_is_served_by_the_runtime() {
 #[cfg(unix)]
 #[test]
 fn a_datagram_larger_than_the_pool_allows_goes_whole_between_the_tasks_buffers() {
+    // As large as the system sends (FreeBSD's 8 KiB), past the pool's room: a class below it.
+    let size = (100 * 1024).min(crate::alone::largest_unix_datagram());
+    let room = *crate::buf::CLASSES
+        .iter()
+        .rev()
+        .find(|&&c| c < size)
+        .unwrap();
     let group = crate::rt::shard::least_buffer_cap() - crate::buf::CLASSES[0];
-    let rt = runtime(Some(group + 64 * 1024));
+    let rt = runtime(Some(group + room));
     let (a, b) = datagram_pair();
     // macOS refuses a datagram larger than the sender's buffer (2 KiB for a Unix socket by
     // default) and holds none larger than the receiver's.
@@ -876,7 +918,7 @@ fn a_datagram_larger_than_the_pool_allows_goes_whole_between_the_tasks_buffers()
     let a = Owned::new(a, DATAGRAM);
     let b = Owned::new(b, DATAGRAM);
     rt.block_on(async {
-        let big = pattern(100 * 1024);
+        let big = pattern(size);
         // Polled on a worker, whose pool has the cap.
         let (src, bytes) = (Arc::clone(&a.src), big.clone());
         let sent = within(crate::runtime::spawn(async move {
@@ -970,10 +1012,13 @@ fn tempdir() -> std::path::PathBuf {
 }
 
 mod biased;
+#[cfg(unix)]
+mod caller_clear;
 mod edge_skip;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod inq;
 #[cfg(unix)]
 mod large;
+mod lost_accept;
 mod owned;
 mod requests;

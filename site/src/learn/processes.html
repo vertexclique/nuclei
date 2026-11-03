@@ -14,7 +14,7 @@
 <ul>
 <li><code>kill().await</code> ends the child (SIGKILL on Unix, TerminateProcess on Windows) and waits for its exit; <code>start_kill()</code> only starts it.</li>
 <li><code>kill_on_drop(true)</code> ends the child when its <code>Child</code> is dropped before it exits. By default a dropped child runs on.</li>
-<li><code>try_wait()</code> gives the status if the child exited, without waiting.</li>
+<li><code>try_wait()</code> gives the status if the child exited, without waiting. The child is reaped all the same, by its shard's driver.</li>
 <li>For what <code>Command</code> does not mirror, <code>as_std_mut</code> reaches std's command underneath, <code>spawn_with</code> starts the child through your own code, and <code>into_std</code> takes std's command back.</li>
 </ul>
 

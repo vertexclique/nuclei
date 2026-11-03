@@ -198,14 +198,22 @@ impl Builder {
     }
 
     /// The name of every thread the runtime starts (default `nuclei-worker`
-    /// and `nuclei-blocking`).
+    /// and `nuclei-blocking`), up to its first NUL byte, which no thread's
+    /// name holds.
     pub fn thread_name(mut self, name: impl Into<String>) -> Self {
         let name: String = name.into();
         self.thread_name = Some(Arc::new(move || name.clone()));
         self
     }
 
-    /// A function naming each thread the runtime starts.
+    /// A function naming each thread the runtime starts, each name taken up
+    /// to its first NUL byte. A panic in it as a worker starts (in
+    /// [`build`](Self::build), or `spawn_more_threads`) reaches that caller
+    /// before anything is claimed. One where the runtime starts a thread of
+    /// its own accord (a blocking-pool thread, a runner for a shard the
+    /// handoff took) is caught once the panic hook reported it, and the
+    /// thread takes the default name: the job or shard it was started for
+    /// runs on it.
     pub fn thread_name_fn(mut self, f: impl Fn() -> String + Send + Sync + 'static) -> Self {
         self.thread_name = Some(Arc::new(f));
         self
@@ -269,7 +277,11 @@ impl Builder {
     /// The most bytes each worker's IO buffers hold (default 64 MiB). Reads
     /// that had to wait land in these buffers, and writes that had to wait
     /// are copied into them; at the cap, IO waits for buffers to come back,
-    /// so a worker's IO memory never grows past it. On io_uring the worker's
+    /// so a worker's IO memory never grows past it. A thread that serves the
+    /// runtime and runs no shard (one of its blocking pool, one inside it with
+    /// [`enter`](crate::Runtime::enter), a worker whose shard was handed over)
+    /// holds as much at most in a pool of its own (one that held more before
+    /// `enter` takes no new memory until it is back under the cap). On io_uring the worker's
     /// receive buffers count against the cap too
     /// ([`recv_buffers`](crate::config::IoUringConfiguration::recv_buffers) of
     /// [`recv_buffer_size`](crate::config::IoUringConfiguration::recv_buffer_size)
@@ -325,11 +337,13 @@ impl Builder {
     /// with every other task, timer and IO of it, goes to another thread on
     /// the same core, and the blocked task carries on once its poll returns.
     /// At least 1 ms; [`build`](Self::build) fails with `InvalidInput` below.
-    /// Tasks that `spawn_local` keeps on the blocked thread wait for it. The
-    /// watch costs each poll two plain stores and a load, and each call a
-    /// task makes into its worker (a wake, a spawn, a send or a receive) two
-    /// loads and two stores; with it on, an io_uring worker's ring takes
-    /// submissions from any thread.
+    /// Tasks that `spawn_local` keeps on the blocked thread wait for it. A
+    /// [`ShardLocal`](crate::runtime::ShardLocal) value that the rest of that
+    /// poll or those tasks use is reached through the shard, lent back to
+    /// each call by its new thread. The watch costs each poll two plain
+    /// stores and a load, and each call a task makes into its worker (a
+    /// wake, a spawn, a send or a receive) two loads and two stores; with it
+    /// on, an io_uring worker's ring takes submissions from any thread.
     pub fn handoff_after(mut self, after: Option<Duration>) -> Self {
         self.handoff_after = Some(after);
         self
@@ -409,6 +423,7 @@ impl Builder {
                 Some(cores) => super::cores::mask_of(cores),
                 None => super::current_mask(),
             },
+            buffer_cap: limits.buffer_cap,
         });
         static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (exit_tx, exits) = kovan_channel::unbounded();
@@ -475,6 +490,7 @@ impl Builder {
                 guests: std::sync::OnceLock::new(),
                 lingering: super::super::linger::Lingering::new(),
                 io: self.io.resolve(),
+                buffer_cap: limits.buffer_cap,
             }
         });
         inner.pool.set_owner(Arc::downgrade(&inner));

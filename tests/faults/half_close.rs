@@ -65,19 +65,33 @@ pub async fn read_exact_past_a_half_close<S: Stream>() {
     );
 }
 
-/// What std answers to a write after its own shutdown, and to a second
-/// shutdown.
-fn oracle_own_shutdown<S: Stream>() -> (Answer, Answer) {
-    let (mut ours, _peer) = S::std_pair(false);
+/// What std answers after its own shutdown, the peer having read to the end
+/// (see [`fin_settled`]): a second shutdown, a write, and the reads of what
+/// the peer sends then, `back`, and its end. FreeBSD disconnects a TCP
+/// socket that a second shutdown finds with its FIN acknowledged, so there
+/// its reads end at once.
+fn oracle_own_shutdown<S: Stream>(back: &[u8]) -> (Answer, Answer, (Vec<u8>, Answer)) {
+    let (mut ours, mut peer) = S::std_pair(false);
     ours.write_all(b"bytes").unwrap();
     S::shutdown_std(&ours, Shutdown::Write).unwrap();
+    let (_, end) = std_read_until_end(&mut peer, 8192);
+    assert!(matches!(end, Ok(0)), "std's peer's end: {end:?}");
+    fin_settled(&ours);
     let twice = S::shutdown_std(&ours, Shutdown::Write);
     let wrote = ours.write_all(b"more");
-    (Answer::of(&wrote, |_| 0), Answer::of(&twice, |_| 0))
+    peer.write_all(back).unwrap();
+    S::shutdown_std(&peer, Shutdown::Write).unwrap();
+    let (got, end) = std_read_until_end(&mut ours, 4096);
+    (
+        Answer::of(&wrote, |_| 0),
+        Answer::of(&twice, |_| 0),
+        (got, Answer::of(&end, |n| *n)),
+    )
 }
 
 pub async fn own_shutdown<S: Stream>() {
-    let (want_write, want_twice) = oracle_own_shutdown::<S>();
+    let back = pattern(14, 50_000);
+    let (want_write, want_twice, (want_back, want_end)) = oracle_own_shutdown::<S>(&back);
     for writer in WRITERS {
         let bytes = pattern(13, 200_000);
         let (ours, peer) = S::pair(false);
@@ -95,6 +109,7 @@ pub async fn own_shutdown<S: Stream>() {
         let (mut peer, (got, end)) = joined(reader).await;
         same_bytes(&what, &got, &bytes);
         assert!(matches!(end, Ok(0)), "{what}: the peer's end: {end:?}");
+        fin_settled(&ours);
         let twice = within(&what, close(&ours)).await;
         assert_eq!(
             Answer::of(&twice, |_| 0),
@@ -107,12 +122,11 @@ pub async fn own_shutdown<S: Stream>() {
             want_write,
             "{what}: a write after it"
         );
-        let back = pattern(14, 50_000);
         peer.write_all(&back).unwrap();
         S::shutdown_std(&peer, Shutdown::Write).unwrap();
         let (got, end) = within(&what, read_to_end_as(&ours, Reader::Owned, 4096)).await;
-        same_bytes(&format!("{what}: our reads after it"), &got, &back);
-        assert_eq!(end, Answer::Ok(0), "{what}: our read at the end");
+        same_bytes(&format!("{what}: our reads after it"), &got, &want_back);
+        assert_eq!(end, want_end, "{what}: our read at the end");
     }
 }
 

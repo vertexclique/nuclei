@@ -186,6 +186,37 @@ impl SOCKADDR_STORAGE {
     }
 }
 
+/// `ioctlsocket` command: the socket's calls do not block (`u32` 1) or do.
+pub(crate) const FIONBIO: i32 = 0x8004_667Eu32 as i32;
+
+/// The AFD driver's poll of sockets, which completes once one of the events it asks for is
+/// there: how a socket says it has room to send, which no overlapped call tells.
+pub(crate) const IOCTL_AFD_POLL: ULONG = 0x0001_2024;
+/// Room to send.
+pub(crate) const AFD_POLL_SEND: ULONG = 0x0004;
+/// The socket was closed under the poll.
+pub(crate) const AFD_POLL_LOCAL_CLOSE: ULONG = 0x0020;
+pub(crate) const STATUS_PENDING: NTSTATUS = 0x0000_0103;
+
+/// One socket of an AFD poll: the events asked for, and those that came.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct AFD_POLL_HANDLE_INFO {
+    pub(crate) Handle: HANDLE,
+    pub(crate) Events: ULONG,
+    pub(crate) Status: NTSTATUS,
+}
+
+/// An AFD poll of one socket.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct AFD_POLL_INFO {
+    pub(crate) Timeout: i64,
+    pub(crate) NumberOfHandles: ULONG,
+    pub(crate) Exclusive: ULONG,
+    pub(crate) Handles: [AFD_POLL_HANDLE_INFO; 1],
+}
+
 #[repr(C)]
 pub(crate) struct IO_STATUS_BLOCK {
     pub(crate) Status: ULONG_PTR,
@@ -216,6 +247,7 @@ const _: () = {
     assert!(align_of::<SOCKADDR_STORAGE>() == 8);
     assert!(size_of::<IO_STATUS_BLOCK>() == 2 * p);
     assert!(size_of::<FILE_COMPLETION_INFORMATION>() == 2 * p);
+    assert!(size_of::<AFD_POLL_INFO>() == 16 + if p == 8 { 16 } else { 12 });
 };
 
 pub(crate) const AF_INET: u16 = 2;
@@ -243,7 +275,6 @@ pub(crate) const SO_KEEPALIVE: i32 = 0x0008;
 pub(crate) const SO_LINGER: i32 = 0x0080;
 pub(crate) const SO_SNDBUF: i32 = 0x1001;
 pub(crate) const SO_RCVBUF: i32 = 0x1002;
-pub(crate) const SO_MAX_MSG_SIZE: i32 = 0x2003;
 pub(crate) const IPPROTO_IP: i32 = 0;
 pub(crate) const IP_TOS: i32 = 3;
 
@@ -281,6 +312,7 @@ pub(crate) const FILE_MODE_INFORMATION: u32 = 16;
 pub(crate) const FILE_ACCESS_INFORMATION: u32 = 8;
 pub(crate) const FILE_WRITE_DATA: ULONG = 0x2;
 pub(crate) const FILE_APPEND_DATA: ULONG = 0x4;
+pub(crate) const FILE_WRITE_THROUGH: ULONG = 0x2;
 pub(crate) const FILE_NO_INTERMEDIATE_BUFFERING: ULONG = 0x8;
 pub(crate) const FILE_SYNCHRONOUS_IO_ALERT: ULONG = 0x10;
 pub(crate) const FILE_SYNCHRONOUS_IO_NONALERT: ULONG = 0x20;
@@ -302,6 +334,10 @@ pub(crate) const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x0200_0000;
 
 pub(crate) const ERROR_IO_PENDING: i32 = 997;
 pub(crate) const ERROR_HANDLE_EOF: i32 = 38;
+/// What `RtlNtStatusToDosError` makes of a connection reset or dropped under an operation.
+pub(crate) const ERROR_NETNAME_DELETED: i32 = 64;
+/// What `RtlNtStatusToDosError` makes of an operation the system had no resources for.
+pub(crate) const ERROR_NO_SYSTEM_RESOURCES: i32 = 1450;
 pub(crate) const ERROR_BROKEN_PIPE: i32 = 109;
 pub(crate) const WAIT_TIMEOUT: i32 = 258;
 /// `WaitForSingleObject`: the object is signalled (a process: it ended).
@@ -372,6 +408,12 @@ unsafe extern "system" {
         lpName: *const u16,
     ) -> HANDLE;
     pub(crate) fn SetEvent(hEvent: HANDLE) -> BOOL;
+    pub(crate) fn GetOverlappedResult(
+        hFile: HANDLE,
+        lpOverlapped: *mut OVERLAPPED,
+        lpNumberOfBytesTransferred: *mut DWORD,
+        bWait: BOOL,
+    ) -> BOOL;
     pub(crate) fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> BOOL;
     pub(crate) fn CreateIoCompletionPort(
         FileHandle: HANDLE,
@@ -508,6 +550,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     pub(crate) fn WSAStartup(wVersionRequested: u16, lpWSAData: *mut WSADATA) -> i32;
     pub(crate) fn WSAGetLastError() -> i32;
+    pub(crate) fn ioctlsocket(s: SOCKET, cmd: i32, argp: *mut u32) -> i32;
     pub(crate) fn WSASocketW(
         af: i32,
         r#type: i32,
@@ -626,6 +669,18 @@ unsafe extern "system" {
     pub(crate) fn NtCancelWaitCompletionPacket(
         WaitCompletionPacketHandle: HANDLE,
         RemoveSignaledPacket: BOOLEAN,
+    ) -> NTSTATUS;
+    pub(crate) fn NtDeviceIoControlFile(
+        FileHandle: HANDLE,
+        Event: HANDLE,
+        ApcRoutine: *mut c_void,
+        ApcContext: *mut c_void,
+        IoStatusBlock: *mut IO_STATUS_BLOCK,
+        IoControlCode: ULONG,
+        InputBuffer: *mut c_void,
+        InputBufferLength: ULONG,
+        OutputBuffer: *mut c_void,
+        OutputBufferLength: ULONG,
     ) -> NTSTATUS;
     pub(crate) fn NtQueryInformationFile(
         FileHandle: HANDLE,

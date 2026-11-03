@@ -47,6 +47,7 @@ CONSTANTS
     Prog,       \* per task, its operations in order: [op |-> "lock" or "cancel", n |-> permits]
     Closer,     \* a closer thread closes the semaphore at some point
     MaxBypass,  \* MAX_BYPASS (2 under loom; 16 in a build)
+    TidyMaybe,  \* a pass may leave withdrawn nodes linked (the sweep runs only past half)
     Mutation    \* "none", or the name of the one rule this run takes away
 
 \* The tasks are the names Prog gives programs to: 1, 2, ... for a sequence, or
@@ -94,11 +95,13 @@ variables
     raisedHandoff = FALSE,
     nudgePending = FALSE,              \* a nudge found its waiter still carrying the last one
     gaveBackGrant = FALSE,             \* a waiter that took on its own gave back a grant
-    enqueued = [r \in Reqs |-> FALSE];  \* the waiter's enqueue transition happened
+    enqueued = [r \in Reqs |-> FALSE], \* the waiter's enqueue transition happened
+    added = 0,                         \* permits `add_permits` added
+    forgotten = 0;                     \* permits `forget_permits` took away
 
 define
     Conservation ==
-        free + SumOver(heldBy, Tasks) + SumOver(owned, Reqs) + inPass = Permits
+        free + SumOver(heldBy, Tasks) + SumOver(owned, Reqs) + inPass = Permits + added - forgotten
     MutualExclusion == Permits = 1 => SumOver(heldBy, Tasks) <= 1
     NoAdmitAfterClose == ~admittedAfterClose
     BypassBounded == \A r \in Reqs : counted[r] <= MaxBypass
@@ -107,7 +110,7 @@ define
     \* arrival stack: the pass that came after it, or the one its DIRTY forced, took it in.
     NoStrandedArrival == \A r \in Range(arrivals) : enqueued[r] => draining
     AllDone == \A t \in Tasks : pc[t] = "Done"
-    PermitsBackAtEnd == AllDone => free = Permits
+    PermitsBackAtEnd == AllDone => free = Permits + added - forgotten
     \* Every task ends. Once every task is at its end it stays there (an ended
     \* task takes no step, under every mutation too), so "in the end, all are
     \* ended" is the same as "all are ended again and again", which TLC checks
@@ -145,7 +148,8 @@ macro claimOrDirty(claimed) begin
 end macro;
 
 (***************************************************************************)
-(* The drain role's work (`WaitQueue::drain` and `RawSemaphore::pass`).   *)
+(* The drain role's work (`Policy::drain` in src/sync/queue.rs and       *)
+(* `RawSemaphore::pass` in src/sync/raw_semaphore.rs).                     *)
 (***************************************************************************)
 procedure Drain()
 \* (The withdrawn nodes a sweep takes, and the front a handoff looks at, are
@@ -166,14 +170,24 @@ D_absorb:
         forget(gone);    \* their futures left them, and now the queue lets them go
     end with;
 D_tidy:
-    \* The sweep: every withdrawn waiter on the list goes.
-    with gone = {r \in Range(list) : phase[r] = "cancelled"} do   \* the withdrawn ones
-        list := Without(list, gone);
-        owedCount := owedCount - Cardinality({r \in gone : owed[r]});
-        forget(gone);    \* their futures left them, and now the queue lets them go
-    end with;
+    \* The sweep: every withdrawn waiter on the list goes. `List::tidy` sweeps only once the
+    \* withdrawals since its last sweep pass half the list: with TidyMaybe the pass may sweep
+    \* or not, so a withdrawn node (an owed one too, keeping HANDOFF up) can stay linked.
+    either
+        with gone = {r \in Range(list) : phase[r] = "cancelled"} do   \* the withdrawn ones
+            list := Without(list, gone);
+            owedCount := owedCount - Cardinality({r \in gone : owed[r]});
+            forget(gone);    \* their futures left them, and now the queue lets them go
+        end with;
+    or
+        await TidyMaybe;
+        skip;
+    end either;
 D_closed:
-    if closedBit then
+    \* MUTATION close_grants_none: the close's pass grants no waiter, and keeps them queued.
+    if closedBit /\ Mutation = "close_grants_none" then
+        goto D_end;
+    elsif closedBit then
         \* Closed: every waiter is granted the close; the queue lets go of each.
         wl := wl \cup {r \in Range(list) : phase[r] = "waiting"};
         closedG := [r \in Reqs |-> closedG[r] \/ (r \in Range(list) /\ phase[r] = "waiting")];
@@ -211,7 +225,10 @@ D_handoff:
     end if;
 D_handBack:
     \* Withdrawn at the grant: the permits go back, in a fetch_add of their own.
-    free := free + inPass;
+    \* MUTATION handoff_keeps_withdrawn: they are dropped with the withdrawn node.
+    if Mutation # "handoff_keeps_withdrawn" then
+        free := free + inPass;
+    end if;
     inPass := 0;
     goto D_handoff;
 D_nudgeStart:
@@ -257,11 +274,14 @@ D_exit:
     if dirty /\ Mutation # "exit_ignores_dirty" then
         noneLeft := FALSE;    \* read: the next pass computes it again
         goto D_clear;
-    elsif ~noneLeft /\ wakeFront then
+    \* MUTATION exit_ignores_wake: a release's request (WAKE_FRONT) with somebody queued does
+    \* not send the drain round again.
+    elsif ~noneLeft /\ wakeFront /\ Mutation # "exit_ignores_wake" then
         goto D_clear;
     else
         draining := FALSE;
-        if owedCount = 0 then
+        \* MUTATION exit_clears_owed_handoff: HANDOFF comes down with a waiter still owed.
+        if owedCount = 0 \/ Mutation = "exit_clears_owed_handoff" then
             handoffBit := FALSE;
         end if;
         if noneLeft then
@@ -286,7 +306,8 @@ variables wants = FALSE, claimed = FALSE;
 begin
 R_add:
     \* One fetch_add; `wants_drain` of the word it saw.
-    wants := queuedBit /\ (~nudgeOut \/ handoffBit);
+    \* MUTATION release_ignores_handoff: a nudge out skips the pass even with a handoff owed.
+    wants := queuedBit /\ (~nudgeOut \/ (handoffBit /\ Mutation # "release_ignores_handoff"));
     free := free + back;
     if fromReq = NoReq then
         heldBy[self] := heldBy[self] - back;
@@ -336,17 +357,25 @@ Q_enqueue:
     arrivals := Append(arrivals, ar);
 Q_enqTr:
     \* `Step::Drain(state | QUEUED)`.
+    \* MUTATION enqueue_no_drain: QUEUED goes up with no claim of the role and no dirty mark.
     queuedBit := TRUE;
     enqueued[ar] := TRUE;
-    claimOrDirty(claimed);
+    if Mutation # "enqueue_no_drain" then
+        claimOrDirty(claimed);
+    end if;
 Q_enqDrain:
     if claimed then
         claimed := FALSE;    \* read: back to its start
         call Drain();
     end if;
 Q_park:
+    \* A granted or nudged future takes the nudge marker down (`consume_nudge`).
+    \* MUTATION finish_keeps_marker: a granted one leaves it up.
+    \* MUTATION nudge_never_consumed: a nudged one leaves it up.
     if phase[ar] = "granted" then
-        nudgeOut := FALSE;
+        if Mutation # "finish_keeps_marker" then
+            nudgeOut := FALSE;
+        end if;
         if ~closedG[ar] then
             heldBy[self] := heldBy[self] + owned[ar];
             owned[ar] := 0;
@@ -355,7 +384,9 @@ Q_park:
         return;
     elsif nudged[ar] then
         nudged[ar] := FALSE;
-        nudgeOut := FALSE;
+        if Mutation # "nudge_never_consumed" then
+            nudgeOut := FALSE;
+        end if;
         goto Q_retry;
     elsif drop then
         goto Q_withdraw;
@@ -500,20 +531,58 @@ Q_wdDrain:
     end if;
 end procedure;
 
+\* `RawSemaphore::add(1)` (`add_permits`): one permit more, and with somebody queued a
+\* `Step::Wake(state | WAKE_FRONT)`: the drain role, or only the request.
+\* MUTATION add_no_wake: the permit is added and nobody is told.
+procedure AddPermits()
+begin
+AD_add:
+    free := free + 1;
+    added := added + 1;
+    if queuedBit /\ Mutation # "add_no_wake" then
+        wakeFront := TRUE;
+        if ~draining then
+            draining := TRUE;
+            call Drain();
+            return;
+        else
+            return;
+        end if;
+    else
+        return;
+    end if;
+end procedure;
+
 fair process task \in Tasks
 variables j = 1, before = 0;
 begin
 T_op:
     while j <= Len(Prog[self]) do
         before := heldBy[self];
-        call Acquire(Prog[self][j].n, <<self, j>>, Prog[self][j].op = "cancel");
+        if Prog[self][j].op = "add" then
+            call AddPermits();
+        elsif Prog[self][j].op = "forget" then
+            \* `forget_permits(1)`: one compare-and-swap takes a free permit away, if any.
+            forgotten := forgotten + (IF free >= 1 THEN 1 ELSE 0);
+            free := IF free >= 1 THEN free - 1 ELSE free;
+        else
+            call Acquire(Prog[self][j].n, <<self, j>>, Prog[self][j].op = "cancel");
+        end if;
 T_release:
-        if heldBy[self] > before then
+        \* "split" gives its permits back in two releases: one, then the rest.
+        if heldBy[self] > before /\ Prog[self][j].op = "split" then
+            call Release(1, NoReq);
+            goto T_rest;
+        elsif heldBy[self] > before then
             call Release(Prog[self][j].n, NoReq);
         end if;
 T_next:
         j := j + 1;
     end while;
+    goto Done;
+T_rest:
+    call Release(Prog[self][j].n - 1, NoReq);
+    goto T_next;
 end process;
 
 fair process closer \in (IF Closer THEN {CloserT} ELSE {})

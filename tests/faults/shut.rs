@@ -67,10 +67,15 @@ fn delivered<S: Stream>(peer: &S::Std) {
     let _ = peer;
 }
 
-/// What std answers to a second shutdown of `how` on a stream it shut so already.
+/// What std answers to a second shutdown of `how` on a stream it shut so already, once its
+/// peer read to the end (see [`fin_settled`]: FreeBSD disconnects a TCP socket shut both ways
+/// once its FIN is acknowledged, and a shutdown then answers `ENOTCONN`).
 fn std_second_shutdown<S: Stream>(how: Shutdown) -> Answer {
-    let (ours, _peer) = S::std_pair(false);
+    let (ours, mut peer) = S::std_pair(false);
     S::shutdown_std(&ours, how).unwrap();
+    let (_, end) = std_read_until_end(&mut peer, 8192);
+    assert!(matches!(end, Ok(0)), "std's peer's end: {end:?}");
+    fin_settled(&ours);
     Answer::of(&S::shutdown_std(&ours, how), |_| 0)
 }
 
@@ -103,6 +108,7 @@ pub async fn shut_writing_delivers_every_byte_behind<S: Stream>() {
         let (peer, (got, end)) = joined(reader).await;
         same_bytes(&what, &got, &bytes);
         assert!(matches!(end, Ok(0)), "{what}: the peer's end: {end:?}");
+        fin_settled(&ours);
         let again = within(&what, ours.shut(how)).await;
         assert_eq!(
             Answer::of(&again, |_| 0),
@@ -121,7 +127,12 @@ pub async fn reads_after_a_shut_answer_as_std<S: Stream>() {
                 "{}: shut({how:?}) with {unread} bytes unread past the first",
                 S::NAME
             );
-            let (want, want_end) = std_reads_after::<S>(how, &bytes);
+            // Windows' read after the shutdown errs, where ours answers the end.
+            let (want, want_end) = if cfg!(windows) {
+                (Vec::new(), Answer::of(&Ok(0), |n: &usize| *n))
+            } else {
+                std_reads_after::<S>(how, &bytes)
+            };
             let (ours, mut peer) = S::pair(false);
             peer.write_all(&bytes).unwrap();
             let first = within(&what, read_exact(&ours, 1)).await.unwrap();
@@ -135,6 +146,14 @@ pub async fn reads_after_a_shut_answer_as_std<S: Stream>() {
                 want_end,
                 "{what}: the read that ended"
             );
+            if cfg!(not(any(target_os = "linux", target_os = "android"))) {
+                let mut buf = [0u8; 16];
+                let again = within(&what, read_some(&ours, &mut buf)).await;
+                assert!(
+                    matches!(again, Ok(0)),
+                    "{what}: a read after the end: {again:?}"
+                );
+            }
             drop(peer);
         }
     }

@@ -1,5 +1,6 @@
 # configuration                spec                 expected
 C_safe                         MC_Clock             pass
+C_safe_other                   MC_Clock             pass
 C_safe_live                    MC_Clock             pass
 C_three                        MC_Clock             pass
 C_pair                         MC_Clock             pass
@@ -11,3 +12,27 @@ M_no_job_check                 MC_Clock             violated:NoBadJump
 M_no_attempt                   MC_Clock             violated:TimersFire
 W_jump                         MC_Clock             violated:NoJumpW
 C_rearm                        MC_Clock             pass
+C_post_wakes                   MC_Clock             pass
+C_post_own                     MC_Clock             pass
+M_post_no_wake                 MC_Clock             violated:TimersFire
+M_uncounted_shard              MC_Clock             violated:TimersFire
+M_detached_uncounted           MC_Clock             violated:NoBadJump
+C_read                         MC_ClockRead         pass
+M_check_then_read              MC_ClockRead         violated:ReaderMonotonic
+M_pause_reads_first            MC_ClockRead         violated:ReaderMonotonic
+OW_wheels                      MC_OneWheel          pass
+M_one_wheel                    MC_OneWheel          violated:NeverEarly
+FA_protocol                    MC_ForeignArm        pass
+M_no_in_flight                 MC_ForeignArm        violated:ForeignNeverPassed
+M_no_wait_advance_foreign      MC_ForeignArm        violated:ForeignNeverPassed
+CJ_join                        MC_ClockJoin         pass
+MCJ_no_members_recheck         MC_ClockJoin         violated:ClockNeverPassesArmed
+LJ_join                        MC_LateJoin          pass
+LJ_leave                       MC_LateJoin          pass
+M_no_late_join                 MC_LateJoin          violated:ClockNeverPassesArmed
+M_no_visit_mark                MC_LateJoin          violated:ClockNeverPassesArmed
+M_no_join_recheck              MC_LateJoin          violated:NoStaleGuest
+M_pause_unclaimed              MC_LateJoin          violated:NoBadJump
+W_join_at_look                 MC_LateJoin          violated:ClockNeverPassesArmed
+OW_watched                     MC_OneWheel          pass
+M_swap_on_watched              MC_OneWheel          violated:NoTouchAfterTake

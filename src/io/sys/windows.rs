@@ -10,21 +10,24 @@
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::windows::io::{BorrowedHandle, FromRawSocket, OwnedHandle, OwnedSocket};
+use std::os::windows::io::{
+    AsRawHandle, BorrowedHandle, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket,
+};
 
 use crate::fs::Allocate;
 use crate::io::raw::Raw;
 use crate::io::source::Kind;
 use crate::syscore::windows::{
-    AF_INET, AF_INET6, BY_HANDLE_FILE_INFORMATION, DWORD, DeviceIoControl, ERROR_BROKEN_PIPE,
-    ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION, FILE_ALLOCATION_INFO_CLASS, FILE_APPEND_DATA,
-    FILE_BEGIN, FILE_CURRENT, FILE_END_OF_FILE_INFO_CLASS, FILE_MODE_INFORMATION,
-    FILE_NO_INTERMEDIATE_BUFFERING, FILE_STANDARD_INFO, FILE_STANDARD_INFO_CLASS,
-    FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA,
+    AF_INET, AF_INET6, BY_HANDLE_FILE_INFORMATION, CreateEventW, DWORD, DeviceIoControl,
+    ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, FILE_ACCESS_INFORMATION,
+    FILE_ALLOCATION_INFO_CLASS, FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT,
+    FILE_END_OF_FILE_INFO_CLASS, FILE_MODE_INFORMATION, FILE_NO_INTERMEDIATE_BUFFERING,
+    FILE_STANDARD_INFO, FILE_STANDARD_INFO_CLASS, FILE_SYNCHRONOUS_IO_ALERT,
+    FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, FILE_WRITE_THROUGH,
     FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetFileSizeEx, GetFileType, HANDLE, IN_ADDR, INVALID_SOCKET,
-    IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK, NtQueryInformationFile, OVERLAPPED, ReadFile, SD_BOTH,
-    SD_RECEIVE, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE,
+    GetFileInformationByHandleEx, GetFileSizeEx, GetFileType, GetOverlappedResult, HANDLE, IN_ADDR,
+    INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK, NtQueryInformationFile, OVERLAPPED,
+    ReadFile, SD_BOTH, SD_RECEIVE, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_TYPE,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
     SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
     SOL_SOCKET, STATUS_SUCCESS, SetFileInformationByHandle, SetFilePointerEx, ULONG,
@@ -63,6 +66,14 @@ fn int_option(raw: Raw, name: i32) -> io::Result<i32> {
         )
     })?;
     Ok(value)
+}
+
+/// No count of a socket's unacknowledged bytes is asked on Windows, so the wait before a
+/// zero-linger close is skipped there, as before. Unverified: nothing here shows that Windows
+/// orders a close's reset after the data still on its way, or takes a reset that overtook it;
+/// the resetting peer of `tests/net_streams.rs` passes on CI's Windows runner without the wait.
+pub(crate) fn unacked(_raw: Raw) -> Option<usize> {
+    None
 }
 
 /// What kind of socket `raw` is: one of messages (datagrams, raw or
@@ -106,6 +117,9 @@ pub(crate) struct FileMode {
     /// bytes straight between the caller's memory and the device, by its
     /// alignment rules.
     pub(crate) direct: bool,
+    /// Writing through (`FILE_FLAG_WRITE_THROUGH`): a write returns once its
+    /// bytes are on the device.
+    pub(crate) sync: bool,
 }
 
 /// How the file handle `raw` was opened.
@@ -115,6 +129,7 @@ pub(crate) fn file_mode(raw: Raw) -> io::Result<FileMode> {
     Ok(FileMode {
         append: access & FILE_APPEND_DATA != 0 && access & FILE_WRITE_DATA == 0,
         direct: mode & FILE_NO_INTERMEDIATE_BUFFERING != 0,
+        sync: mode & FILE_WRITE_THROUGH != 0,
     })
 }
 
@@ -176,8 +191,9 @@ pub(crate) fn recv_ready(raw: Raw, buf: &mut [u8], peek: bool) -> io::Result<usi
 /// A `recvfrom` (with `peek`, a look that leaves the datagram) on the
 /// datagram socket `raw` into `buf`, made only once a zero-byte look said a
 /// datagram (or an error) came: the socket blocks, and holding one it answers
-/// at once. A datagram longer than `buf` is cut to it, as the port's own
-/// receive cuts one.
+/// at once. A datagram longer than `buf` answers `WSAEMSGSIZE`, `buf` holding the bytes that fit
+/// and the datagram consumed (a peek leaves it), as std's receive does; a peek into an empty `buf`
+/// (a sender look) takes that answer for success, the sender being filled in.
 pub(crate) fn recv_from_ready(
     raw: Raw,
     buf: &mut [u8],
@@ -201,10 +217,10 @@ pub(crate) fn recv_from_ready(
     };
     let n = if n == SOCKET_ERROR {
         let err = wsa_error();
-        if err.raw_os_error() != Some(WSAEMSGSIZE) {
+        if !(peek && buf.is_empty() && err.raw_os_error() == Some(WSAEMSGSIZE)) {
             return Err(err);
         }
-        buf.len()
+        0
     } else {
         n as usize
     };
@@ -278,6 +294,21 @@ pub(crate) fn adopt_connected(raw: Raw) -> io::Result<()> {
     })
 }
 
+/// Makes the socket's calls answer `WSAEWOULDBLOCK` where they would block, as a unix
+/// descriptor's are made `O_NONBLOCK`: a task's own call on it never blocks its shard. The
+/// socket's overlapped operations are as they were.
+pub(crate) fn set_nonblocking(raw: Raw) -> io::Result<()> {
+    let mut on: u32 = 1;
+    // SAFETY: the command takes a u32 of our own.
+    check(unsafe {
+        crate::syscore::windows::ioctlsocket(
+            socket_of(raw),
+            crate::syscore::windows::FIONBIO,
+            &mut on,
+        )
+    })
+}
+
 /// A new overlapped TCP socket of address family `family`, not inherited.
 pub(crate) fn tcp_socket(family: u16) -> io::Result<OwnedSocket> {
     socket(family, SOCK_STREAM, IPPROTO_TCP)
@@ -307,7 +338,9 @@ fn socket(family: u16, ty: i32, protocol: i32) -> io::Result<OwnedSocket> {
         return Err(wsa_error());
     }
     // SAFETY: a new socket nobody else owns.
-    Ok(unsafe { OwnedSocket::from_raw_socket(socket as u64) })
+    let socket = unsafe { OwnedSocket::from_raw_socket(socket as u64) };
+    set_nonblocking(std::os::windows::io::AsRawSocket::as_raw_socket(&socket))?;
+    Ok(socket)
 }
 
 /// The address family of the socket `raw` (that of its local address).
@@ -338,18 +371,6 @@ pub(crate) fn bind_any(raw: Raw, family: u16) -> io::Result<()> {
     match check(unsafe { bind(socket_of(raw), core::ptr::from_ref(&storage).cast(), len) }) {
         Err(err) if err.raw_os_error() == Some(crate::syscore::windows::WSAEINVAL) => Ok(()),
         other => other,
-    }
-}
-
-/// The error Winsock's own check gives a datagram of `len` bytes on the
-/// socket `raw` before it sends it: longer than the socket's
-/// `SO_MAX_MSG_SIZE`.
-pub(crate) fn datagram_too_long(raw: Raw, len: usize) -> Option<io::Error> {
-    match int_option(raw, SO_MAX_MSG_SIZE) {
-        Ok(max) => usize::try_from(max)
-            .is_ok_and(|max| len > max)
-            .then(|| io::Error::from_raw_os_error(crate::syscore::windows::WSAEMSGSIZE)),
-        Err(err) => Some(err),
     }
 }
 
@@ -472,29 +493,78 @@ pub(crate) unsafe fn socket_addr(addr: *const SOCKADDR, len: i32) -> io::Result<
     }
 }
 
-/// An `OVERLAPPED` asking for a synchronous read or write at `offset`.
-fn at(offset: u64) -> OVERLAPPED {
+thread_local! {
+    /// This thread's event for its reads and writes of files: one a handle opened for overlapped
+    /// IO answers pending is waited for on it (see [`at`]). Made at the thread's first such call.
+    static FILE_EVENT: core::cell::OnceCell<OwnedHandle> = const { core::cell::OnceCell::new() };
+}
+
+/// An `OVERLAPPED` for a read or write at `offset` that the calling thread waits out. A handle
+/// opened for synchronous IO makes the call itself wait. One opened for overlapped IO (a
+/// database's log, `FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`)
+/// may answer the call pending with the kernel still holding it, and the kernel later writes
+/// its end into this `OVERLAPPED`: so it names the thread's own event, which the call clears as
+/// it starts and the kernel sets at the call's end, and [`finished`] waits on it. Its low bit
+/// set keeps the end off any port the handle is bound to (proofs/tla/port/PortFile.tla).
+fn at(offset: u64) -> io::Result<OVERLAPPED> {
+    let event = FILE_EVENT.with(|event| -> io::Result<HANDLE> {
+        if let Some(event) = event.get() {
+            return Ok(event.as_raw_handle().cast());
+        }
+        // SAFETY: plain arguments: a manual-reset event, not set, with no name.
+        let made = unsafe { CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
+        if made.is_null() {
+            return Err(last_error());
+        }
+        // SAFETY: a new event nobody else owns.
+        let owned = unsafe { OwnedHandle::from_raw_handle(made.cast()) };
+        let raw = owned.as_raw_handle().cast();
+        let _ = event.set(owned);
+        Ok(raw)
+    })?;
     let mut ov = OVERLAPPED::zeroed();
     ov.Offset = offset as u32;
     ov.OffsetHigh = (offset >> 32) as u32;
-    ov
+    ov.hEvent = (event as usize | 1) as HANDLE;
+    Ok(ov)
+}
+
+/// The end of a read or write made with `ov` from [`at`], which answered `ok`, with `done` bytes
+/// if it ended in the call: one the handle answered pending (ERROR_IO_PENDING) is waited out on
+/// the thread's event, so the call returns only once the kernel is done with `ov` and its
+/// buffer, with what the kernel said of it.
+fn finished(raw: Raw, ok: i32, done: DWORD, ov: &mut OVERLAPPED) -> io::Result<DWORD> {
+    if ok != 0 {
+        return Ok(done);
+    }
+    let err = last_error();
+    if err.raw_os_error() != Some(ERROR_IO_PENDING) {
+        return Err(err);
+    }
+    let mut moved: DWORD = 0;
+    // SAFETY: `ov` is the one the pending call named, alive until this returns, and the wait
+    // ends only once the kernel is done with it.
+    if unsafe { GetOverlappedResult(handle_of(raw), ov, &mut moved, 1) } == 0 {
+        return Err(last_error());
+    }
+    Ok(moved)
 }
 
 /// Reads up to `len` bytes at `offset` of the file into `buf`; zero at the
 /// end of the file.
 pub(super) fn read_at(raw: Raw, buf: *mut u8, len: usize, offset: u64) -> io::Result<usize> {
-    let mut ov = at(offset);
+    let mut ov = at(offset)?;
     let mut read: DWORD = 0;
     let len = u32::try_from(len).unwrap_or(u32::MAX);
-    // SAFETY: writes at most `len` bytes at `buf`, which the caller owns.
-    if unsafe { ReadFile(handle_of(raw), buf.cast(), len, &mut read, &mut ov) } == 0 {
-        let err = last_error();
-        return match err.raw_os_error() {
+    // SAFETY: writes at most `len` bytes at `buf`, which the caller owns until the call ends.
+    let ok = unsafe { ReadFile(handle_of(raw), buf.cast(), len, &mut read, &mut ov) };
+    match finished(raw, ok, read, &mut ov) {
+        Ok(read) => Ok(read as usize),
+        Err(err) => match err.raw_os_error() {
             Some(ERROR_HANDLE_EOF | ERROR_BROKEN_PIPE) => Ok(0),
             _ => Err(err),
-        };
+        },
     }
-    Ok(read as usize)
 }
 
 pub(crate) fn pread(raw: Raw, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -528,11 +598,12 @@ pub(crate) fn append_all(raw: Raw, buf: &[u8]) -> io::Result<u64> {
 pub(super) fn write_all_at(raw: Raw, mut buf: &[u8], mut offset: Option<u64>) -> io::Result<()> {
     while !buf.is_empty() {
         // Both halves of the offset all ones: the file's end.
-        let mut ov = at(offset.unwrap_or(u64::MAX));
+        let mut ov = at(offset.unwrap_or(u64::MAX))?;
         let mut written: DWORD = 0;
         let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-        // SAFETY: reads at most `len` bytes from `buf`.
-        if unsafe {
+        // SAFETY: reads at most `len` bytes from `buf`, which the caller keeps until the call
+        // ends.
+        let ok = unsafe {
             WriteFile(
                 handle_of(raw),
                 buf.as_ptr().cast(),
@@ -540,10 +611,8 @@ pub(super) fn write_all_at(raw: Raw, mut buf: &[u8], mut offset: Option<u64>) ->
                 &mut written,
                 &mut ov,
             )
-        } == 0
-        {
-            return Err(last_error());
-        }
+        };
+        let written = finished(raw, ok, written, &mut ov)?;
         if written == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
@@ -642,8 +711,12 @@ fn control<T>(raw: Raw, code: DWORD, input: Option<&T>) -> io::Result<()> {
         Some(input) => (core::ptr::from_ref(input).cast(), size_of::<T>() as DWORD),
         None => (core::ptr::null(), 0),
     };
-    // SAFETY: the call reads `len` bytes at `ptr`, which is ours or null.
-    if unsafe {
+    // A handle opened for overlapped IO needs an `OVERLAPPED` for this too, waited out as a
+    // read's is (see `at`).
+    let mut ov = at(0)?;
+    // SAFETY: the call reads `len` bytes at `ptr`, which is ours or null, and `ov` lives until
+    // `finished` saw the call end.
+    let ok = unsafe {
         DeviceIoControl(
             handle_of(raw),
             code,
@@ -652,13 +725,10 @@ fn control<T>(raw: Raw, code: DWORD, input: Option<&T>) -> io::Result<()> {
             core::ptr::null_mut(),
             0,
             &mut returned,
-            core::ptr::null_mut(),
+            &mut ov,
         )
-    } == 0
-    {
-        return Err(last_error());
-    }
-    Ok(())
+    };
+    finished(raw, ok, returned, &mut ov).map(drop)
 }
 
 /// Zeroes the bytes of the file from `from` to `to`.

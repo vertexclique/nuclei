@@ -25,8 +25,15 @@
 (* an operation out stays on its port, and that operation's end wakes it. *)
 (* Every completion wakes the side's waiters.                              *)
 (*                                                                          *)
+(* The drain runs for at most the linger a dropped handle's bytes get     *)
+(* (`drain` with `linger::time`): with `DrainTimes` set its time may run   *)
+(* out at any moment while bytes are held, and the rest is given up. A    *)
+(* peer that never reads (`PeerReads` FALSE) takes no byte: only that time *)
+(* ends the drain.                                                         *)
+(*                                                                          *)
 (* What must never happen. A byte a write took never reaches the kernel   *)
-(* once A has gone, though W runs; or the drain task waits for good.       *)
+(* once A has gone, though W runs and the peer reads; or the drain task    *)
+(* waits for good, whatever the peer does.                                 *)
 (*                                                                          *)
 (* What is abstract. Bytes are counted, not named; an operation carries   *)
 (* all the side holds; the side's guard, the port's keeper (which delivers *)
@@ -39,6 +46,8 @@ CONSTANTS                                                                    \* 
     Total,      \* bytes the writes took before A went
     OpOut,      \* TRUE: one of them is out with an operation as A goes (a port, a ring); FALSE: all wait (epoll, kqueue)
     Cancels,    \* TRUE: the eviction cancels the operation out, which may come back undone (a ring)
+    PeerReads,  \* TRUE: the peer reads, so a send ends; FALSE: it never reads, and a send never ends by itself
+    DrainTimes, \* TRUE: the drain's linger time may run out while bytes are held
     Mutation    \* "none", or the name of the one rule this run takes away
 
 (* --algorithm Behind                                                         \* the algorithm, in PlusCal
@@ -48,7 +57,8 @@ variables                                                                    \* 
     reg = "A",                                                               \* the shard the source is registered with: "A", "W", or "none"
     drain = "none",                                                          \* the drain task: "none", "waiting", or "done"
     woken = FALSE,                                                           \* the drain task was woken since it last looked
-    sent = 0;                                                                \* bytes the kernel took
+    sent = 0,                                                                \* bytes the kernel took
+    expired = FALSE;                                                         \* (record) the drain's time ran out with bytes held
 
 define                                                                       \* names the properties use:
     Holds == behind > 0 \/ inflight > 0                                      \* the side still has bytes the kernel has not taken
@@ -72,7 +82,7 @@ fair process kernel = "K"                                                    \* 
 begin                                                                        \* the kernel's steps:
 K_loop:                                                                      \* the next end
     while TRUE do                                                            \* for every operation
-        await inflight > 0;                                                  \* one is out
+        await inflight > 0 /\ (PeerReads \/ (Cancels /\ reg # "W"));         \* one is out, and the peer reads or it is cancelled
         if Cancels /\ reg # "W" then                                         \* cancelled by the eviction:
             either sent := sent + inflight;                                  \* too late, the bytes went
             or behind := behind + inflight;                                  \* or undone: they come back to the side
@@ -102,13 +112,20 @@ fair process task = "D"                                                      \* 
 begin                                                                        \* the task's steps:
 D_loop:                                                                      \* the next poll
     while drain # "done" do                                                  \* until it ends
-        await drain = "waiting" /\ woken;                                    \* spawned, and woken since its last poll
-        woken := FALSE;                                                      \* this poll takes the wake
-        if ~Holds then                                                       \* the kernel took every byte:
+        \* MUTATION no_drain_time: the drain has no time limit, and waits for a peer that never reads for good.
+        await drain = "waiting" /\ (woken \/ (DrainTimes /\ Holds /\ Mutation # "no_drain_time")); \* woken, or its time may run out
+        if ~woken then                                                       \* its time ran out, bytes held:
+            drain := "done";                                                 \* the task ends, the rest given up
+            expired := TRUE;
+        elsif ~Holds then                                                    \* the kernel took every byte:
+            woken := FALSE;
             drain := "done";                                                 \* the task ends
         \* MUTATION no_register: the poll leaves the source registered nowhere.
         elsif reg = "none" /\ inflight = 0 /\ Mutation # "no_register" then  \* registered nowhere, nothing out:
+            woken := FALSE;
             reg := "W";                                                      \* `ensure_registered`: W's driver has it now
+        else
+            woken := FALSE;                                                  \* this poll takes the wake
         end if;                                                              \* else an operation out wakes it as it ends
     end while;                                                               \* the task ended
 end process;                                                                 \* end of the task
@@ -146,4 +163,7 @@ DrainEnds == (drain = "waiting") ~> (drain = "done")                         \* 
 
 \* The drain task moves the source to W.
 NoMove == reg # "W"                                                          \* never registered with W
+
+\* The drain's time runs out with bytes still held.
+NoDrainTimeout == ~expired                                                   \* never given up
 =============================================================================

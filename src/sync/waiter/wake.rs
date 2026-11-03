@@ -8,7 +8,7 @@ use core::ptr::{self, NonNull};
 use core::task::Waker;
 
 use super::node::{GRANTED, NUDGED, Taken, Touch, Waiter, release_queued};
-use crate::sync::internal::Ordering;
+use crate::sync::internal::{Ordering, during_unwind};
 use crate::sync::queue::WaitQueue;
 
 /// Waiters a drain pass granted or nudged, woken in order once the pass
@@ -125,7 +125,8 @@ impl Drop for WakeRest<'_, '_> {
     fn drop(&mut self) {
         while let Some(waker) = self.0.pop() {
             if let Some(waker) = waker {
-                waker.wake();
+                // Unwinding already: a second panic would abort.
+                during_unwind(|| waker.wake());
             }
         }
     }

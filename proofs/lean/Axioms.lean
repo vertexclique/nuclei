@@ -78,6 +78,8 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Wheel.level_zero_exact
 #print axioms Nuclei.Wheel.cascade_lowers
 #print axioms Nuclei.Wheel.next_window_wraps
+#print axioms Nuclei.Wheel.stale_key_stays_stale
+#print axioms Nuclei.Wheel.stale_key_matches_after_all
 #print axioms Nuclei.Wheel.example_seventy_thousand
 
 -- A ring's file slots: every operation keeps a free slot unheld, unnamed and with no file;
@@ -88,6 +90,8 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Files.no_double_free
 #print axioms Nuclei.Files.named_slot_is_not_free
 #print axioms Nuclei.Files.release_takes_the_file_out
+#print axioms Nuclei.Files.refused_release_keeps_the_slot
+#print axioms Nuclei.Files.ignoring_a_refusal_frees_a_slot_with_its_file
 #print axioms Nuclei.Files.example_reuse_waits
 
 -- A vectored read's fill: each room takes at most its size, the rooms take the whole count (or
@@ -154,6 +158,21 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Notify.served_le_waiting
 #print axioms Nuclei.Notify.left_only_when_all_served
 #print axioms Nuclei.Notify.a_generation_is_never_a_marker
+-- Notify's owed word: its fields come back as they went in and fit 64 bits, a count made below
+-- its room is never lost, the pass's split loses none, the expired take no more than there are and
+-- leave something only once each took one, and a full count serves every waiter and the permit.
+#print axioms Nuclei.Notify.decode_encode
+#print axioms Nuclei.Notify.encode_lt
+#print axioms Nuclei.Notify.owe_ok
+#print axioms Nuclei.Notify.owe_counts
+#print axioms Nuclei.Notify.split_counts
+#print axioms Nuclei.Notify.newer_takes_nothing
+#print axioms Nuclei.Notify.giveBack_counts
+#print axioms Nuclei.Notify.absorbed_and_left
+#print axioms Nuclei.Notify.absorbed_le_expired
+#print axioms Nuclei.Notify.left_only_when_all_absorbed
+#print axioms Nuclei.Notify.serve_more_than_line
+#print axioms Nuclei.Notify.full_serves_every_waiter
 
 -- The barrier's generations: a generation is exactly n arrivals, its last leads it and only it,
 -- the leader's arrival completes it, and a waiter released for a generation behind the count goes

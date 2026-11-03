@@ -1,0 +1,16 @@
+TLC run of every configuration in proofs/tla/atomicwaker, 2026-11-02 23:00 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+A_register                         428        209      1  pass                                  pass                                  yes
+A_displacing                       896        454      1  pass                                  pass                                  yes
+A_two_wakers_displacing           5665       2142      2  pass                                  pass                                  yes
+M_no_self_wake                      19         16      0  violated:SelfWoken                    violated:SelfWoken                    yes
+M_no_wake_taken                     56         43      1  violated:SelfWoken                    violated:SelfWoken                    yes
+M_failure_path_drops_displaced         904        462      1  violated:AllEnd                       violated:AllEnd                       yes
+A_clone_panics                     691        333      1  pass                                  pass                                  yes
+A_clone_panics_displacing         1549        773      2  pass                                  pass                                  yes
+M_clone_unguarded                   69         46      1  violated:Recovers                     violated:Recovers                     yes
+
+results matching EXPECTED.txt: 9 of 9

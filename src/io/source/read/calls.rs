@@ -4,7 +4,6 @@
 use super::*;
 use crate::buf::owned::{IoBufMut, OwnedBuf};
 use crate::io::side::OwnerPoll;
-use crate::rt::context;
 
 impl Source {
     /// A caller's descriptor: `Ready` with the read side's edge count while
@@ -14,22 +13,31 @@ impl Source {
         self: &Arc<Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<u32>> {
-        self.poll_read_side(cx, false, |st, io, waker, after| {
-            st.fd_ready(io, waker, after)
-        })
+        self.poll_read_side(
+            || cx.waker(),
+            false,
+            |st, io, waker, after| st.fd_ready(io, waker, after),
+        )
     }
 
     /// A caller's descriptor would block on a read: the side waits for its
-    /// next edge, unless one came after `tick`.
+    /// next edge, unless one came after `tick`. A side held by another
+    /// (another task's look, the driver's edge) has its holder clear it as
+    /// it lets go, before any look of the caller's can see it ready.
     #[cfg(unix)]
     pub(crate) fn fd_clear_read(self: &Arc<Self>, tick: u32) {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        // Nothing to wait for and nothing to fail: a registration that
-        // failed is the next readiness call's to report.
-        let _ = self.poll_read_side(&mut cx, false, |st, _io, _waker, _after| {
-            st.fd_clear(tick);
-            Poll::Ready(Ok(()))
+        let mut after = After::default();
+        // Nothing to fail: a registration that failed is the next readiness call's to report.
+        let _ = self.with_io(|io| {
+            self.read.run_or_defer(
+                super::super::read_work::CLEAR,
+                &mut after,
+                &self.hooks_in(io.shard),
+                |st| st.fd_clear(tick),
+                || self.read_clear.leave(tick),
+            );
         });
+        self.settle(after);
     }
 
     /// Drops what the side read ahead of a stream and holds still
@@ -76,38 +84,28 @@ impl Source {
             cx,
             #[inline(always)]
             |cx| {
+                let cx_waker = cx.waker();
                 if let Some(io) = self.here(&self.read) {
-                    owner_poll!(self, self.read, io, cx, |st, after, waker| self
+                    owner_poll!(self, self.read, io, cx_waker, |st, after, waker| self
                         .read_step(st, io, waker, after, out, peek));
                 }
-                self.poll_read_any(cx, out, peek)
+                self.poll_read_any(cx_waker, out, peek)
             },
         )
     }
 
-    /// [`poll_read`](Self::poll_read) for every poll [`here`](Self::here) does not take. From a
-    /// task's code on a shard the monitor watches, the owner's poll first, in a bracket that
-    /// ends before what it left is settled.
+    /// [`poll_read`](Self::poll_read) for every poll [`here`](Self::here) does not take, given
+    /// the poll's waker, all of its context a read looks at.
     #[inline(never)]
     fn poll_read_any(
         self: &Arc<Self>,
-        cx: &mut Context<'_>,
+        waker: &Waker,
         out: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<usize>> {
-        if context::unbracketed(context::local()).is_err() {
-            let held = context::bracketed();
-            if let Some(io) = held
-                .shard()
-                .and_then(|shard| self.here_on(shard, &self.read))
-            {
-                owner_poll!(self, self.read, io, cx, |st, after, waker| self
-                        .read_step(st, io, waker, after, out, peek), then held.end());
-            }
-            held.end();
-        }
-        self.poll_reading(
-            cx,
+        self.poll_read_side(
+            || waker,
+            true,
             #[inline(always)]
             |st, io, waker, after| self.read_step(st, io, waker, after, out, peek),
         )
@@ -163,15 +161,16 @@ impl Source {
         cx: &mut Context<'_>,
         step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
-        self.poll_read_side(cx, true, step)
+        self.poll_read_side(|| cx.waker(), true, step)
     }
 
     /// Polls the read side with `step`: for the handle's own reads when
-    /// `drive`, else for its caller's calls.
+    /// `drive`, else for its caller's calls. `waker` gives the poll's waker
+    /// where it is used, so a caller that has its context reads it there.
     #[inline(always)]
-    fn poll_read_side<R>(
+    fn poll_read_side<'w, R>(
         self: &Arc<Self>,
-        cx: &mut Context<'_>,
+        waker: impl Fn() -> &'w Waker,
         drive: bool,
         mut step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
@@ -181,7 +180,7 @@ impl Source {
             |io| {
                 self.read.poll(
                     &mut after,
-                    cx.waker(),
+                    waker(),
                     &self.hooks_in(io.shard),
                     #[inline(always)]
                     |st, after| {
@@ -191,7 +190,7 @@ impl Source {
                         }
                         #[cfg(not(unix))]
                         let _ = drive;
-                        step(st, io, cx.waker(), after)
+                        step(st, io, waker(), after)
                     },
                 )
             },

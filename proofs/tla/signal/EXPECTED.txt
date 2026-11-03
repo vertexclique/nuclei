@@ -6,3 +6,9 @@ MG_dispatch_first              MC_Signal            violated:SeesAll
 MG_no_recheck                  MC_Signal            violated:SeesAll
 WG_coalesce                    MC_Signal            violated:NoCoalesce
 WG_pump_wake                   MC_Signal            violated:NoPumpWake
+SP_safe                        MC_SignalPump        pass
+SP_live                        MC_SignalPump        pass
+MP_pump_dropped                MC_SignalPump        violated:SeesAll
+MP_no_wake_at_drop             MC_SignalPump        violated:SeesAll
+MP_wake_before_down            MC_SignalPump        violated:SeesAll
+WP_restart                     MC_SignalPump        violated:NoRestart

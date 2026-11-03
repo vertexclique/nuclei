@@ -1,47 +1,63 @@
-TLC run of every configuration in proofs/tla/port, 2026-10-31 01:26 UTC.
+TLC run of every configuration in proofs/tla/port, 2026-11-02 19:48 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 600 s each.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-PK_safe                           5134       1970      2  pass                                  pass                                  yes
-PK_live                           5134       1970      2  pass                                  pass                                  yes
-PK_away                           1076        436      1  pass                                  pass                                  yes
-MK_no_keeper                       350        180      1  violated:AllDelivered                 violated:AllDelivered                 yes
-MK_no_evict_wait                  1605        628      2  violated:AllDelivered                 violated:AllDelivered                 yes
-MK_no_wait                        1306        573      1  violated:OneDrainer                   violated:OneDrainer                   yes
-MK_ignore_called_off               527        268      1  violated:OneDrainer                   violated:OneDrainer                   yes
-MK_no_recheck                     5099       1970      2  violated:Registers                    violated:Registers                    yes
-MK_fail_on_ops                     113         62      1  violated:NoFailure                    violated:NoFailure                    yes
-WK_waited                          561        279      1  violated:NoWaited                     violated:NoWaited                     yes
-WK_called_off                      190        111      1  violated:NoCalledOff                  violated:NoCalledOff                  yes
-WK_stopped                         537        272      1  violated:NoStopped                    violated:NoStopped                    yes
-WK_kept                            180        105      1  violated:NoKept                       violated:NoKept                       yes
-PV_safe                           4577       1568      2  pass                                  pass                                  yes
-PV_live                           4577       1568      2  pass                                  pass                                  yes
-PV_all_safe                     944102     234274      4  pass                                  pass                                  yes
-PV_all_live                     944102     234274     20  pass                                  pass                                  yes
-PV_held_safe                    107199      29276      2  pass                                  pass                                  yes
-PV_held_live                    107199      29276      5  pass                                  pass                                  yes
-MPV_no_resubmit                   4085       1384      2  violated:Served                       violated:Served                       yes
+PK_safe                           7675       2922      1  pass                                  pass                                  yes
+PK_live                           7675       2922      2  pass                                  pass                                  yes
+PK_away                           1457        578      1  pass                                  pass                                  yes
+MK_no_keeper                       443        226      2  violated:AllDelivered                 violated:AllDelivered                 yes
+MK_no_evict_wait                  2053        800      1  violated:AllDelivered                 violated:AllDelivered                 yes
+MK_no_wait                        1336        589      1  violated:OneDrainer                   violated:OneDrainer                   yes
+MK_ignore_called_off               521        262      1  violated:OneDrainer                   violated:OneDrainer                   yes
+MK_no_recheck                     7640       2922      1  violated:Registers                    violated:Registers                    yes
+MK_fail_on_ops                     144         81      1  violated:NoFailure                    violated:NoFailure                    yes
+WK_waited                         1363        595      1  violated:NoWaited                     violated:NoWaited                     yes
+WK_called_off                      190        110      1  violated:NoCalledOff                  violated:NoCalledOff                  yes
+WK_stopped                         532        267      1  violated:NoStopped                    violated:NoStopped                    yes
+WK_kept                            180        105      2  violated:NoKept                       violated:NoKept                       yes
+PV_safe                           4577       1568      1  pass                                  pass                                  yes
+PV_live                           4577       1568      1  pass                                  pass                                  yes
+PV_all_safe                     944102     234274      6  pass                                  pass                                  yes
+PV_all_live                     944102     234274     37  pass                                  pass                                  yes
+PV_held_safe                    107199      29276      1  pass                                  pass                                  yes
+PV_held_live                    107199      29276      6  pass                                  pass                                  yes
+MPV_no_resubmit                   4085       1384      1  violated:Served                       violated:Served                       yes
 MPV_keep_readable               267538      76663      3  violated:NeverBlocks                  violated:NeverBlocks                  yes
-MPV_no_unstarve                  61988      19480      4  violated:Served                       violated:Served                       yes
-MPV_park                          4165       1416      2  violated:Served                       violated:Served                       yes
-MPV_park_held                    61931      17067      4  violated:Served                       violated:Served                       yes
-MPV_park_write                   95519      26324      5  violated:Served                       violated:Served                       yes
-MPV_no_starved_wake               4409       1504      2  violated:Served                       violated:Served                       yes
+MPV_no_unstarve                  64560      20264      4  violated:Served                       violated:Served                       yes
+MPV_park                          4165       1416      1  violated:Served                       violated:Served                       yes
+MPV_park_held                    68804      18788      4  violated:Served                       violated:Served                       yes
+MPV_park_write                   95519      26324      6  violated:Served                       violated:Served                       yes
+MPV_no_starved_wake               4409       1504      1  violated:Served                       violated:Served                       yes
 MPV_own_early                    26152       7631      2  violated:NeverBlocks                  violated:NeverBlocks                  yes
-WPV_starve                        2191        697      1  violated:NoStarve                     violated:NoStarve                     yes
-WPV_zero                           344        140      1  violated:NoZero                       violated:NoZero                       yes
-WPV_direct                        3176        988      1  violated:NoDirect                     violated:NoDirect                     yes
+WPV_starve                        2191        697      2  violated:NoStarve                     violated:NoStarve                     yes
+WPV_zero                           344        140      2  violated:NoZero                       violated:NoZero                       yes
+WPV_direct                        3176        988      3  violated:NoDirect                     violated:NoDirect                     yes
 PV_udp_safe                       4577       1568      2  pass                                  pass                                  yes
-PV_udp_live                       4577       1568      2  pass                                  pass                                  yes
-PV_udp_held_live                107199      29276      5  pass                                  pass                                  yes
+PV_udp_live                       4577       1568      3  pass                                  pass                                  yes
+PV_udp_held_live                107199      29276      8  pass                                  pass                                  yes
 PV_pipe_safe                      7093       2392      1  pass                                  pass                                  yes
-PV_pipe_live                      7093       2392      2  pass                                  pass                                  yes
-PV_pipe_held_live               106297      27700      5  pass                                  pass                                  yes
+PV_pipe_live                      7093       2392      1  pass                                  pass                                  yes
+PV_pipe_held_live               106297      27700      7  pass                                  pass                                  yes
 MPV_peek_off                       773        294      1  violated:NeverBlocks                  violated:NeverBlocks                  yes
-MPV_pipe_park                     5969       1968      2  violated:Served                       violated:Served                       yes
+MPV_pipe_park                     5969       1968      1  violated:Served                       violated:Served                       yes
 MPV_pipe_park_write               6749       2280      2  violated:Served                       violated:Served                       yes
 WPV_room                           344        140      1  violated:NoRoom                       violated:NoRoom                       yes
+PK_read                            861        364      2  pass                                  pass                                  yes
+PK_duplex                         1275        506      2  pass                                  pass                                  yes
+PK_duplex_back                   10104       3719      3  pass                                  pass                                  yes
+MK_duplex                          138         76      2  violated:ReadServed                   violated:ReadServed                   yes
+MK_keeper_leaves                  2081        782      2  violated:ReadServed                   violated:ReadServed                   yes
+MK_no_rebind                       903        354      2  violated:Registers                    violated:Registers                    yes
+MK_no_here                       10287       3853      2  violated:ReadServed                   violated:ReadServed                   yes
+PL_look                            114         60      2  pass                                  pass                                  yes
+MPL_errors                          60         33      2  violated:NoSpuriousError              violated:NoSpuriousError              yes
+MPL_waits                          105         54      1  violated:Served                       violated:Served                       yes
+WPL_taken                           60         33      2  violated:NoTaken                      violated:NoTaken                      yes
+PF_overlapped                      199         81      2  pass                                  pass                                  yes
+PF_sync                             41         25      1  pass                                  pass                                  yes
+MPF_no_wait                         73         45      1  violated:NoDeadWrite                  violated:NoDeadWrite                  yes
+MPF_handle_wait                    241        118      1  violated:NoDeadWrite                  violated:NoDeadWrite                  yes
+WPF_pending                         14         12      1  violated:NoPendingWait                violated:NoPendingWait                yes
 
-results matching EXPECTED.txt: 40 of 40
+results matching EXPECTED.txt: 56 of 56

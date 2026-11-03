@@ -1,8 +1,9 @@
 # configuration                spec                 expected
 L_lock                         MC_FileLock          pass
 L_lock_may_fail                MC_FileLock          pass
-M_job_ignores_gone             MC_FileLock          violated:NoOwnerlessLock
-M_drop_ignores_held            MC_FileLock          violated:NoOwnerlessLock
-M_drop_reads_then_writes       MC_FileLock          violated:NoOwnerlessLock
-W_lock_after_gone              MC_FileLock          violated:NoLockAfterGone
-W_drop_unlocks                 MC_FileLock          violated:NoDropUnlock
+L_lock_released                MC_FileLock          pass
+L_lock_frees_pool              MC_FileLock          pass
+M_lock_keeps_pool              MC_FileLock          violated:WriteServed
+M_try_apart                    MC_FileLock          violated:NoOwnerlessLock
+M_no_timer                     MC_FileLock          violated:EndsOnceFree
+W_retry                        MC_FileLock          violated:NoRetry

@@ -6,3 +6,7 @@ M_ignore_shared                MC_SendsNow          violated:Contiguous
 M_no_bit                       MC_SendsNow          violated:InOrder
 M_publish_ignores_held         MC_SendsNow          violated:InOrder
 W_fast                         MC_SendsNow          violated:NoFast
+S_full                         MC_TakenFull         pass
+S_handoff_full                 MC_TakenFull         pass
+M_blind_found_full             MC_TakenFull         violated:BlockedOwed
+W_taken_skip                   MC_TakenFull         violated:NoSkip

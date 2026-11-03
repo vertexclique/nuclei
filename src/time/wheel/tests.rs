@@ -5,7 +5,7 @@ use std::task::{Wake, Waker};
 
 use proptest::prelude::*;
 
-use super::{LEVELS, SLOT_BITS, SPAN, Wheel, level_by_windows, level_for, slot_for};
+use super::{LEVELS, SLOT_BITS, SPAN, TimerKey, Wheel, level_by_windows, level_for, slot_for};
 
 /// A waker that counts its wakes.
 struct Count(AtomicUsize);
@@ -19,6 +19,11 @@ impl Wake for Count {
 fn waker() -> (Waker, Arc<Count>) {
     let count = Arc::new(Count(AtomicUsize::new(0)));
     (Waker::from(count.clone()), count)
+}
+
+/// Arms a timer with a clone of `w`; a deadline already passed reads as fired.
+fn arm(wheel: &mut Wheel, when: u64, w: &Waker) -> TimerKey {
+    wheel.insert(when, w.clone()).unwrap_or(TimerKey::FIRED)
 }
 
 /// Advances and wakes what fired; returns how many fired.
@@ -103,7 +108,7 @@ fn a_timer_is_placed_after_the_wheels_position_or_wraps_on_the_top_level() {
 fn a_timer_fires_when_the_wheel_reaches_its_deadline() {
     let mut wheel = Wheel::new();
     let (w, count) = waker();
-    let key = wheel.insert(5, &w);
+    let key = arm(&mut wheel, 5, &w);
     assert_eq!(wheel.next_deadline(), Some(5));
     assert_eq!(advance(&mut wheel, 4), 0);
     assert!(!wheel.is_fired(key));
@@ -144,7 +149,7 @@ fn timers_at_every_level_fire_exactly_on_time() {
             .iter()
             .map(|&d| {
                 let (w, c) = waker();
-                (start + d, wheel.insert(start + d, &w), c)
+                (start + d, arm(&mut wheel, start + d, &w), c)
             })
             .collect();
         let end = start + (1 << 36);
@@ -178,7 +183,7 @@ fn a_deadline_beyond_the_span_fires_on_time() {
     let mut wheel = Wheel::new();
     let far = 3 * SPAN + 12_345;
     let (w, count) = waker();
-    let key = wheel.insert(far, &w);
+    let key = arm(&mut wheel, far, &w);
     let mut fired_at = None;
     let mut now = 0;
     while fired_at.is_none() {
@@ -195,17 +200,42 @@ fn a_deadline_beyond_the_span_fires_on_time() {
     assert_eq!(count.0.load(Ordering::SeqCst), 1);
 }
 
+/// A key held while its entry is let go of and taken again 2^32 times, as a
+/// sleep that fired and is not polled for minutes on a shard arming and
+/// cancelling millions of timeouts a second may be, never reaches the timer
+/// that holds the entry then (`proofs/lean/Nuclei/Wheel.lean`,
+/// `stale_key_stays_stale`).
+#[test]
+fn a_key_stays_stale_however_often_its_entry_is_reused() {
+    let mut wheel = Wheel::new();
+    let (w, _) = waker();
+    let old = arm(&mut wheel, 10, &w);
+    wheel.remove(old);
+    wheel.age(old, (1 << 32) - 1);
+    let (w2, count2) = waker();
+    let new = arm(&mut wheel, 10, &w2);
+    assert_eq!(new.index, old.index, "the entry is taken again");
+    assert!(
+        wheel.is_fired(old),
+        "a key whose timer is gone reaches the timer that took its entry"
+    );
+    wheel.remove(old);
+    assert_eq!(wheel.armed(), 1, "the stale key removed another timer");
+    assert_eq!(advance(&mut wheel, 20), 1);
+    assert_eq!(count2.0.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn a_removed_timer_never_fires_and_its_key_goes_stale() {
     let mut wheel = Wheel::new();
     let (w, count) = waker();
-    let key = wheel.insert(10, &w);
+    let key = arm(&mut wheel, 10, &w);
     wheel.remove(key);
     assert_eq!(wheel.armed(), 0);
     assert!(wheel.is_fired(key), "a stale key reads as fired");
     // The place is reused; the old key does not reach the new timer.
     let (w2, count2) = waker();
-    let key2 = wheel.insert(10, &w2);
+    let key2 = arm(&mut wheel, 10, &w2);
     wheel.remove(key);
     wheel.reset(key, 3, &w);
     assert_eq!(wheel.armed(), 1);
@@ -219,7 +249,7 @@ fn a_removed_timer_never_fires_and_its_key_goes_stale() {
 fn a_reset_moves_an_armed_timers_deadline() {
     let mut wheel = Wheel::new();
     let (w, count) = waker();
-    let key = wheel.insert(10, &w);
+    let key = arm(&mut wheel, 10, &w);
     wheel.reset(key, 100, &w);
     assert_eq!(advance(&mut wheel, 50), 0);
     assert_eq!(advance(&mut wheel, 100), 1);
@@ -230,7 +260,7 @@ fn a_reset_moves_an_armed_timers_deadline() {
     assert!(wheel.is_fired(key));
     assert_eq!(wheel.armed(), 0);
     // A deadline already passed fires at once, with no wake.
-    let key = wheel.insert(200, &w);
+    let key = arm(&mut wheel, 200, &w);
     wheel.reset(key, 5, &w);
     assert!(wheel.is_fired(key));
     assert_eq!(wheel.armed(), 0);
@@ -241,16 +271,16 @@ fn a_reset_moves_an_armed_timers_deadline() {
 fn a_fired_timer_lets_go_of_its_entry_for_the_next_one() {
     let mut wheel = Wheel::new();
     let (w, _count) = waker();
-    let key = wheel.insert(10, &w);
+    let key = arm(&mut wheel, 10, &w);
     assert_eq!(advance(&mut wheel, 10), 1);
     assert!(wheel.is_fired(key));
     let before = wheel.entries.len();
-    let next = wheel.insert(20, &w);
+    let next = arm(&mut wheel, 20, &w);
     assert_eq!(wheel.entries.len(), before, "the fired entry is reused");
     assert!(!wheel.is_fired(next));
     assert!(wheel.is_fired(key), "the old key reaches no entry");
     // One armed for a time already passed takes no entry at all.
-    let passed = wheel.insert(3, &w);
+    let passed = arm(&mut wheel, 3, &w);
     assert!(wheel.is_fired(passed));
     assert_eq!(wheel.entries.len(), before);
 }
@@ -260,7 +290,7 @@ fn a_deadline_already_passed_is_fired_at_once() {
     let mut wheel = Wheel::new();
     advance(&mut wheel, 100);
     let (w, count) = waker();
-    let key = wheel.insert(100, &w);
+    let key = arm(&mut wheel, 100, &w);
     assert!(wheel.is_fired(key));
     assert_eq!(wheel.armed(), 0);
     assert_eq!(
@@ -275,9 +305,10 @@ fn set_waker_keeps_a_waker_of_the_same_task_and_replaces_another() {
     let mut wheel = Wheel::new();
     let (w1, c1) = waker();
     let (w2, c2) = waker();
-    let key = wheel.insert(10, &w1);
-    wheel.set_waker(key, &w1.clone());
-    wheel.set_waker(key, &w2);
+    let key = arm(&mut wheel, 10, &w1);
+    assert!(wheel.wakes(key, &w1.clone()));
+    assert!(!wheel.wakes(key, &w2));
+    drop(wheel.replace_waker(key, w2));
     advance(&mut wheel, 10);
     assert_eq!(c1.0.load(Ordering::SeqCst), 0);
     assert_eq!(c2.0.load(Ordering::SeqCst), 1);
@@ -285,17 +316,18 @@ fn set_waker_keeps_a_waker_of_the_same_task_and_replaces_another() {
 
 #[test]
 fn many_timers_in_one_slot_all_fire_and_the_slab_is_reused() {
+    const TIMERS: u64 = if cfg!(miri) { 100 } else { 1000 };
     let mut wheel = Wheel::new();
     let (w, count) = waker();
-    let keys: Vec<_> = (0..1000).map(|_| wheel.insert(70, &w)).collect();
-    assert_eq!(advance(&mut wheel, 70), 1000);
-    assert_eq!(count.0.load(Ordering::SeqCst), 1000);
-    keys.into_iter().for_each(|k| wheel.remove(k));
+    let keys: Vec<_> = (0..TIMERS).map(|_| arm(&mut wheel, 70, &w)).collect();
+    assert_eq!(advance(&mut wheel, 70), TIMERS as usize);
+    assert_eq!(count.0.load(Ordering::SeqCst), TIMERS as usize);
+    keys.into_iter().for_each(|k| drop(wheel.remove(k)));
     let before = wheel.entries.len();
-    let keys: Vec<_> = (0..1000).map(|i| wheel.insert(200 + i, &w)).collect();
+    let keys: Vec<_> = (0..TIMERS).map(|i| arm(&mut wheel, 200 + i, &w)).collect();
     assert_eq!(wheel.entries.len(), before, "removed entries are reused");
-    assert_eq!(wheel.armed(), 1000);
-    keys.into_iter().for_each(|k| wheel.remove(k));
+    assert_eq!(wheel.armed(), TIMERS as usize);
+    keys.into_iter().for_each(|k| drop(wheel.remove(k)));
     assert_eq!(wheel.armed(), 0);
     assert_eq!(wheel.next_deadline(), None);
 }
@@ -344,7 +376,7 @@ proptest! {
                 Op::Insert(d) => {
                     let (w, c) = waker();
                     let when = now + d;
-                    let key = wheel.insert(when, &w);
+                    let key = arm(&mut wheel, when, &w);
                     timers.push((key, when, c, when <= now, false));
                 }
                 Op::Remove(i) => {
@@ -413,8 +445,8 @@ fn a_timer_in_the_next_top_window_does_not_hide_a_nearer_one() {
     advance(&mut wheel, 1000);
     let (near, near_count) = waker();
     let (far, far_count) = waker();
-    wheel.insert(1000 + (1 << 30), &near);
-    wheel.insert(1000 + (1 << 36) - 1, &far);
+    arm(&mut wheel, 1000 + (1 << 30), &near);
+    arm(&mut wheel, 1000 + (1 << 36) - 1, &far);
     assert!(wheel.next_deadline().unwrap() <= 1000 + (1 << 30));
     let mut steps = 0;
     while let Some(d) = wheel.next_deadline() {

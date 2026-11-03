@@ -37,6 +37,7 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 CONSTANTS
     Prog,       \* per task, its operations in order (see MC_RwLock)
     MaxBypass,  \* MAX_BYPASS
+    MaxReaders, \* the most readers inside at once (`with_max_readers`)
     Mutation    \* "none", or the name of the one rule this run takes away
 
 \* The tasks are the names Prog gives programs to: 1, 2, ... for a sequence, or
@@ -44,13 +45,16 @@ CONSTANTS
 Tasks == DOMAIN Prog
 \* One request per operation, and one for each upgrade's own wait.
 Reqs == UNION {{<<t, j>> : j \in 1..Len(Prog[t])} : t \in Tasks}
-        \cup UNION {{<<t, j + 100>> : j \in {i \in 1..Len(Prog[t]) : Prog[t][i] = "upgrade"}} : t \in Tasks}
+        \cup UNION {{<<t, j + 100>> : j \in {i \in 1..Len(Prog[t]) : Prog[t][i] \in {"upgrade", "upgrade_drop"}}}
+                   : t \in Tasks}
 NoReq == <<0, 0>>
 Range(s) == {s[k] : k \in DOMAIN s}
 Without(s, S) == SelectSeq(s, LAMBDA x : x \notin S)
 \* The kind an operation first asks for.
 KindOf(op) == CASE op = "read" -> "read" [] op = "drop_read" -> "read"
                 [] op = "write" -> "write" [] op = "drop_write" -> "write" [] op = "downgrade" -> "write"
+                [] op = "downgrade_hold" -> "write"
+                [] op = "drop_upg" -> "upg" [] op = "upgrade_drop" -> "upg"
                 [] OTHER -> "upg"
 
 (* --algorithm RwLock
@@ -83,10 +87,15 @@ define
               upgrading |-> upgrading]
     \* The word of a free lock: where a pass's sharing walk starts from, before it walks.
     FreeWord == [readers |-> 0, writer |-> FALSE, upgradable |-> FALSE, upgrading |-> FALSE]
+    \* MUTATION write_ignores_upgradable: a write enters past an upgradable read.
+    \* MUTATION upg_ignores_upgradable: an upgradable read enters past another.
     Admits(k, s) ==
+        \* MUTATION readers_unbounded: a read enters past the reader bound.
         CASE k = "read" -> ~s.writer /\ (~s.upgrading \/ Mutation = "read_ignores_upgrading")
-          [] k = "write" -> ~s.writer /\ ~s.upgradable /\ s.readers = 0
-          [] OTHER -> ~s.writer /\ ~s.upgradable
+                           /\ (s.readers < MaxReaders \/ Mutation = "readers_unbounded")
+          [] k = "write" -> ~s.writer /\ (~s.upgradable \/ Mutation = "write_ignores_upgradable")
+                            /\ s.readers = 0
+          [] OTHER -> ~s.writer /\ (~s.upgradable \/ Mutation = "upg_ignores_upgradable")
     Enter(k, s) ==
         CASE k = "read" -> [s EXCEPT !.readers = @ + 1]
           [] k = "write" -> [s EXCEPT !.writer = TRUE]
@@ -104,6 +113,8 @@ define
         /\ Holding("write") # {} => Holding("read") = {} /\ Holding("upg") = {}
         /\ Cardinality(Holding("upg")) <= 1
     NoReaderWhileUpgrading == ~readerWhileUpgrading
+    \* Never more readers inside than the bound.
+    ReadersBounded == readers <= MaxReaders
     NoUpgradeOverReaders == ~upgradedOverReaders
     BypassBounded == \A r \in Reqs : counted[r] <= MaxBypass
     NoBargePastOwed == ~bargedPastOwed
@@ -161,14 +172,15 @@ D_clear:
 D_absorb:
     \* A dropped upgrade's node goes first; an arriving upgrade takes the slot.
     with gone = {r \in Range(arrivals) : phase[r] = "cancelled"},    \* the withdrawn arrivals
-         left = {r \in Range(list) \cup Range(arrivals) : phase[r] = "cancelled"} do  \* all of them
+         left = {r \in Range(list) \cup Range(arrivals) : phase[r] = "cancelled"}
+                \cup (IF upgSlot # NoReq /\ phase[upgSlot] = "cancelled" THEN {upgSlot} ELSE {}) do
         upgSlot := IF \E r \in Range(arrivals) \ gone : kind[r] = "upgrade"
                    THEN CHOOSE r \in Range(arrivals) \ gone : kind[r] = "upgrade"
                    ELSE IF upgSlot # NoReq /\ phase[upgSlot] = "cancelled" THEN NoReq ELSE upgSlot;
         list := SelectSeq(list \o arrivals, LAMBDA r : phase[r] # "cancelled" /\ kind[r] # "upgrade");
         arrivals := <<>>;
-        \* Every withdrawn node on the stack and the list leaves both here (an
-        \* upgrade is never withdrawn, so none of them is the upgrade's). The
+        \* Every withdrawn node on the stack and the list leaves both here, and a
+        \* dropped upgrade's node leaves the upgrade's slot (`UpgradeWait::cancel`). The
         \* queue letting a node go settles its owed mark (`release_queued`, in
         \* src/sync/waiter/node.rs, forgives it), so each owed one is counted out.
         \* MUTATION absorb_after_sweep: the count looks at the list after it was
@@ -267,7 +279,9 @@ D_exit:
     if dirty /\ Mutation # "exit_ignores_dirty" then
         noneLeft := FALSE;    \* read: the next pass computes it again
         goto D_clear;
-    elsif ~noneLeft /\ wakeFront then
+    \* MUTATION exit_ignores_wake_front: a release's request to wake the front, which came while
+    \* the pass ran, does not send the drain round again.
+    elsif ~noneLeft /\ wakeFront /\ Mutation # "exit_ignores_wake_front" then
         goto D_clear;
     else
         draining := FALSE;
@@ -505,7 +519,8 @@ Q_wdDrain:
 end procedure;
 
 \* The upgradable read's upgrade (`UpgradeWait::poll`), by task `self` holding it.
-procedure Upgrade(ur = NoReq)
+\* `gdrop`: the upgrade's future is dropped at its first wait (`UpgradeWait::cancel`).
+procedure Upgrade(ur = NoReq, gdrop = FALSE)
 variables claimed = FALSE;
 begin
 G_raise:
@@ -534,6 +549,10 @@ G_enqDrain:
         call Drain();
     end if;
 G_park:
+    if gdrop then
+        goto G_cancel;
+    end if;
+G_await:
     await phase[ur] = "granted";
 G_finish:
     \* `finish_upgrade`: one fetch_xor.
@@ -544,6 +563,23 @@ G_finish:
     held[self] := "write";
     forget({ur});    \* the upgrade's node: the slot let it go at the grant
     return;
+G_cancel:
+    \* `UpgradeWait::cancel`: the node withdrawn (a grant that came first carries nothing:
+    \* the future flips the word itself), then `upgradable_unlock`: the upgradable read and
+    \* UPGRADING go together.
+    \* MUTATION upgrade_drop_keeps_upgrading: UPGRADING stays up.
+    if phase[ur] = "waiting" then
+        phase[ur] := "cancelled";
+    end if;
+    upgradable := FALSE;
+    if Mutation # "upgrade_drop_keeps_upgrading" then
+        upgrading := FALSE;
+    end if;
+    held[self] := "none";
+G_cancelPass:
+    \* UPGRADING was up: the unlock asks for a pass, which also lets the node go.
+    call Released();
+    return;
 end procedure;
 
 \* `downgrade`: the write becomes one read in one step.
@@ -551,11 +587,12 @@ procedure Downgrade()
 variables claimed = FALSE;
 begin
 W_down:
+    \* MUTATION downgrade_no_wake: the waiters are not told the lock is shared now.
     writer := FALSE;
     readers := readers + 1;
     held[self] := "read";
     downgraded := TRUE;
-    if queuedBit then
+    if queuedBit /\ Mutation # "downgrade_no_wake" then
         wakeFront := TRUE;
         claimed := ~draining;
         draining := TRUE;
@@ -575,16 +612,21 @@ begin
 T_op:
     while j <= Len(Prog[self]) do
         op := Prog[self][j];
-        call Acquire(KindOf(op), <<self, j>>, op \in {"drop_read", "drop_write"});
+        call Acquire(KindOf(op), <<self, j>>, op \in {"drop_read", "drop_write", "drop_upg"});
 T_then:
         if held[self] = "none" then
             goto T_next;
         elsif op = "upgrade" then
-            call Upgrade(<<self, j + 100>>);
-        elsif op = "downgrade" then
+            call Upgrade(<<self, j + 100>>, FALSE);
+        elsif op = "upgrade_drop" then
+            call Upgrade(<<self, j + 100>>, TRUE);
+        elsif op \in {"downgrade", "downgrade_hold"} then
             call Downgrade();
         end if;
 T_release:
+        \* "downgrade_hold": the downgraded read is held until another task reads beside it,
+        \* or every other task ended (no step of its own: the release waits for it).
+        await op # "downgrade_hold" \/ readers >= 2 \/ \A t \in Tasks \ {self} : pc[t] = "Done";
         if held[self] # "none" then
             call Unlock(held[self], TRUE);
         end if;

@@ -50,6 +50,7 @@ use kovan::{
     free_node, pin, retire_reclaimable,
 };
 
+use super::{Popped, Stash};
 use crate::sync::internal::{AtomicBool, AtomicU64, Ordering};
 
 /// Cells per leaf.
@@ -64,6 +65,11 @@ const MAX_LEVEL: u32 = 10;
 /// its window of values taken ahead.
 const WINDOW: u64 = 64;
 
+/// The cached leaf number while a put-back value waits: no leaf has it (a
+/// position is below 2^64 and a leaf holds 32 of them), so the next pop
+/// leaves the cached path and finds the stash.
+const DIVERTED: u64 = u64::MAX;
+
 /// Leaves spanned by a node of `level`.
 const fn span(level: u32) -> u64 {
     if level >= MAX_LEVEL {
@@ -71,6 +77,16 @@ const fn span(level: u32) -> u64 {
     } else {
         1 << (FAN_BITS * level)
     }
+}
+
+/// Where the receiver's head stands.
+enum Reached<'a, T> {
+    /// The head's cell.
+    Cell(&'a Cell<T>),
+    /// The put-back value.
+    Stashed(T),
+    /// The next leaf is not made yet.
+    Missing,
 }
 
 struct Cell<T> {
@@ -191,6 +207,11 @@ struct Head<T> {
     /// The values taken past the head: bit `k` for position `pos + k` (bit 0
     /// is never set); the receiver's alone, read by [`Radix::len`] as a count.
     ahead: AtomicU64,
+    /// The value the receiver put back, taken by the next pop.
+    stash: Stash<T>,
+    /// The leaf number the cache held while it is [`DIVERTED`]; the
+    /// receiver's alone.
+    saved: UnsafeCell<u64>,
 }
 
 /// The queue.
@@ -232,6 +253,8 @@ impl<T> Radix<T> {
                 pos: AtomicU64::new(start),
                 leaf: UnsafeCell::new((ptr::null_mut(), 0)),
                 ahead: AtomicU64::new(0),
+                stash: Stash::new(),
+                saved: UnsafeCell::new(0),
             }),
             _values: PhantomData,
         };
@@ -361,50 +384,105 @@ impl<T> Radix<T> {
         slot.load(Ordering::SeqCst, guard).as_raw()
     }
 
-    /// Takes the oldest value ready, without waiting: `None` when there is
-    /// none. A position still being written is passed over for the first
-    /// ready one behind it (see the module).
+    /// Takes the oldest value ready, without waiting: the put-back value
+    /// first, then [`Popped::Nothing`] when there is none. A position still
+    /// being written is passed over for the first ready one behind it (see
+    /// the module).
     ///
     /// # Safety
     ///
     /// The caller is the queue's one receiver: no two calls of this function
     /// on one queue run at once.
     #[inline]
-    pub(in crate::sync::mpsc) unsafe fn try_pop(&self) -> Option<T> {
+    pub(in crate::sync::mpsc) unsafe fn try_pop(&self) -> Popped<T> {
         let head = self.head.pos.load(Ordering::Relaxed);
         // SAFETY: the caller's contract.
-        if let Some(cell) = unsafe { self.head_cell(head) } {
-            // SeqCst: the receiver's look in the channel's wake handshake.
-            if cell.ready.load(Ordering::SeqCst) {
-                // SAFETY: ready: its send wrote the value first; the head
-                // moves past it below, so it is moved out once.
-                let value = unsafe { cell.value.get().read().assume_init() };
-                // SAFETY: the caller's contract.
-                unsafe { self.taken(head, head) };
-                return Some(value);
+        match unsafe { self.head_cell(head) } {
+            Reached::Stashed(value) => return Popped::Stashed(value),
+            Reached::Cell(cell) => {
+                // SeqCst: the receiver's look in the channel's wake handshake.
+                if cell.ready.load(Ordering::SeqCst) {
+                    // SAFETY: ready: its send wrote the value first; the head
+                    // moves past it below, so it is moved out once.
+                    let value = unsafe { cell.value.get().read().assume_init() };
+                    // SAFETY: the caller's contract.
+                    unsafe { self.taken(head, head) };
+                    return Popped::Value(value);
+                }
             }
+            Reached::Missing => {}
         }
         // SAFETY: the caller's contract.
-        unsafe { self.take_past(head) }
+        unsafe { self.take_past(head) }.map_or(Popped::Nothing, Popped::Value)
+    }
+
+    /// Keeps `value`, which [`try_pop`](Self::try_pop) answered, for the next
+    /// pop: the head's leaf cache is diverted, so that pop leaves the cached
+    /// path and answers the stash.
+    ///
+    /// # Safety
+    ///
+    /// As for [`try_pop`](Self::try_pop).
+    pub(in crate::sync::mpsc) unsafe fn put_back(&self, value: T) {
+        // SAFETY: the caller's contract.
+        unsafe { self.head.stash.put(value) };
+        // SAFETY: as above: the cache is the receiver's.
+        unsafe {
+            let cache = &mut *self.head.leaf.get();
+            *self.head.saved.get() = cache.1;
+            cache.1 = DIVERTED;
+        }
     }
 
     /// The head's cell, the head's leaf moved on (and the leaves it left
-    /// retired) while the head is past it; `None` while the next leaf is not
-    /// made yet.
+    /// retired) while the head is past it; the put-back value when the cache
+    /// is diverted; `Missing` while the next leaf is not made yet.
     ///
     /// # Safety
     ///
     /// The caller is the receiver.
     #[inline]
-    unsafe fn head_cell(&self, head: u64) -> Option<&Cell<T>> {
+    unsafe fn head_cell(&self, head: u64) -> Reached<'_, T> {
         // SAFETY: the caller's contract: the head's leaf is ours.
-        let (mut leaf, number) = unsafe { *self.head.leaf.get() };
+        let (leaf, number) = unsafe { *self.head.leaf.get() };
         if head / CELLS != number {
             // SAFETY: the caller's contract.
-            leaf = unsafe { self.move_head_leaf(head, number) }?;
+            return unsafe { self.off_leaf(head, number) };
         }
         // SAFETY: the head's leaf is retired by this end alone, and not yet.
-        Some(unsafe { &(*leaf).cells[(head % CELLS) as usize] })
+        Reached::Cell(unsafe { &(*leaf).cells[(head % CELLS) as usize] })
+    }
+
+    /// The head is off the cached leaf: the cache is diverted for a put-back
+    /// value, or the head moved on. Once per leaf, so out of line.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the receiver.
+    #[inline(never)]
+    unsafe fn off_leaf(&self, head: u64, mut number: u64) -> Reached<'_, T> {
+        if number == DIVERTED {
+            // SAFETY: the caller's contract: the cache is the receiver's.
+            number = unsafe { *self.head.saved.get() };
+            // SAFETY: as above.
+            unsafe { (*self.head.leaf.get()).1 = number };
+            // SAFETY: as above.
+            if let Some(value) = unsafe { self.head.stash.take() } {
+                return Reached::Stashed(value);
+            }
+        }
+        let leaf = if head / CELLS == number {
+            // SAFETY: as above: the cache is the receiver's.
+            unsafe { (*self.head.leaf.get()).0 }
+        } else {
+            // SAFETY: the caller's contract.
+            match unsafe { self.move_head_leaf(head, number) } {
+                Some(leaf) => leaf,
+                None => return Reached::Missing,
+            }
+        };
+        // SAFETY: the head's leaf is retired by this end alone, and not yet.
+        Reached::Cell(unsafe { &(*leaf).cells[(head % CELLS) as usize] })
     }
 
     /// Moves the head's leaf on from leaf `number` to the head's, retiring
@@ -579,7 +657,9 @@ impl<T> Radix<T> {
         let front = self.head.pos.load(Ordering::Acquire);
         let ahead = u64::from(self.head.ahead.load(Ordering::Acquire).count_ones());
         let back = self.tail.load(Ordering::Acquire);
-        usize::try_from(back.saturating_sub(front).saturating_sub(ahead)).unwrap_or(usize::MAX)
+        usize::try_from(back.saturating_sub(front).saturating_sub(ahead))
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::from(self.head.stash.is_held()))
     }
 }
 
@@ -591,7 +671,10 @@ impl<T> Drop for Radix<T> {
         let head = *self.head.pos.get_mut();
         let ahead = *self.head.ahead.get_mut();
         let tail = *self.tail.get_mut();
-        let (_, from) = *self.head.leaf.get_mut();
+        let (_, mut from) = *self.head.leaf.get_mut();
+        if from == DIVERTED {
+            from = *self.head.saved.get_mut();
+        }
         let guard = pin();
         // SAFETY: as above, nothing else reaches the tree.
         let root = unsafe { self.root.load_unprotected(Ordering::Relaxed, &guard) }.as_raw();
@@ -664,7 +747,10 @@ mod tests {
 
     fn pop<T>(queue: &Radix<T>) -> Option<T> {
         // SAFETY: each test pops from one thread only.
-        unsafe { queue.try_pop() }
+        match unsafe { queue.try_pop() } {
+            Popped::Value(value) | Popped::Stashed(value) => Some(value),
+            Popped::Nothing => None,
+        }
     }
 
     #[test]
@@ -928,5 +1014,67 @@ mod tests {
             p.join().unwrap();
         }
         assert_eq!(pop(&queue), None);
+    }
+
+    #[test]
+    fn a_put_back_value_comes_out_first_at_every_leaf_boundary() {
+        let queue = Radix::new();
+        for i in 0..CELLS * 3 {
+            queue.push(i);
+        }
+        for i in 0..CELLS * 3 {
+            // SAFETY: one thread pops.
+            let Popped::Value(value) = (unsafe { queue.try_pop() }) else {
+                panic!("a value was pushed");
+            };
+            assert_eq!(value, i);
+            // SAFETY: as above.
+            unsafe { queue.put_back(value) };
+            assert_eq!(queue.len(), (CELLS * 3 - i) as usize, "the stash counts");
+            assert!(matches!(
+                // SAFETY: as above.
+                unsafe { queue.try_pop() },
+                Popped::Stashed(v) if v == i
+            ));
+            assert_eq!(queue.len(), (CELLS * 3 - i - 1) as usize);
+        }
+        assert_eq!(pop(&queue), None);
+    }
+
+    #[test]
+    fn a_queue_dropped_with_a_put_back_value_drops_it_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let queue = Radix::new();
+        for _ in 0..CELLS + 3 {
+            queue.push(Counted(Arc::clone(&drops)));
+        }
+        for _ in 0..CELLS + 1 {
+            // SAFETY: one thread pops.
+            let Popped::Value(value) = (unsafe { queue.try_pop() }) else {
+                panic!("a value was pushed");
+            };
+            drop(value);
+        }
+        // SAFETY: as above.
+        let Popped::Value(value) = (unsafe { queue.try_pop() }) else {
+            panic!("a value was pushed");
+        };
+        // SAFETY: as above.
+        unsafe { queue.put_back(value) };
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            (CELLS + 1) as usize
+        );
+        drop(queue);
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            (CELLS + 3) as usize
+        );
     }
 }

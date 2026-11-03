@@ -40,6 +40,35 @@ pub struct Stats {
     /// (most often the locked-memory limit); their reads use the pool's
     /// buffers instead.
     pub receive_buffers_missing: u64,
+    /// Completions the kernel dropped from a full io_uring completion queue
+    /// for want of memory. The shard then recovers: it cancels its operations
+    /// and ends those that do not end with an error, a socket's after a short
+    /// wait and a file's call after the
+    /// [`write_behind_linger`](crate::runtime::Builder::write_behind_linger)
+    /// time. A zero-copy send whose notification was dropped only keeps its
+    /// buffer held. Each report is also said once at error. A drop is seen at
+    /// the kernel's report at the next wait that sleeps, and when the kernel
+    /// starts holding completions past the queue; a shard that never sleeps
+    /// sees it then.
+    pub completions_dropped: u64,
+    /// Operations a going shard gave up on while the kernel still held them: a socket's after
+    /// a short wait, a file's call once the
+    /// [`write_behind_linger`](crate::runtime::Builder::write_behind_linger) time ran out, its
+    /// writes then maybe not landed. Their memory is kept for good. Each shard's give-up is also
+    /// said once at warn.
+    pub operations_given_up: u64,
+    /// Files whose bytes written behind were given up with no caller left
+    /// to answer: a dropped handle's write that failed or whose
+    /// [`write_behind_linger`](crate::runtime::Builder::write_behind_linger)
+    /// ran out, one handed back by `get_mut` or `into_inner` the same way, or
+    /// one still out when the process exited, or one that landed and failed
+    /// on a file opened for direct IO or to sync each write, its error left
+    /// unanswered as the handle went. Each is also said once at warn.
+    pub write_behind_lost: u64,
+    /// Tasks a thread that exited or a runtime that shut down could not cancel: their wake was
+    /// still on its way at the deadline, so their futures, which may be dropped only on their
+    /// own thread, are leaked. Each time is also said once at warn.
+    pub tasks_left: u64,
 }
 
 /// One shard's counters. Those marked "published" are as the shard last
@@ -98,6 +127,11 @@ pub struct ShardStats {
     /// Times the shard went to another thread because the thread running it
     /// stayed in one poll past [`Builder::handoff_after`](crate::Builder::handoff_after).
     pub handoffs: u64,
+    /// Times the shard's thread stayed in one poll past the threshold but the shard could not go
+    /// to another thread, because the kernel refused the memory fence the handoff needs (Linux's
+    /// `membarrier`): the poll went on holding up the shard. Zero on other systems, whose
+    /// handoff takes no fence that can fail.
+    pub handoffs_failed: u64,
     /// The longest poll the runtime saw on the shard, at the resolution of
     /// its watch (a quarter of the handoff threshold); zero when no poll
     /// lasted that long, or with the handoff off.
@@ -228,7 +262,7 @@ impl core::fmt::Debug for Histogram {
     }
 }
 
-/// IO errors counted by [`io::ErrorKind`], and two kinds of failure
+/// IO errors counted by [`io::ErrorKind`], and five kinds of failure
 /// counted apart.
 ///
 /// An error counted is one an operation on a socket, pipe or file ended
@@ -241,9 +275,20 @@ pub struct ErrorCounts {
     /// Handles the shard could not register: the kernel refused to watch
     /// the descriptor, or to let the shard's driver take it.
     pub refused_registrations: u64,
+    /// Times a worker that stopped gave up waiting for another thread to let
+    /// go of one of its sockets or files; the registration then ends when
+    /// that thread does.
+    pub evictions_given_up: u64,
     /// Accepts that failed because the process or the system had no file
     /// descriptor left (counted among the errors by kind too).
     pub accepts_out_of_descriptors: u64,
+    /// Connections a listener skipped because they were lost before they were accepted: reset,
+    /// or a network error pending on them.
+    pub accepts_skipped: u64,
+    /// Datagrams dropped because an owned receive given up before it took
+    /// its datagram had it cut to its buffer: handed on, the next receive
+    /// would take its first bytes for the whole of it.
+    pub cut_datagrams_dropped: u64,
 }
 
 impl ErrorCounts {
@@ -269,7 +314,10 @@ impl Default for ErrorCounts {
         Self {
             by_kind: [0; KINDS.len()],
             refused_registrations: 0,
+            evictions_given_up: 0,
             accepts_out_of_descriptors: 0,
+            accepts_skipped: 0,
+            cut_datagrams_dropped: 0,
         }
     }
 }
@@ -279,10 +327,13 @@ impl core::fmt::Debug for ErrorCounts {
         f.debug_struct("ErrorCounts")
             .field("by_kind", &self.iter().collect::<Vec<_>>())
             .field("refused_registrations", &self.refused_registrations)
+            .field("evictions_given_up", &self.evictions_given_up)
             .field(
                 "accepts_out_of_descriptors",
                 &self.accepts_out_of_descriptors,
             )
+            .field("accepts_skipped", &self.accepts_skipped)
+            .field("cut_datagrams_dropped", &self.cut_datagrams_dropped)
             .finish()
     }
 }

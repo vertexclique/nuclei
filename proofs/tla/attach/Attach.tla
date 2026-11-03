@@ -25,7 +25,10 @@
 (* ring's mailbox never hands the source a slot of the wrong table.        *)
 (*                                                                          *)
 (* What is modelled step by step: the attach and every request (each one  *)
-(* atomic step, as the sides make them); the ring's look, its install and *)
+(* atomic step, as the sides make them: within it, `attach_now` names     *)
+(* the shard and token before it takes the ask, and a refused              *)
+(* attach clears them after its release, the order Pending.tla checks     *)
+(* against a shard that leaves); the ring's look, its install and          *)
 (* its hand-over as separate steps; the ring's mailbox, in order. What is *)
 (* abstract: one source, one attach to the ring and at most one to B,     *)
 (* whose ring's own look and install are one step.                        *)
@@ -77,7 +80,9 @@ end define;
 fair process attacher = "attacher"
 begin
 A_attach:
-    if ~stopped /\ ~closed then
+    \* MUTATION attach_stopped: the attach does not look at whether the shard stopped.
+    \* MUTATION attach_closed: the attach does not look at whether the handle closed.
+    if (~stopped \/ Mutation = "attach_stopped") /\ (~closed \/ Mutation = "attach_closed") then
         reg := "registering";
         ops := TRUE;
         token := "t0";
@@ -136,6 +141,10 @@ P_perform:
     elsif "evict" \in reqs then
         \* `evict_now`: an attach under way is undone, a registration goes.
         if reg = "registering" /\ ops /\ Mutation # "no_abandon" then
+            reg := "unreg" || ops := FALSE || token := "none" || home := "none"
+                || evicted := TRUE;
+        \* MUTATION evict_keeps_slot: the evict of a registered source posts no detach, and its slot stays in the table.
+        elsif reg = "registered" /\ Mutation = "evict_keeps_slot" then
             reg := "unreg" || ops := FALSE || token := "none" || home := "none"
                 || evicted := TRUE;
         elsif reg = "registered" then

@@ -34,7 +34,12 @@
 (* cancel and completion, which settle applies in one step (`Shard::leave` *)
 (* settles only while its ring has operations out; or, on a ring           *)
 (* another thread can reap, the ring's keeper: src/rt/shard/ring/keeper.rs; *)
-(* LentZc.tla checks the keeper's part).                                   *)
+(* LentZc.tla checks the keeper's part). An attach of the source still    *)
+(* asked of A, which A's wait also waits for, is Pending.tla's.            *)
+(* LentZc.tla checks the keeper's part). A's wait (`wait_for_evictions`)   *)
+(* is an `await` here: the code spins on `yield_now` with no bound, and    *)
+(* ends only once a holder that holds a side as A goes lets go of it,      *)
+(* which this model assumes.                                               *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 

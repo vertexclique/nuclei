@@ -37,48 +37,49 @@
 
 /// The owner's poll of the side `$side` of `$src` through `$io`, as `Side::poll_owner` runs it,
 /// with `$step` the poll's step (`$st` the side's state, `$after` what the step leaves, `$waker`
-/// the poll's): returns from the closure or function it is expanded in with the poll's result,
-/// once `$leave` (if given) let go of the shard and what the poll left is settled; carries on
-/// past it when a foreign thread came and nothing ran, what the take left settled. One expansion
-/// per caller: the owner's poll is the same code inline on the path that needs no bracket and in
-/// the bracket of the one that does (`poll_read`, `poll_read_any` and the writes').
+/// the poll's waker `$wk`): returns from the closure or function it is expanded in with the poll's result,
+/// once what the poll left is settled; carries on past it when a foreign thread came and nothing
+/// ran, what the take left settled, or when the shard was taken before the step marked its call
+/// (`After::enter`). The reads' and the writes' one code.
 macro_rules! owner_poll {
-    ($src:expr, $side:expr, $io:expr, $cx:expr,
-     |$st:ident, $after:ident, $waker:ident| $step:expr $(, then $leave:expr)?) => {{
-        let $waker = $cx.waker();
+    ($src:expr, $side:expr, $io:expr, $wk:expr,
+     |$st:ident, $after:ident, $waker:ident| $step:expr) => {{
         let mut after = After::default();
-        let hooks = $src.hooks_in($io.shard);
-        match $side.poll_owner(
-            &mut after,
-            &hooks,
-            #[inline(always)]
-            |$st, $after| {
-                #[cfg(unix)]
-                $st.drive();
-                $step
-            },
-        ) {
-            OwnerPoll::Done(poll) => {
-                $($leave;)?
-                return $src.finish_poll(after, poll);
-            }
-            OwnerPoll::Left(held, poll) => {
-                let poll = held.finish_poll(poll, &mut after, &hooks, &mut |$st, $after| {
+        // From a task's code on a shard the monitor watches, the call is marked until the
+        // settle; a shard taken meanwhile is left to the poll of any thread.
+        if after.enter() {
+            let hooks = $src.hooks_in($io.shard);
+            match $side.poll_owner(
+                &mut after,
+                &hooks,
+                #[inline(always)]
+                |$st, $after| {
+                    let $waker = $wk;
                     #[cfg(unix)]
                     $st.drive();
                     $step
-                });
-                $($leave;)?
-                return $src.finish_poll(after, poll);
-            }
-            OwnerPoll::Refused => {
-                $($leave;)?
-                $src.settle(after);
+                },
+            ) {
+                OwnerPoll::Done(poll) => return $src.finish_owned_poll(after, poll),
+                OwnerPoll::Left(held, poll) => {
+                    // Taken out here, the `dyn` step holds the waker, so the poll's context
+                    // never leaves its frame.
+                    let $waker = $wk;
+                    let poll = held.finish_poll(poll, &mut after, &hooks, &mut |$st, $after| {
+                        #[cfg(unix)]
+                        $st.drive();
+                        $step
+                    });
+                    return $src.finish_owned_poll(after, poll);
+                }
+                OwnerPoll::Refused => $src.settle_owned(after),
             }
         }
     }};
 }
 
+#[cfg(unix)]
+mod clear;
 #[cfg(unix)]
 mod direct;
 mod hooks;
@@ -99,9 +100,7 @@ use self::hooks::SourceHooks;
 
 use core::cell::UnsafeCell;
 use core::ptr::addr_of_mut;
-#[cfg(completion)]
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -196,6 +195,9 @@ mod read_work {
     pub(super) const UNSTARVE: u8 = 2;
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 4;
+    /// A caller's clear found the side held (`Source::read_clear` holds its tick).
+    #[cfg(unix)]
+    pub(super) const CLEAR: u8 = 128;
     /// The side's ring operation completed (its mailbox holds it).
     #[cfg(completion)]
     pub(super) const DONE: u8 = 8;
@@ -214,10 +216,14 @@ mod read_work {
 
 /// Side-local work of the write side (its deferred word).
 mod write_work {
-    /// A buffer came back to the pool the side ran out of.
+    /// A buffer came back to the pool the side ran out of, or a call outside
+    /// the side ended, whose place it held (`WriteState::unstarve`).
     pub(super) const UNSTARVE: u8 = 1;
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 2;
+    /// As the read side's (`Source::write_clear`).
+    #[cfg(unix)]
+    pub(super) const CLEAR: u8 = 32;
     /// The side's ring operation completed (its mailbox holds it).
     #[cfg(completion)]
     pub(super) const DONE: u8 = 4;
@@ -468,6 +474,10 @@ pub(crate) struct Source {
     /// The epoch a retire left, which one revival moves on.
     retired_epoch: AtomicU32,
     kind: Kind,
+    /// Set to zero linger through nuclei (`set_zero_linger`, or `set_linger` under a second), so a
+    /// drop on an Apple target asks the kernel whether bytes are still unacknowledged
+    /// (`waits_for_acks`).
+    zero_linger: AtomicBool,
     read: Side<ReadState>,
     write: Side<WriteState>,
     /// The shards that claimed the sides as their owner.
@@ -489,6 +499,11 @@ pub(crate) struct Source {
     /// A datagram socket's words for the calls made with no guard.
     #[cfg(unix)]
     quick: quick::Quick,
+    /// The ticks of a caller's clears that found a side held, for its holder.
+    #[cfg(unix)]
+    read_clear: clear::LeftClear,
+    #[cfg(unix)]
+    write_clear: clear::LeftClear,
     /// A TCP listener's: whether it asked its kernel to count what reads leave
     /// (`passes_inq`).
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -578,6 +593,7 @@ impl Source {
             addr_of_mut!((*slot).epoch).write(AtomicU32::new(0));
             addr_of_mut!((*slot).retired_epoch).write(AtomicU32::new(0));
             addr_of_mut!((*slot).kind).write(kind);
+            addr_of_mut!((*slot).zero_linger).write(AtomicBool::new(false));
             addr_of_mut!((*slot).read).write(Side::biased(read));
             addr_of_mut!((*slot).write).write(Side::biased(WriteState::default()));
             addr_of_mut!((*slot).read_owner).write(owner::Owner::new());
@@ -603,6 +619,10 @@ impl Source {
             addr_of_mut!((*slot).unsent).write(AtomicU8::new(0));
             #[cfg(unix)]
             addr_of_mut!((*slot).quick).write(quick::Quick::new(kind));
+            #[cfg(unix)]
+            addr_of_mut!((*slot).read_clear).write(clear::LeftClear::default());
+            #[cfg(unix)]
+            addr_of_mut!((*slot).write_clear).write(clear::LeftClear::default());
             #[cfg(any(target_os = "linux", target_os = "android"))]
             addr_of_mut!((*slot).inq_children).write(AtomicU8::new(INQ_UNASKED));
             #[cfg(completion)]
@@ -626,6 +646,7 @@ impl Source {
             epoch: _,
             retired_epoch: _,
             kind: _,
+            zero_linger: _,
             read: _,
             write: _,
             read_owner: _,
@@ -636,6 +657,10 @@ impl Source {
             unsent: _,
             #[cfg(unix)]
                 quick: _,
+            #[cfg(unix)]
+                read_clear: _,
+            #[cfg(unix)]
+                write_clear: _,
             #[cfg(any(target_os = "linux", target_os = "android"))]
                 inq_children: _,
             #[cfg(completion)]
@@ -654,6 +679,42 @@ impl Source {
 
     pub(crate) fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// Marks the stream as set to zero linger through nuclei, or not.
+    pub(crate) fn set_zero_linger(&self, on: bool) {
+        self.zero_linger.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the stream was set to zero linger through nuclei.
+    pub(crate) fn zero_linger(&self) -> bool {
+        self.zero_linger.load(Ordering::Relaxed)
+    }
+
+    /// Whether a drop of the stream resets it: a TCP stream set to zero linger through nuclei.
+    #[cfg(any(test, target_vendor = "apple"))]
+    pub(crate) fn resets_at_close(&self) -> bool {
+        self.kind == Kind::Tcp && self.zero_linger.load(Ordering::Relaxed)
+    }
+
+    /// Whether a zero-linger stream's reset first waits for the peer's acknowledgements, both in
+    /// the drop (a stream with nothing behind still goes to a linger task) and in the linger. Only
+    /// on Apple targets: the stream was set to zero linger through nuclei, its peer is a loopback
+    /// address, and its kernel holds bytes the peer has not acknowledged, which that loopback's
+    /// reset could overtake (proofs/tla/close/AbortAcks.tla, `L_drop`). Elsewhere the reset
+    /// follows the drain at once.
+    pub(crate) fn waits_for_acks(&self, fd: Raw) -> bool {
+        #[cfg(target_vendor = "apple")]
+        {
+            self.resets_at_close()
+                && crate::io::sys::peer_is_loopback(fd)
+                && crate::io::sys::unacked(fd).is_some_and(|n| n > 0)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = fd;
+            false
+        }
     }
 
     /// Whether a connection this TCP listener accepts now starts with its kernel counting what
@@ -810,31 +871,17 @@ impl Source {
 
     /// How a poll of `side` reaches the descriptor when it runs on the shard the source is
     /// registered with and takes `side` as that shard's owner; `None` for any other poll, which
-    /// finds its way as [`with_io`](Self::with_io) does. A thread inside its shard, or on one
-    /// nobody watches, needs no bracket (a task's code on a shard the monitor watches finds
-    /// `None` here, and its way out of line takes one); a source registered with that shard is
-    /// reached as `via` finds (the ring's
-    /// operations Here, else the poller's calls on the descriptor); and a side that shard
-    /// claimed is taken biased (as `Hooks::owner` and `Side::owned_by` find).
+    /// finds its way as [`with_io`](Self::with_io) does. Only the shard's fixed parts are looked
+    /// at here: the owner's step marks its call before it touches the rest (`After::enter`). A
+    /// source registered with that shard is reached as `via` finds (the ring's operations Here,
+    /// else the poller's calls on the descriptor); and a side that shard claimed is taken biased
+    /// (as `Hooks::owner` and `Side::owned_by` find).
     #[inline(always)]
     fn here<'a, S>(self: &'a Arc<Self>, side: &Side<S>) -> Option<Io<'a>> {
         if self.kind == Kind::File {
             return None;
         }
-        self.here_on(context::running_inside(context::local())?, side)
-    }
-
-    /// [`here`](Self::here) on `shard`, the shard this thread runs as a call into it finds it:
-    /// from a task's code on a shard the monitor watches, in a bracket (`poll_read_any`).
-    #[inline(always)]
-    fn here_on<'a, S>(
-        self: &'a Arc<Self>,
-        shard: &'a crate::rt::shard::Shard,
-        side: &Side<S>,
-    ) -> Option<Io<'a>> {
-        if self.kind == Kind::File {
-            return None;
-        }
+        let shard = context::running(context::local())?;
         let addr = shard.shared_addr();
         let fd = self.fd.load(Ordering::Acquire);
         if fd == NO_FD || self.reg.home.load(Ordering::Relaxed) != addr || !side.owned_by(addr) {
@@ -919,9 +966,22 @@ impl Source {
         }
     }
 
-    /// [`settle`](Self::settle) for a step that left something.
+    /// [`settle`](Self::settle) of an owner's step, which `After::enter` may have marked: its
+    /// call ends before what the step left is woken.
+    #[inline(always)]
+    fn settle_owned(self: &Arc<Self>, after: After) {
+        if let Err(after) = after.settle_light_owned() {
+            self.settle_rest(after);
+        }
+    }
+
+    /// [`settle`](Self::settle) for a step that left something, or one of a marked call
+    /// (`After::enter`) that left more than a waker, whose call ends first.
     #[inline(never)]
     fn settle_rest(self: &Arc<Self>, mut after: After) {
+        if after.marked() {
+            context::unmark_call();
+        }
         self.kick(&mut after);
         if after.starved() {
             Arc::clone(self).wait_for_buffer();
@@ -962,6 +1022,22 @@ impl Source {
     ) -> Poll<io::Result<R>> {
         let watch = after.must_register() || poll.is_pending();
         self.settle(after);
+        if watch && let Err(err) = self.ensure_registered() {
+            return Poll::Ready(Err(err));
+        }
+        poll
+    }
+
+    /// [`finish_poll`](Self::finish_poll) of an owner's poll, which `After::enter` may have
+    /// marked ([`settle_owned`](Self::settle_owned)).
+    #[inline(always)]
+    fn finish_owned_poll<R>(
+        self: &Arc<Self>,
+        after: After,
+        poll: Poll<io::Result<R>>,
+    ) -> Poll<io::Result<R>> {
+        let watch = after.must_register() || poll.is_pending();
+        self.settle_owned(after);
         if watch && let Err(err) = self.ensure_registered() {
             return Poll::Ready(Err(err));
         }
@@ -1016,9 +1092,10 @@ impl Source {
             })
         });
         match registered {
-            // Refused for its stop, here or by the attach (which set the
-            // registration back to none): the tasks look again.
-            Some(Err(err)) if requests::is_stopped_shard(&err) => {
+            // Refused for its stop, here or by the attach, or for a
+            // descriptor a retire took out (the attach set the registration
+            // back to none): the tasks look again.
+            Some(Err(err)) if requests::is_refused_for_now(&err) => {
                 self.look_again();
                 Ok(())
             }
@@ -1222,6 +1299,11 @@ impl Source {
     }
 }
 
+/// Looks of a shard that leaves which found an attach still asked of it, for a test.
+#[cfg(test)]
+pub(crate) static ATTACH_WAITS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 impl Source {
     /// Whether the read side and the write side went to shared mode.
@@ -1235,6 +1317,33 @@ impl Source {
             self.reg.home.load(Ordering::SeqCst),
             self.reg.token.load(Ordering::SeqCst),
         )
+    }
+
+    /// Claims the registration, as `register` does before it posts it: for a test that posts it
+    /// by hand.
+    #[cfg(ring)]
+    pub(crate) fn claim_registration(&self) -> bool {
+        self.reg
+            .state
+            .compare_exchange(
+                UNREGISTERED,
+                REGISTERING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Whether the registration is claimed and not made yet.
+    #[cfg(ring)]
+    pub(crate) fn is_registering(&self) -> bool {
+        self.reg.state.load(Ordering::SeqCst) == REGISTERING
+    }
+
+    /// Whether a lease on the handle's object is out (a ring's mailbox may hold it).
+    #[cfg(ring)]
+    pub(crate) fn is_leased(&self) -> bool {
+        self.ask.keep.leased()
     }
 
     /// The read side as a line, for a test that failed: its guard's words,

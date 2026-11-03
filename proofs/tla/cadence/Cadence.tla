@@ -22,16 +22,23 @@
 (* The count alone bounds the wait in runs, but not in time: N slow runs   *)
 (* are N times a few milliseconds. What must hold: the time the operation  *)
 (* waits is at most Bound, a few runs' worth, whatever mix of tasks the    *)
-(* environment picks. Take away the first drive and a shard handed on      *)
-(* again and again is checked only at every Q-th run of long tasks; take   *)
-(* away the time rule and slow tasks wait for the count.                   *)
+(* environment picks, and it waits at most N runs, however quick they are. *)
+(* Take away the first drive and a shard handed on again and again is      *)
+(* checked only at every Q-th run of long tasks; take away the time rule   *)
+(* and slow tasks wait for the count; take away the count and quick tasks, *)
+(* which the clock never finds the bound past, keep it waiting for good.   *)
 (*                                                                          *)
 (* What is modelled: the three kinds of task, the count since the last     *)
 (* drive, the time since the last drive, the handoff after a long task, the *)
 (* new runner's first drive. What is abstract: time is whole units (a run  *)
 (* adds its kind's amount), what a task does, the coarse clock's own       *)
 (* resolution (the bound is whole units), the drive itself (one step that  *)
-(* hands every queued operation to the kernel).                            *)
+(* hands every queued operation to the kernel). The drive                  *)
+(* (src/rt/shard.rs `Shard::drive`) also applies posted registrations and  *)
+(* fires the shard's due timers (`fire_timers`) before it looks at the     *)
+(* poller, so the bound on how long an operation waits is the same bound   *)
+(* on how late a due timer of a busy shard fires; the timers themselves    *)
+(* are the timer and clock families' part.                                 *)
 (***************************************************************************)
 EXTENDS Integers
 
@@ -49,6 +56,7 @@ variables
     since = 0,            \* task runs since the last drive (`since_drive`)
     age = 0,              \* time since the last drive (what `last_drive` and the clock tell)
     waited = 0,           \* time the queued operation has waited so far
+    runs = 0,             \* task runs the queued operation has waited through so far
     submitted = FALSE,    \* the operation reached the kernel (a drive happened)
     fresh = FALSE,        \* a new runner has taken the shard and has not run yet
     byFirst = FALSE,      \* record: the new runner's first drive submitted it
@@ -58,6 +66,8 @@ define
     \* The operation never waits longer than Bound, even after it is submitted
     \* (`waited` stops growing then).
     Bounded == waited <= Bound
+    \* It never waits through more than N task runs, however quick they are.
+    RunsBounded == runs <= N
     \* Witnesses.
     NoFirstDrive == ~byFirst
     NoTimeDrive == ~byTime
@@ -81,14 +91,16 @@ Turn:
             \* One task runs; the environment picks which kind.
             with c \in {0, Slow, Long} do
                 waited := waited + c;
+                runs := runs + 1;
                 if c = Long then
                     \* Past the threshold: the shard is handed on, this runner
                     \* is detached and drives and checks nothing more.
                     fresh := TRUE;
                     since := since + 1;
                     age := age + c;
-                elsif since + 1 >= N then
+                elsif since + 1 >= N /\ Mode /= "no_count_rule" then
                     \* The count: N runs since the last drive.
+                    \* (MUTATION no_count_rule: no drive by count; only the clock's reads drive.)
                     submitted := TRUE;
                     since := 0;
                     age := 0;

@@ -19,6 +19,11 @@ const INDEX_MASK: u64 = (1 << INDEX_BITS) - 1;
 /// The user data no operation of the slab ever has: the ring's own wake.
 pub(crate) const NOT_AN_OP: u64 = u64::MAX;
 
+/// The least user data of the ring's wakes: the 256 values from here to [`NOT_AN_OP`], one for
+/// each runner that took the ring over in turn (`RingPoller::adopt`). No operation has one: a slab
+/// hands out no index in the top 256 of its index bits, the tags a ring adds included.
+pub(crate) const WAKE_LOW: u64 = NOT_AN_OP - 255;
+
 struct Slot<T> {
     generation: u32,
     op: Option<T>,

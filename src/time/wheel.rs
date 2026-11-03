@@ -15,11 +15,13 @@
 //! Timers live in a slab of entries linked into their slot's list by index,
 //! so arming and cancelling are O(1) and allocate nothing once the slab has
 //! grown to the most timers alive at once. A [`TimerKey`] carries the
-//! entry's generation: a key whose timer is gone never reaches the entry
-//! that reuses its place. A timer that fires lets go of its entry as it
-//! fires, and one armed for a time the wheel passed already takes none: a
-//! key that reaches no entry reads as fired, so its owner has nothing to
-//! remove.
+//! entry's generation, which each release of the entry moves on by one: a
+//! key whose timer is gone reaches no entry that reuses its place until that
+//! place was let go of 2^64 times, which at one reuse a nanosecond takes
+//! over 580 years (`proofs/lean/Nuclei/Wheel.lean`, `stale_key_stays_stale`).
+//! A timer that fires lets go of its entry as it
+//! fires, and one armed for a time the wheel passed already takes none and
+//! hands its waker back, so its owner has nothing to remove.
 //!
 //! The wheel is shard-local and knows only milliseconds since its own
 //! start; the time module converts instants and rounds deadlines up, so a
@@ -40,6 +42,9 @@ const LEVELS: usize = 6;
 /// about 795 days. A deadline further away is placed on the top level at
 /// that distance and placed again when its slot comes.
 const SPAN: u64 = 1 << (SLOT_BITS as u64 * LEVELS as u64);
+/// The units one slot of the top level spans.
+#[cfg(all(test, any(target_os = "linux", target_os = "android", precise_timer)))]
+pub(crate) const TOP_SLOT: u64 = SPAN / SLOTS as u64;
 /// The end of a slot list, and of the free list.
 const NIL: usize = usize::MAX;
 
@@ -48,11 +53,12 @@ const NIL: usize = usize::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TimerKey {
     index: usize,
-    generation: u32,
+    generation: u64,
 }
 
 impl TimerKey {
     /// The key of a timer that fired as it was armed: it reaches no entry.
+    #[cfg(test)]
     const FIRED: Self = Self {
         index: usize::MAX,
         generation: 0,
@@ -76,7 +82,7 @@ struct Entry {
     /// next free one).
     prev: usize,
     next: usize,
-    generation: u32,
+    generation: u64,
     place: Place,
 }
 
@@ -102,8 +108,14 @@ pub(crate) struct Wheel {
     levels: [Level; LEVELS],
     entries: Vec<Entry>,
     free: usize,
-    /// Timers armed.
+    /// Timers armed, and the `phantom` count a shard adds while other
+    /// wheels it keeps aside hold timers, so its rare branches look at them.
     armed: usize,
+    /// The part of `armed` that stands for timers of other wheels.
+    phantom: usize,
+    /// The generation every entry of this wheel starts at: a wheel kept aside
+    /// has a tag in the high bits, so no key reaches an entry of another wheel.
+    tag: u64,
 }
 
 impl Default for Wheel {
@@ -149,7 +161,23 @@ impl Wheel {
             entries: Vec::new(),
             free: NIL,
             armed: 0,
+            phantom: 0,
+            tag: 0,
         }
+    }
+
+    /// A wheel whose keys are disjoint from every wheel with another `tag`
+    /// (a tag in the high bits, below which entries count their releases).
+    pub(crate) const fn tagged(tag: u64) -> Self {
+        let mut wheel = Self::new();
+        wheel.tag = tag;
+        wheel
+    }
+
+    /// Makes `armed` count `n` timers of other wheels besides its own.
+    pub(crate) fn set_phantom(&mut self, n: usize) {
+        self.armed = self.armed - self.phantom + n;
+        self.phantom = n;
     }
 
     /// The wheel's time: every deadline up to it has been processed.
@@ -158,7 +186,8 @@ impl Wheel {
         self.elapsed
     }
 
-    /// How many timers are armed.
+    /// How many timers are armed, those of other wheels a shard counts here
+    /// included (`set_phantom`).
     pub(crate) fn armed(&self) -> usize {
         self.armed
     }
@@ -174,21 +203,23 @@ impl Wheel {
 
     /// Arms a timer for `when`, waking `waker` once the wheel passes it. A
     /// deadline the wheel has passed already is fired at once, without a
-    /// wake: the caller sees it fired when it looks.
+    /// wake: the waker comes back, to drop once the caller let go of the
+    /// wheel. The waker is the caller's clone, made before it borrowed the
+    /// wheel: cloning is user code.
     #[inline(always)]
-    pub(crate) fn insert(&mut self, when: u64, waker: &Waker) -> TimerKey {
+    pub(crate) fn insert(&mut self, when: u64, waker: Waker) -> Result<TimerKey, Waker> {
         if when <= self.elapsed {
-            return TimerKey::FIRED;
+            return Err(waker);
         }
         let index = self.alloc();
         let entry = &mut self.entries[index];
         entry.when = when;
-        entry.waker = Some(waker.clone());
+        entry.waker = Some(waker);
         self.link(index);
-        TimerKey {
+        Ok(TimerKey {
             index,
             generation: self.entries[index].generation,
-        }
+        })
     }
 
     /// Whether the timer of `key` has fired. A stale key reads as fired: its
@@ -197,15 +228,19 @@ impl Wheel {
         self.entry(key).is_none()
     }
 
-    /// Replaces the waker of an armed timer, unless it would wake the same
-    /// task already.
-    pub(crate) fn set_waker(&mut self, key: TimerKey, waker: &Waker) {
-        if let Some(index) = self.live(key) {
-            let entry = &mut self.entries[index];
-            match &entry.waker {
-                Some(old) if old.will_wake(waker) => {}
-                _ => entry.waker = Some(waker.clone()),
-            }
+    /// Whether the armed timer of `key` wakes the task of `waker` already.
+    pub(crate) fn wakes(&self, key: TimerKey, waker: &Waker) -> bool {
+        self.entry(key)
+            .is_some_and(|e| e.waker.as_ref().is_some_and(|old| old.will_wake(waker)))
+    }
+
+    /// Makes `waker` the one an armed timer wakes. The waker it replaced
+    /// comes back, to drop once the caller let go of the wheel; so does
+    /// `waker` itself when the timer is gone.
+    pub(crate) fn replace_waker(&mut self, key: TimerKey, waker: Waker) -> Option<Waker> {
+        match self.live(key) {
+            Some(index) => self.entries[index].waker.replace(waker),
+            None => Some(waker),
         }
     }
 
@@ -217,7 +252,7 @@ impl Wheel {
         let Some(index) = self.live(key) else { return };
         self.unlink(index);
         if when <= self.elapsed {
-            self.release(index);
+            drop(self.release(index));
             return;
         }
         let entry = &mut self.entries[index];
@@ -229,22 +264,26 @@ impl Wheel {
     }
 
     /// Removes the armed timer of `key`; its key goes stale. A stale key (a
-    /// timer fired or removed already) does nothing.
-    pub(crate) fn remove(&mut self, key: TimerKey) {
-        let Some(index) = self.live(key) else { return };
+    /// timer fired or removed already) does nothing. Answers the timer's
+    /// waker, to drop once the caller let go of the wheel: dropping it is
+    /// user code.
+    pub(crate) fn remove(&mut self, key: TimerKey) -> Option<Waker> {
+        let index = self.live(key)?;
         self.unlink(index);
-        self.release(index);
+        self.release(index)
     }
 
-    /// Puts the unlinked entry `index` on the free list, its key stale.
+    /// Puts the unlinked entry `index` on the free list, its key stale;
+    /// answers the waker it held.
     #[inline]
-    fn release(&mut self, index: usize) {
+    fn release(&mut self, index: usize) -> Option<Waker> {
         let entry = &mut self.entries[index];
-        entry.waker = None;
+        let waker = entry.waker.take();
         entry.place = Place::Free;
         entry.generation = entry.generation.wrapping_add(1);
         entry.next = self.free;
         self.free = index;
+        waker
     }
 
     /// The earliest time the wheel has work at: a level-0 slot whose timers
@@ -399,10 +438,19 @@ impl Wheel {
             waker: None,
             prev: NIL,
             next: NIL,
-            generation: 0,
+            generation: self.tag,
             place: Place::Free,
         });
         index
+    }
+
+    /// Moves the generation of the free entry `key` named on by `releases`,
+    /// as that many timers armed in its place and let go of would.
+    #[cfg(test)]
+    fn age(&mut self, key: TimerKey, releases: u64) {
+        let entry = &mut self.entries[key.index];
+        assert_eq!(entry.place, Place::Free, "only a free entry ages");
+        entry.generation = entry.generation.wrapping_add(releases as _);
     }
 
     /// The entry of a key that is not stale.

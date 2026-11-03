@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::{EXIT_TAG, FILE_TAG, ShardRing};
 use crate::process::exit::{Exit, status_of};
+use crate::rt::shard::Shard;
 use crate::syscore::linux::iouring::ring::Sqe;
 
 /// A child's exit, watched on a ring.
@@ -19,6 +20,13 @@ pub(crate) struct ExitOp {
     /// What `WAITID` fills; boxed, so it stays put while the call is out.
     info: Box<Info>,
     waitid: bool,
+}
+
+impl ExitOp {
+    /// The watch is given up on: its waiter gets the error `errno`.
+    pub(super) fn finish_with(&self, errno: i32) {
+        self.exit.finish(Err(errno));
+    }
 }
 
 /// The info a `WAITID` fills.
@@ -65,20 +73,21 @@ impl ShardRing {
         match inserted {
             // The child may run for as long as it likes: never counted against the cap.
             Ok(user_data) => self.enter(user_data | FILE_TAG | EXIT_TAG, sqe, false),
-            // Past 2^30 children watched at once on one ring.
-            Err(op) => op.exit.finish(Err(libc::ENOBUFS)),
+            // Past 2^30 children watched at once on one ring: the resource ran out (ENOMEM, as
+            // `submit` ends an operation the full table cannot take).
+            Err(op) => op.exit.finish(Err(libc::ENOMEM)),
         }
     }
 
     /// The operation of a child's exit watch completed with `res`.
-    pub(super) fn complete_exit(&self, user_data: u64, res: i32) {
+    pub(super) fn complete_exit(&self, shard: Option<&Shard>, user_data: u64, res: i32) {
         let Some(op) = self.take_exit(user_data) else {
-            return;
+            return self.exit_unknown(shard, user_data, res);
         };
         self.end_exit(op, res);
     }
 
-    fn take_exit(&self, user_data: u64) -> Option<ExitOp> {
+    pub(super) fn take_exit(&self, user_data: u64) -> Option<ExitOp> {
         self.exit_ops
             .borrow_mut()
             .remove(user_data & !(FILE_TAG | EXIT_TAG))
@@ -88,8 +97,7 @@ impl ShardRing {
     /// child let go.
     fn end_exit(&self, op: ExitOp, res: i32) {
         if res == -libc::ECANCELED {
-            let orphan = Arc::strong_count(&op.exit) == 1;
-            op.exit.unwatched(orphan);
+            op.exit.unwatched();
             return;
         }
         if res < 0 {

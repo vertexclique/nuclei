@@ -1,10 +1,11 @@
 -------------------------------- MODULE Linger --------------------------------
 (***************************************************************************)
 (* What a dropped handle leaves, when the runtime it ran on drops           *)
-(* (src/rt/linger.rs: `hand`, `Inner::linger`, `Guarded`, `Lingering`,      *)
-(* `Inner::lingers_done`, `RunAll` and its drop; src/rt/runtime.rs:         *)
-(* `Runtime::drop`,                                                         *)
-(* `finish_lingering`, `spawn_linger`; src/rt/runtime/enter.rs:             *)
+(* (src/rt/linger.rs: `hand`, `Inner::take_linger`,                       *)
+(* `Inner::route_linger`, `Guarded`, `Lingering`, `Inner::lingers_done`,  *)
+(* `RunAll` and its drop, `alone` and the linger thread it hands to       *)
+(* (`linger_thread`); src/rt/runtime.rs: `Runtime::drop`,                 *)
+(* `finish_lingering`, `spawn_linger`; src/rt/runtime/enter.rs:           *)
 (* `shutdown_background`; src/rt/sched.rs: `Sched::drop_future`;          *)
 (* src/rt/shard.rs: `Shared::settled`, `write_ended`, `drop_stopped`,       *)
 (* `release_inbox`;                                                         *)
@@ -13,15 +14,18 @@
 (* `FileOp::complete`, `finish_on_pool`; src/fs/file/mod.rs:                *)
 (* `FileState::write` polls the write it starts, so its end wakes the task *)
 (* (`K_end`);                                                               *)
-(* src/io/handle.rs: the handle's                                          *)
-(* drop; src/rt/shard/going.rs: a gone shard's sources).                    *)
+(* src/io/handle.rs: the handle's drop, `deliver_file`;                    *)
+(* src/rt/linger.rs: `hand_file`, `Tracked`, `wait_at_exit`, the exit's    *)
+(* wait for file lingers; src/rt/shard/going.rs: a gone shard's sources).   *)
 (*                                                                          *)
 (* Who acts. A worker W of the runtime runs a task that holds a handle     *)
 (* whose write-behind holds bytes, and whose file has one write out. The   *)
 (* runtime's drop D, on the thread that drops it. The thread K that ends   *)
 (* that write (a ring's keeper, the blocking pool). Another thread X that  *)
-(* may hold the drain of W's stopped inbox as K's wake lands there. A      *)
-(* thread of its own, for a linger nobody else runs.                       *)
+(* may hold the drain of W's stopped inbox as K's wake lands there. The    *)
+(* linger thread, for a linger nobody else runs (one for the process,      *)
+(* `alone`; a linger no worker takes while the runtime runs is             *)
+(* tla/going/Unworked.tla's).                                              *)
 (*                                                                          *)
 (* What can happen. The task drops the handle while the runtime runs: its  *)
 (* linger (the drain of the bytes) is handed to the runtime and runs as a  *)
@@ -36,19 +40,35 @@
 (* itself on W's shard until its end's wake went. Once W is gone, the drop *)
 (* runs the list on its own thread until no linger handed to the runtime  *)
 (* is left (it counts them), no write is counted on W, and W's inbox is    *)
-(* quiet; then it returns. One handed after that runs on a thread of its   *)
-(* own. Each linger sends its bytes, one at a time. A background shutdown  *)
-(* (`Background`) waits for nothing: it stops W and returns, and every     *)
-(* linger runs on a thread of its own. The drop's run has a bound of its   *)
-(* own, the runtime's linger time (`Bound`): once it runs out, a linger    *)
-(* the run was still running goes on on a thread of its own, as one it     *)
-(* never took does (`RunAll`'s drop), and the drop returns.                *)
+(* quiet; then it returns. One handed after that runs on the linger        *)
+(* thread. Each linger sends its bytes, one at a time. A background        *)
+(* shutdown (`Background`) waits for nothing: it stops W and returns, and  *)
+(* every linger runs on the linger thread. The drop's run has a bound of   *)
+(* its own, the runtime's linger time (`Bound`): once it runs out, a       *)
+(* linger the run was still running goes on on the linger thread, as one   *)
+(* it never took does (`RunAll`'s drop), and the drop returns.             *)
+(*                                                                          *)
+(* The process default runtime is never dropped (`Mode` "exit"): the       *)
+(* process exits instead, once the task dropped the handle, which kills    *)
+(* every thread, the workers with their lingers among them. So a file's     *)
+(* linger is counted from its hand to its end wherever it runs, and the     *)
+(* exit (an `atexit` hook) waits until none is left, or its own bound ran   *)
+(* out, which it says. A handle dropped on a thread that is neither a     *)
+(* worker nor one of the blocking pool's (`Mode` "off_worker":            *)
+(* `block_on`'s thread, say) delivers its bytes before its drop returns,  *)
+(* as std's would be in the kernel by then; one dropped on the pool's     *)
+(* thread K hands its linger, as on a worker, since its writes would wait *)
+(* for the pool (`pool_delivers`). A                                       *)
+(* linger whose write fails or whose time runs out (`Mode` "exit_fail")    *)
+(* gives the rest up, and says so: a warning, and a count in `stats`.      *)
 (*                                                                          *)
 (* What must never happen. The drop returns before every byte the handle   *)
 (* took reached the peer (a background shutdown, or a drop whose bound ran *)
 (* out, does not wait, but the bytes still reach it); a linger is dropped  *)
 (* unfinished; another runtime (the process default one) is started for a *)
-(* linger.                                                                 *)
+(* linger; the process exits, or a drop off a worker returns, with bytes   *)
+(* the handle took neither delivered nor said lost; a linger gives up      *)
+(* without a word.                                                         *)
 (*                                                                          *)
 (* What is abstract. One handle and its linger; one write, whose own bytes *)
 (* the handle's count leaves out; the bytes are counted; the peer reads (a *)
@@ -68,6 +88,9 @@ CONSTANTS                                                                    \* 
     Total,       \* the bytes in the handle's write-behind
     Background,  \* TRUE: the runtime shuts down in the background, waiting for nothing
     Bound,       \* TRUE: the drop's own bound may run out while a linger still runs
+    Mode,        \* "drop": the runtime drops; "exit": it is the process default, and the process exits;
+                 \* "off_worker": as "exit", the handle dropped on a thread that is no worker;
+                 \* "exit_fail": as "exit", and the linger's write may fail or its time run out
     Mutation     \* "none", or the name of the one rule this run takes away
 
 (* --algorithm Linger                                                         \* the algorithm, in PlusCal
@@ -90,7 +113,13 @@ variables                                                                    \* 
     taskHeldOnce = FALSE,                                                    \* (record) the task with the handle was held by the write as W stopped
     lateDrain = FALSE,                                                       \* (record) X dropped the held task, after K counted its write out
     fromList = FALSE,                                                        \* (record) the drop ran a linger of its list
-    boundOut = FALSE;                                                        \* (record) the drop's own bound ran out
+    boundOut = FALSE,                                                        \* (record) the drop's own bound ran out
+    exited = FALSE,                                                          \* the process exited: every thread is gone
+    lostAtExit = FALSE,                                                      \* (record) it exited with bytes neither sent nor said lost
+    offDropDone = FALSE,                                                     \* the drop off a worker returned
+    gaveUp = FALSE,                                                          \* (record) a linger gave the rest of its bytes up
+    waitedFor = FALSE,                                                       \* (record) a linger was still out when main returned
+    reported = FALSE;                                                        \* bytes given up were said lost (a warning and a count)
 
 define                                                                       \* names the steps and properties use:
     \* Where a linger handed now goes: a task on W while the runtime runs; the list once its drop began.
@@ -118,24 +147,36 @@ define                                                                       \* 
              /\ \/ Counted                                                   \* a linger not ended
                 \/ counted /\ Mutation # "no_call_wait"                      \* a write not counted out
                 \/ inbox = "pushed" /\ Mutation # "no_inbox_wait"            \* a woken task not dropped
+    \* The process exits rather than dropping its runtime (the process default one).
+    Exits == Mode \in {"exit", "off_worker", "exit_fail"}                    \* no drop of the runtime
+    \* A linger handed and not ended, wherever it runs: the process-wide count the exit waits on.
+    LingerOut == linger \in {"task", "held", "list", "alone", "default"}     \* as `Tracked` counts
 end define;                                                                  \* end of the names
 
-\* The held task drops where its wake was drained: its handle hands its linger.
-macro DropHeld() begin                                                       \* `Sched::drop_future`, the handle's drop
+\* The held task drops on thread `who`, where its wake was drained: its handle hands its linger. On K, a thread of
+\* the blocking pool, it hands it as on a worker: the delivery's writes would need the pool, K itself.
+macro DropHeld(who) begin                                                    \* `Sched::drop_future`, the handle's drop
     dropped := TRUE;                                                         \* the handle goes
     taskHeld := FALSE;                                                       \* the task is gone
     inbox := "empty";                                                        \* its wake was taken out
-    linger := HeldTo;                                                        \* its linger is handed
-    if HeldTo = "default" then defaultStarted := TRUE; end if;               \* (the mutation's start)
+    \* MUTATION pool_delivers: on K the handle delivers its bytes itself, as a drop off a worker does; its writes
+    \* wait for the pool, which is K, so its linger time runs out and the bytes are given up.
+    if who = "K" /\ Mutation = "pool_delivers" then                          \* (the mutation)
+        gaveUp := TRUE;                                                      \* the bytes are given up,
+        reported := TRUE;                                                    \* said at warn, and counted
+    else                                                                     \* else:
+        linger := HeldTo;                                                    \* its linger is handed
+        if HeldTo = "default" then defaultStarted := TRUE; end if;           \* (the mutation's start)
+    end if;                                                                  \* handed, or given up
 end macro;                                                                   \* end of the macro
 
 \* The worker: its task drops the handle, the linger's task runs, and the runtime's drop stops it.
 fair process worker = "W"                                                    \* weakly fair: it keeps running
 begin                                                                        \* the worker's steps:
 W_loop:                                                                      \* the next thing to do
-    while wRuns do                                                           \* until it is stopped
+    while wRuns /\ ~exited do                                                \* until it is stopped, or the process exits
         either                                                               \* the task drops the handle:
-            await ~dropped /\ ~closing;                                      \* while the runtime runs
+            await ~dropped /\ ~closing /\ Mode # "off_worker";               \* while the runtime runs (on this worker)
             dropped := TRUE;                                                 \* the handle goes
             linger := HandedTo;                                              \* its linger is handed: a task here
             if HandedTo = "default" then defaultStarted := TRUE; end if;     \* (never, as the runtime runs)
@@ -143,6 +184,12 @@ W_loop:                                                                      \* 
             await linger = "task";                                           \* it is a task here
             linger := After;                                                 \* one more byte, done at the last
             sent := sent + 1;                                                \* the peer gets it
+        or                                                                   \* the linger's write fails, or its time runs out:
+            await linger = "task" /\ Mode = "exit_fail";                     \* (where the run allows it)
+            linger := "done";                                                \* it ends, the rest given up
+            gaveUp := TRUE;                                                  \* (recorded)
+            \* MUTATION silent_give_up: it gives up without a word, as before the fix.
+            reported := Mutation # "silent_give_up";                         \* said at warn, and counted
         or                                                                   \* the runtime's drop stops the worker:
             await closing;                                                   \* the drop began
             wRuns := FALSE;                                                  \* its shard goes, dropping its tasks
@@ -180,7 +227,11 @@ end process;                                                                 \* 
 fair process dropper = "D"                                                   \* weakly fair: the drop goes on
 begin                                                                        \* the drop's steps:
 D_close:                                                                     \* `Lingering::close`
-    closing := TRUE;                                                         \* lingers handed from now go to the list
+    if Exits then                                                            \* the process default runtime never drops:
+        goto Done;                                                           \* nothing to do
+    else                                                                     \* a runtime that drops:
+        closing := TRUE;                                                     \* lingers handed from now go to the list
+    end if;                                                                  \* closed, or done
 D_join:                                                                      \* `stop_and_join`
     await Background \/ ~wRuns;                                              \* the worker stopped and its thread ended (in the background, not waited for)
 D_run:                                                                       \* `finish_lingering`: the list runs here
@@ -227,7 +278,7 @@ K_end:                                                                       \* 
         if HandedTo = "default" then defaultStarted := TRUE; end if;         \* (the mutation's start)
     end if;                                                                  \* the wake went
 K_drain:                                                                     \* `drop_stopped`, on this thread
-    if drainer = "K" then DropHeld(); drainer := "none"; end if;             \* the task drops here
+    if drainer = "K" then DropHeld("K"); drainer := "none"; end if;          \* the task drops here
 K_out:                                                                       \* `WriteCall`'s drop
     counted := FALSE;                                                        \* the write counts itself out
 end process;                                                                 \* end of the thread
@@ -238,7 +289,7 @@ begin                                                                        \* 
 X_drain:                                                                     \* its drain, after K went on
     await drainer = "X" \/ (pc["K"] = "Done" /\ drainer = "none");          \* its part, or none came
     if drainer = "X" then                                                    \* the held task's wake is its to drop:
-        DropHeld();                                                          \* the task drops here
+        DropHeld("X");                                                       \* the task drops here
         drainer := "none";                                                   \* drained
         lateDrain := TRUE;                                                   \* (recorded)
     end if;                                                                  \* done
@@ -252,10 +303,47 @@ E_run:                                                                       \* 
         linger := After;                                                     \* one more byte, done at the last
         sent := sent + 1;                                                    \* the peer gets it
     end while;                                                               \* none is (any more)
-    await (dropDone /\ pc["W"] = "Done" /\ pc["K"] = "Done" /\ pc["X"] = "Done")  \* nothing more comes once all are done
-          \/ linger \in {"alone", "default"};                                \* or one came meanwhile
-    if linger \in {"alone", "default"} then goto E_run; end if;              \* one that came meanwhile
+    await ((dropDone \/ exited) /\ pc["W"] = "Done" /\ pc["K"] = "Done" /\ pc["X"] = "Done")  \* nothing more comes once all are done
+          \/ (linger \in {"alone", "default"} /\ ~exited);                  \* or one came meanwhile (before the exit)
+    if linger \in {"alone", "default"} /\ ~exited then goto E_run; end if;  \* one that came meanwhile
 end process;                                                                 \* end of the thread
+
+\* The thread that drops the handle off a worker (modes "off_worker"), then returns from main: the process exits.
+fair process main = "M"                                                      \* weakly fair: main goes on
+begin                                                                        \* its steps:
+M_drop:                                                                      \* the handle's drop, off a worker
+    if Mode = "off_worker" then                                              \* (the other modes drop it on W)
+        dropped := TRUE;                                                     \* the handle goes
+        \* MUTATION off_worker_hands: the drop hands a linger to a worker and returns, as before the fix.
+        if Mutation = "off_worker_hands" then                                \* (the mutation)
+            linger := HandedTo;                                              \* a task on W
+            offDropDone := TRUE;                                             \* the drop returns at once
+        end if;                                                              \* else `deliver_file`, here:
+    end if;                                                                  \* the drop began
+M_send:                                                                      \* the bytes go before the drop returns
+    while Mode = "off_worker" /\ ~offDropDone do                             \* until the drop returns
+        if sent < Total then                                                 \* one more byte:
+            sent := sent + 1;                                                \* the file gets it
+        else                                                                 \* all of them went:
+            offDropDone := TRUE;                                             \* the drop returns
+        end if;                                                              \* one step
+    end while;                                                               \* the drop is done
+M_exit:                                                                      \* main returns: `exit` runs its hooks
+    await dropped \/ ~Exits;                                                 \* after the handle was dropped (no exit with a drop)
+    waitedFor := Exits /\ LingerOut;                                         \* (recorded)
+M_wait:                                                                      \* `wait_at_exit`: the file lingers counted
+    if Exits then                                                            \* (a runtime that drops: no exit here)
+        either                                                               \* the count reaches naught:
+            \* MUTATION no_exit_wait: the exit waits for nothing, as before the fix.
+            await ~LingerOut \/ Mutation = "no_exit_wait";                   \* no linger handed is left
+        or                                                                   \* or the exit's own bound runs out:
+            await LingerOut;                                                 \* with one left
+            reported := TRUE;                                                \* said at warn, and counted
+        end either;                                                          \* one of the two
+        lostAtExit := sent < Total /\ ~reported;                             \* (what the exit leaves)
+        exited := TRUE;                                                      \* every thread is gone
+    end if;                                                                  \* main is done
+end process;                                                                 \* end of main
 end algorithm; *)                                                            \* end of the algorithm
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
 \* proofs/tla/run_tlc.sh runs it on a temporary copy before every check, so the tree never
@@ -279,6 +367,15 @@ DropWaits == dropDone => sent = Total                                        \* 
 \* No runtime is started for a linger behind the user's back.
 NoDefault == ~defaultStarted                                                 \* never
 
+\* When the process exits, every byte the handle took reached the file, or its loss was said.
+ExitDelivers == ~lostAtExit                                                  \* never lost unsaid
+
+\* When a drop off a worker returns, every byte the handle took reached the file, or its loss was said.
+OffWorkerDelivers == offDropDone => (sent = Total \/ reported)               \* delivered before the return
+
+\* A linger that gives its bytes up says so.
+GiveUpSaid == gaveUp => reported                                             \* never silent
+
 \* Every byte reaches the peer in the end.
 AllSent == <>(sent = Total)                                                  \* the peer gets them all
 
@@ -301,4 +398,6 @@ NoTaskHeld == ~taskHeldOnce                                                  \* 
 NoLateDrain == ~lateDrain                                                    \* never late
 \* The drop's own bound runs out before every byte reached the peer.
 NoBoundOut == ~(boundOut /\ sent < Total)                                    \* never cut short
+\* The process exits after waiting for a linger still out when main returned, which delivered its bytes.
+NoExitWait == ~(exited /\ waitedFor /\ sent = Total)                        \* never waited for
 =============================================================================

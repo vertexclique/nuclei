@@ -131,14 +131,16 @@ impl Handle<UnixListener> {
         Handle::adopt(UnixListener::bind_addr(addr)?, Kind::UnixListener)
     }
 
-    /// The next connection, with its peer's address. On macOS an accept
-    /// that finds the process out of descriptors closes the connection it
-    /// took, and the next ones take none until a descriptor is free, as a
-    /// TCP listener's do.
+    /// The next connection, with its peer's address. A connection aborted
+    /// while it waited in the backlog is skipped, and the next one taken. On
+    /// macOS an accept that finds the process out of descriptors closes the
+    /// connection it took, and the next ones take none until a descriptor is
+    /// free, as a TCP listener's do.
     ///
     /// # Errors
     ///
-    /// As `accept(2)`.
+    /// As `accept(2)` for the listener itself, such as the process out of
+    /// descriptors.
     pub async fn accept(&self) -> io::Result<(Handle<UnixStream>, UnixSocketAddr)> {
         poll_fn(|cx| self.poll_accept(cx)).await
     }
@@ -344,7 +346,7 @@ impl Handle<UnixDatagram> {
     }
 
     /// Receives a datagram from the connected peer; what does not fit `buf`
-    /// is cut.
+    /// is cut, as std's receive cuts it: the caller sizes the buffer.
     ///
     /// # Errors
     ///
@@ -385,7 +387,8 @@ impl Handle<UnixDatagram> {
     /// Receives a datagram from the connected peer into the spare capacity
     /// of `buf`, after the bytes it holds, and gives `buf` back with the
     /// datagram's length. The driver receives into `buf` itself, so the bytes
-    /// are never copied; what does not fit is cut.
+    /// are never copied; what does not fit is cut, as std's receive cuts it: the caller sizes the
+    /// buffer.
     ///
     /// If the future is dropped before it completes, a datagram the driver
     /// received into `buf` stays with the socket for its next receive, so
@@ -528,7 +531,7 @@ impl Handle<UnixDatagram> {
     }
 
     /// Receives a datagram from the connected peer without waiting; what
-    /// does not fit `buf` is cut.
+    /// does not fit `buf` is cut, as std's receive cuts it: the caller sizes the buffer.
     ///
     /// # Errors
     ///

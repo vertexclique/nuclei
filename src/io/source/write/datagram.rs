@@ -1,7 +1,8 @@
-//! A datagram socket's sends: on unix made by the task itself, so each send
-//! answers what the kernel says of its own datagram, with no buffer of the
-//! pool between (proofs/tla/ring/RingSend.tla); on a completion port copied
-//! and queued for the driver.
+//! A datagram socket's sends, made by the task itself, so each send answers
+//! what the kernel says of its own datagram, with no buffer of the pool
+//! between (proofs/tla/ring/RingSend.tla): on unix, and on a completion port,
+//! whose sockets are non-blocking for it. A ring source with no descriptor
+//! copies and queues its datagram for the driver.
 
 use core::task::{Poll, Waker};
 use std::io;
@@ -58,6 +59,48 @@ impl WriteState {
                     #[cfg(not(completion))]
                     Via::None(never, _) => match never {},
                 },
+            }
+        }
+        self.waiters.register(waker);
+        self.push(io, kind, after);
+        Poll::Pending
+    }
+
+    /// On a port, a datagram handed to the kernel by the polling task once
+    /// nothing of the side is ahead of it, as on unix
+    /// ([`send_now`](Self::send_now)): the call answers what the kernel says
+    /// of this datagram, a refusal included, which a datagram queued for the
+    /// port would only bring to the next call. With no room in the socket
+    /// (`WSAEWOULDBLOCK`) the call waits for the port's poll of the socket for
+    /// room (an AFD poll) and tries again (proofs/tla/ring/RingSend.tla,
+    /// `Backend = "port"`).
+    #[cfg(port)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's context, as every step's"
+    )]
+    pub(super) fn send_now_port(
+        &mut self,
+        io: Io<'_>,
+        fd: crate::io::raw::Raw,
+        kind: Kind,
+        bytes: &[u8],
+        dest: Dest<'_>,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        if !self.ring_holds() && !self.poll_first {
+            let to = match dest {
+                Dest::Connected => None,
+                Dest::Inet(addr) => Some(addr),
+                Dest::Unix((never, _)) => match never {},
+            };
+            match crate::io::sys::send_datagram_now(fd, bytes, to.as_ref()) {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => self.poll_first = true,
+                sent => {
+                    crate::rt::counters::tally::writing(&sent);
+                    return Poll::Ready(sent);
+                }
             }
         }
         self.waiters.register(waker);

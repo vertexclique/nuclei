@@ -184,12 +184,17 @@ impl<T: ?Sized> Mutex<T> {
     /// so do not: the task that would unlock may be the one that thread was
     /// running.
     ///
+    /// A wait whose frame runs a task that opens another blocking frame gives
+    /// up its place in line and asks again, at the back, once its frame is on
+    /// top again, so nested blocking waits never wait on each other with the
+    /// resource free.
+    ///
     /// # Panics
     ///
     /// On `wasm32`, where no other thread can unlock, when the lock is held:
     /// the call could never end.
     pub fn blocking_lock(&self) -> MutexGuard<'_, T> {
-        internal::blocking(self.lock())
+        internal::blocking_in_line(self.lock())
     }
 
     /// [`blocking_lock`](Self::blocking_lock) through an `Arc`, so the guard
@@ -199,7 +204,7 @@ impl<T: ?Sized> Mutex<T> {
     ///
     /// As for [`blocking_lock`](Self::blocking_lock).
     pub fn blocking_lock_owned(self: Arc<Self>) -> OwnedMutexGuard<T> {
-        internal::blocking(self.lock_owned())
+        internal::blocking_in_line(self.lock_owned())
     }
 
     /// The value, borrowed mutably; `&mut self` proves no guard exists.
@@ -665,6 +670,13 @@ impl<T: ?Sized> Drop for Lock<'_, T> {
     }
 }
 
+impl<T: ?Sized> internal::Withdraw for Lock<'_, T> {
+    fn withdraw(self: Pin<&mut Self>) {
+        let this = self.get_mut();
+        this.wait.cancel(&this.mutex.sem, 1);
+    }
+}
+
 impl<T: ?Sized> fmt::Debug for Lock<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Lock").finish_non_exhaustive()
@@ -700,6 +712,13 @@ impl<T: ?Sized> Drop for LockOwned<T> {
     }
 }
 
+impl<T: ?Sized> internal::Withdraw for LockOwned<T> {
+    fn withdraw(self: Pin<&mut Self>) {
+        let this = self.get_mut();
+        this.wait.cancel(&this.mutex.sem, 1);
+    }
+}
+
 impl<T: ?Sized> fmt::Debug for LockOwned<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LockOwned").finish_non_exhaustive()
@@ -709,7 +728,7 @@ impl<T: ?Sized> fmt::Debug for LockOwned<T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::sync::test_support::{Polled, block_on};
+    use crate::sync::test_support::{Polled, block_on, drop_panics, hooked, with_budget_spent};
 
     const ITERATIONS: usize = if cfg!(miri) { 20 } else { 5_000 };
 
@@ -729,6 +748,32 @@ mod tests {
         assert_eq!(waiter.wakes(), 1);
         *waiter.ready() += 1;
         assert_eq!(mutex.spin_rounds(), 0, "the mutex never spins");
+    }
+
+    #[test]
+    fn a_lock_granted_in_the_poll_that_queued_it_spends_the_budget() {
+        let mutex = Arc::new(Mutex::new(0u8));
+        let held = Arc::clone(&mutex).try_lock_owned().expect("free");
+        // The lock finds the mutex held; between that look and its queueing,
+        // the holder lets go, so the retry in the poll that queued it wins.
+        let waker = hooked(Some(Box::new(move || drop(held))), None);
+        let mut lock = Box::pin(mutex.lock());
+        let mut cx = Context::from_waker(&waker);
+        let polled = with_budget_spent(|| lock.as_mut().poll(&mut cx));
+        assert!(
+            polled.is_pending(),
+            "a lock completed past the spent budget"
+        );
+        assert!(
+            mutex.try_lock().is_ok(),
+            "the refused lock gave the mutex back"
+        );
+        let Poll::Ready(mut guard) = lock.as_mut().poll(&mut cx) else {
+            panic!("the lock is free");
+        };
+        *guard += 1;
+        drop(guard);
+        assert_eq!(*mutex.try_lock().expect("free"), 1);
     }
 
     #[test]
@@ -916,5 +961,72 @@ mod tests {
             thread.join().expect("worker");
         }
         assert_eq!(*mutex.try_lock().expect("free"), 4 * ITERATIONS);
+    }
+
+    #[test]
+    fn a_budget_refusal_whose_wake_panics_gives_the_lock_back() {
+        let mutex = Mutex::new(0u8);
+        let waker = hooked(None, Some(Box::new(|| panic!("a waker panicked"))));
+        let mut lock = Box::pin(mutex.lock());
+        let mut cx = Context::from_waker(&waker);
+        let caught = with_budget_spent(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lock.as_mut().poll(&mut cx)))
+        });
+        assert!(caught.is_err(), "the panic reaches the caller");
+        assert!(mutex.try_lock().is_ok(), "the refused lock kept the mutex");
+    }
+
+    #[test]
+    fn a_waker_whose_clone_panics_in_a_second_poll_leaves_the_queue_working() {
+        let mutex = Mutex::new(0u8);
+        let held = mutex.try_lock().expect("free");
+        let first = Polled::new(core::future::pending::<()>());
+        let first_waker = first.waker();
+        let mut front = Box::pin(mutex.lock());
+        assert!(
+            front
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        let mut behind = Polled::new(mutex.lock());
+        behind.pending();
+        // A different waker, so the node clones it, and the clone panics.
+        let bad = hooked(Some(Box::new(|| panic!("a clone panicked"))), None);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            front.as_mut().poll(&mut Context::from_waker(&bad))
+        }));
+        assert!(caught.is_err(), "the panic reaches the caller");
+        drop(held);
+        assert_eq!(
+            first.wakes(),
+            1,
+            "the grant reaches the waiter that panicked"
+        );
+        drop(front);
+        assert_eq!(behind.wakes(), 1, "the grant it held is passed on");
+        assert!(behind.ready().eq(&0));
+    }
+
+    #[test]
+    fn a_waiter_whose_waker_drop_panics_as_it_leaves_still_leaves_the_queue_served() {
+        let mutex = Mutex::new(0u8);
+        let held = mutex.try_lock().expect("free");
+        let waker = drop_panics();
+        let mut leaving = Box::pin(mutex.lock());
+        assert!(
+            leaving
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let mut behind = Polled::new(mutex.lock());
+        behind.pending();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(leaving)));
+        assert!(caught.is_err(), "the panic reaches the dropper");
+        drop(held);
+        assert_eq!(behind.wakes(), 1, "the waiter behind is woken");
+        assert!(behind.ready().eq(&0));
+        assert!(mutex.try_lock().is_ok());
     }
 }

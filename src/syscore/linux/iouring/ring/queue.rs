@@ -103,6 +103,18 @@ impl Sq {
         self.tail.wrapping_sub(self.head().load(Ordering::Acquire))
     }
 
+    /// Hands `f` the user data of each entry pushed that the kernel has not consumed yet. Only
+    /// for a ring with no kernel submission thread, which consumes them only at an enter.
+    pub(crate) fn pending(&self, mut f: impl FnMut(u64)) {
+        // Acquire, as in `ready`: a slot the kernel freed is not read.
+        let head = self.head().load(Ordering::Acquire);
+        for at in 0..self.tail.wrapping_sub(head) {
+            // SAFETY: the slot is inside the SQE array and the kernel has not consumed it, so this
+            // thread's own write of it is the last.
+            f(unsafe { (*self.sqes.add((head.wrapping_add(at) & self.mask) as usize)).user_data });
+        }
+    }
+
     /// Free slots left.
     pub(crate) fn space(&self) -> u32 {
         self.entries - self.ready()
@@ -161,6 +173,7 @@ impl Sq {
 pub(crate) struct Cq {
     khead: *const AtomicU32,
     ktail: *const AtomicU32,
+    kdropped: *const AtomicU32,
     cqes: *const IoUringCqe,
     mask: u32,
 }
@@ -179,10 +192,19 @@ impl Cq {
         Self {
             khead: at(off.head),
             ktail: at(off.tail),
+            kdropped: at(off.overflow),
             // SAFETY: `cqes` is an offset inside the live ring mapping.
             cqes: unsafe { ring.add(off.cqes as usize) }.cast::<IoUringCqe>(),
             mask: entries - 1,
         }
+    }
+
+    /// The kernel's count of completions it dropped, wrapping, since the ring was made: the ones
+    /// it had no room for in the queue and no memory to hold in an overflow entry.
+    pub(crate) fn dropped(&self) -> u32 {
+        // SAFETY: the pointer points into the ring mapping, which outlives `self` (see `new`).
+        // Relaxed: a count read after an enter reported the loss, which synchronised with the kernel.
+        unsafe { &*self.kdropped }.load(Ordering::Relaxed)
     }
 
     /// Drains the completions that have arrived. The tail is read once, with acquire, so entries

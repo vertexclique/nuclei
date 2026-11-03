@@ -46,10 +46,14 @@
 //! otherwise hold the room another connection's reply, the next accept or a
 //! file call needs (proofs/tla/admission). The multishot receives' arrivals
 //! are bounded by the group's buffers, which the queue keeps room for. An
-//! accept's connections (up to [`ACCEPT_CAP`] each) and the completion of
-//! each of these operations have no room kept: past the queue the kernel
-//! holds them (`IORING_FEAT_NODROP`, which the poller requires) until the
-//! poller takes them, and none is lost.
+//! accept's connections (up to [`ACCEPT_CAP`] each), the edges of a
+//! multishot poll armed by a side that reads by readiness, the ring's own
+//! cancels and the completion of each of these operations have no room
+//! kept: past the queue the kernel holds them (`IORING_FEAT_NODROP`, which
+//! the poller requires) until the poller takes them, and none is lost. A
+//! multishot poll's edge that finds the queue full ends the poll instead,
+//! and the next task of its side to wait arms another, whose first look
+//! sees bytes already there (proofs/tla/admission, `EndedRearmed`).
 
 use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -77,7 +81,7 @@ use crate::syscore::linux::iouring::files::Files;
 use crate::syscore::linux::iouring::ops::Ops;
 use crate::syscore::linux::iouring::ring::sys::{
     IORING_CQE_F_BUF_MORE, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF,
-    IOSQE_FIXED_FILE, cqe_buffer_id,
+    IOSQE_FIXED_FILE, KernelTimespec, cqe_buffer_id,
 };
 use crate::syscore::linux::iouring::ring::{IoUringCqe, RingConfig, Sqe};
 use exits::ExitOp;
@@ -96,6 +100,8 @@ pub(crate) struct ShardRing {
     waitid: bool,
     /// The kernel has `IORING_OP_SEND_ZC` (Linux 6.0).
     send_zc: bool,
+    /// The recovery from dropped completions (see `recover`).
+    recover: recover::Recover,
     /// A zero-copy send was refused for lack of lockable memory: the ring sends with copies from
     /// then on.
     zc_denied: Cell<bool>,
@@ -206,9 +212,11 @@ impl ShardRing {
             // Below the file tag's bit, so a source's user data never has it.
             ops: RefCell::new(Ops::new((1 << 31) - 1)),
             file_ops: RefCell::new(Ops::new(1 << 30)),
-            exit_ops: RefCell::new(Ops::new(1 << 30)),
+            // Short of the top 256 indexes, which with both tags would be a wake's (`WAKE_LOW`).
+            exit_ops: RefCell::new(Ops::new((1 << 30) - 256)),
             waitid,
             send_zc,
+            recover: recover::Recover::default(),
             zc_denied: Cell::new(false),
             zero_copy_min: Cell::new(crate::io::source::ring::SEND_ZC_MIN),
             reapable: cfg.multi_issuer,
@@ -373,12 +381,24 @@ impl ShardRing {
             self.polls_armed.set(self.polls_armed.get() + 1);
         }
         let write = counts_as_write(&op);
-        let inserted = self.ops.borrow_mut().insert(op);
+        #[cfg(test)]
+        let full = REFUSE_INSERT_FOR_TEST.with(|n| n.replace(n.get().saturating_sub(1))) > 0;
+        #[cfg(not(test))]
+        let full = false;
+        let inserted = if full {
+            Err(op)
+        } else {
+            self.ops.borrow_mut().insert(op)
+        };
         let user_data = match inserted {
             Ok(user_data) => user_data,
-            // Past 2^32 - 2 operations at once (two per source at most).
+            // The table holds (1 << 31) - 1 operations (two per source at most) and is full: the
+            // resource ran out, which is ENOMEM. Not ENOBUFS, which a multishot receive reads as
+            // its group running dry (it would arm again at once and meet the full table) and a
+            // zero-copy send as the kernel refusing zero copy. A zero-copy send that ends here
+            // ends for its caller with ENOMEM, as a copied send of the same full table would.
             Err(op) => {
-                self.end(None, op, -libc::ENOBUFS);
+                self.end(None, op, -libc::ENOMEM);
                 return IGNORED;
             }
         };
@@ -442,7 +462,7 @@ impl ShardRing {
     /// is left for its task.
     fn complete_file(&self, user_data: u64, res: i32) {
         let Some(op) = self.file_ops.borrow_mut().remove(user_data & !FILE_TAG) else {
-            return;
+            return self.swept_file_ended(user_data);
         };
         self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
         self.admit_waiting();
@@ -566,15 +586,49 @@ impl ShardRing {
 
     /// The source of `slot` went and no entry naming the slot waits to reach
     /// the kernel: a fixed file leaves the table, the slot is released (free
-    /// once its entries completed), and the source's object may close.
+    /// once its entries completed), and the source's object may close. A
+    /// take-out from the table the kernel refuses (it has no memory for the
+    /// update) keeps the slot held with the file in it, since another source
+    /// given the slot would have its own file taken out by the retry; the
+    /// retry comes after the ring's next wait, which a timer makes come
+    /// though nothing else is out (proofs/tla/ring/RingClose.tla,
+    /// `MC_update_ignored`, `MC_update_frees`, `MC_update_no_wake`).
     fn take_out(&self, slot: u32, lease: Option<Lease>) {
-        if self.files.borrow().is_fixed(slot) {
-            // A failure leaves the file in the slot, reserved, until its next
-            // source replaces it.
-            let _ = self.poller.borrow().update_file(slot, -1);
+        if self.files.borrow().is_fixed(slot)
+            && let Err(err) = self.take_file_out(slot)
+        {
+            self.retry_take_out(slot, &err);
+        } else {
+            self.files.borrow_mut().release(slot);
         }
-        self.files.borrow_mut().release(slot);
         drop(lease);
+    }
+
+    /// Takes the file of fixed slot `slot` out of the kernel's table.
+    fn take_file_out(&self, slot: u32) -> io::Result<()> {
+        #[cfg(test)]
+        if REFUSE_TAKE_OUT_FOR_TEST.with(|n| n.replace(n.get().saturating_sub(1))) > 0 {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
+        self.poller.borrow().update_file(slot, -1)
+    }
+
+    /// The kernel refused to take the file of `slot` out of its table: the
+    /// slot waits on `leaving` for the next wait's end to try again, and a
+    /// timer of the ring's own makes that wait come.
+    #[cold]
+    #[inline(never)]
+    fn retry_take_out(&self, slot: u32, err: &io::Error) {
+        static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "io_uring could not take a closed file out of its table ({err}); trying again shortly."
+            );
+        }
+        self.leaving.borrow_mut().push((slot, None));
+        self.poller
+            .borrow_mut()
+            .push(Sqe::timeout(&RETRY_TAKE_OUT).user_data(IGNORED));
     }
 
     /// Slots of sources that went, waiting for their entries to reach the
@@ -630,9 +684,13 @@ impl ShardRing {
     /// build: the cost the inliner weighs it at sits near its limit, so the code around it decides.
     #[inline(always)]
     fn complete(&self, shard: Option<&Shard>, cqe: IoUringCqe) {
+        #[cfg(test)]
+        if self.drops_for_test(&cqe) {
+            return;
+        }
         if cqe.user_data & FILE_TAG != 0 {
             if cqe.user_data & EXIT_TAG != 0 {
-                self.complete_exit(cqe.user_data, cqe.res);
+                self.complete_exit(shard, cqe.user_data, cqe.res);
             } else {
                 self.complete_file(cqe.user_data, cqe.res);
             }
@@ -675,8 +733,11 @@ impl ShardRing {
             return;
         }
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
-            return;
+            return self.recover.late(cqe.user_data);
         };
+        if let RingMem::Zombie | RingMem::RecvZombie { .. } = op.mem {
+            return self.bury(cqe.user_data, op);
+        }
         if counts_as_write(&op) {
             self.writes.set(self.writes.get().saturating_sub(1));
         }
@@ -685,6 +746,106 @@ impl ShardRing {
             self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
         }
         self.end(shard, op, cqe.res);
+    }
+
+    /// The calling thread runs this ring from now on, taken over from a runner the monitor took
+    /// its shard from, and calls this before its first drive. A watched worker's ring is not
+    /// single-issuer, so the kernel runs the completion of each request as work queued to the
+    /// thread that submitted it, at its next return from the kernel: a thread in a wait no signal
+    /// ends (a killable wait, a read of a slow disk) runs none of it meanwhile. A poll the old
+    /// runner armed (a datagram's multishot poll, a one-shot poll for readiness or room), a
+    /// multishot receive (a stream's or a datagram's), and the ring's wake read, would then bring
+    /// nothing for as long. Each is cancelled from here and its side told it ended, so the side
+    /// arms another, submitted by this thread; the old one stays in the slab as a zombie and is
+    /// buried at its own end (`bury`), whenever its old thread runs it. A poll's zombie points at
+    /// no memory and hands its side nothing. A receive's zombie still hands its side what its old
+    /// thread takes before that thread sees the cancel: the kernel takes each arrival and posts
+    /// it under the ring's lock, so the arrivals of both receives come in the stream's order
+    /// (`RingMem::RecvZombie`). An entry still waiting to
+    /// reach the kernel is this thread's, which submits it, and stays as it is; what the kernel
+    /// posted already goes to its side first, so an edge in the queue is not lost with its zombie
+    /// (tests/cadence.rs, each runner blocking at once). Everything else is left as it is, its
+    /// completion waiting for that thread: a one-shot operation that takes or gives bytes, a
+    /// file's call and a child's exit watch, whose work cannot be done again, and an accept,
+    /// whose poll is an exclusive waiter of its listener, the first of which takes each
+    /// connection's wake (see `RingMem::adopted`; proofs/tla/ring/RingHandoff.tla).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn adopt(&self, shard: Option<&Shard>) {
+        // With a kernel submission thread every request is that thread's.
+        if self.poller.borrow().sqpoll() {
+            return;
+        }
+        // What waits to reach the kernel this thread submits at its next enter: its own.
+        let mut pending = Vec::new();
+        self.poller
+            .borrow()
+            .pending(|user_data| pending.push(user_data));
+        pending.sort_unstable();
+        let old: Vec<u64> = self
+            .ops
+            .borrow()
+            .keys()
+            .filter(|user_data| pending.binary_search(user_data).is_err())
+            .collect();
+        self.poller.borrow_mut().adopt(IGNORED, &pending);
+        // The completions the kernel posted already go to their sides first: a poll's edge in
+        // the queue is delivered, not lost with its zombie. A failure is the first drive's to
+        // report, as it meets it again.
+        let _ = self.wait(shard, Some(Duration::ZERO));
+        let mut ended = Vec::new();
+        {
+            let mut ops = self.ops.borrow_mut();
+            for user_data in old {
+                let Some(op) = ops.get_mut(user_data) else {
+                    continue;
+                };
+                let mem = core::mem::replace(&mut op.mem, RingMem::Ready);
+                let (zombie, outcome) = match mem.adopted(op.source.kind()) {
+                    Ok(adopted) => adopted,
+                    Err(mem) => {
+                        op.mem = mem;
+                        continue;
+                    }
+                };
+                op.mem = zombie;
+                self.poller
+                    .borrow_mut()
+                    .push(Sqe::async_cancel(user_data).user_data(IGNORED));
+                if counts_as_write(op) {
+                    self.writes.set(self.writes.get().saturating_sub(1));
+                }
+                // The zombie counts among the source's operations out until its own end.
+                op.source.op_out();
+                let read = core::mem::replace(&mut op.read, true);
+                ended.push((Arc::clone(&op.source), op.epoch, read, outcome));
+            }
+        }
+        for (source, epoch, read, outcome) in ended {
+            source.op_done(
+                Done {
+                    outcome,
+                    epoch,
+                    read,
+                },
+                shard,
+            );
+        }
+    }
+
+    /// A zombie's end (see [`adopt`](Self::adopt)): its slot is named once less and its source
+    /// counts it no more, its side told nothing.
+    #[cold]
+    #[inline(never)]
+    fn bury(&self, user_data: u64, op: RingOp) {
+        #[cfg(feature = "io-stats")]
+        if self.timing.get().is_some() {
+            self.timed(user_data, None, 0);
+        }
+        #[cfg(not(feature = "io-stats"))]
+        let _ = user_data;
+        self.files.borrow_mut().done(op.file);
+        op.source.op_gone();
     }
 
     /// A completion of a zero-copy send, handled here; false for any other. The first completion,
@@ -919,8 +1080,11 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
 /// is still in flight.
 #[inline(always)]
 fn release_charge(ops: &mut Ops<RingOp>, user_data: u64, charged: usize) {
-    if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
-        ops.get_mut(user_data).map(|op| &mut op.mem)
+    if let Some(
+        RingMem::RecvMulti { held, .. }
+        | RingMem::RecvFromMulti { held, .. }
+        | RingMem::RecvZombie { held, .. },
+    ) = ops.get_mut(user_data).map(|op| &mut op.mem)
     {
         *held = held.saturating_sub(charged);
     }
@@ -939,6 +1103,8 @@ fn ends_plain(op: &RingOp) -> bool {
             | RingMem::RecvFromMulti { .. }
             | RingMem::AcceptMulti { .. }
             | RingMem::ReadyMulti
+            | RingMem::Zombie
+            | RingMem::RecvZombie { .. }
     )
 }
 
@@ -965,6 +1131,40 @@ const ACCEPT_CAP: usize = 256;
 /// to anyone: no operation of the slab has it (its index is the one the
 /// slab never hands out), and it is not the wake's.
 const IGNORED: u64 = u32::MAX as u64;
+
+/// The user data of the poller's request for a recovery from dropped completions, and of the
+/// timeout that runs its sweep: [`IGNORED`]'s index with a generation of their own, which no
+/// slab hands out (see `recover`).
+pub(crate) const RECOVER: u64 = IGNORED | (1 << 32);
+const SWEEP: u64 = IGNORED | (2 << 32);
+
+impl Drop for ShardRing {
+    fn drop(&mut self) {
+        self.recover.keep_leftovers();
+    }
+}
+
+/// How long a ring waits before it tries again to take a file out of its
+/// table, once the kernel refused: static, as the kernel reads it after the
+/// entry is queued.
+static RETRY_TAKE_OUT: KernelTimespec = KernelTimespec {
+    tv_sec: 0,
+    tv_nsec: 10_000_000,
+};
+
+#[cfg(test)]
+thread_local! {
+    /// How many of the next take-outs from a table the kernel refuses on
+    /// this thread, for a test of a kernel with no memory for the update.
+    pub(crate) static REFUSE_TAKE_OUT_FOR_TEST: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many of the next inserts into the operation table `submit` makes on this
+    /// thread act as a full table, for a test.
+    pub(crate) static REFUSE_INSERT_FOR_TEST: Cell<u32> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 impl ShardRing {
@@ -1122,6 +1322,7 @@ pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
 
 pub(crate) mod exits;
 pub(crate) mod keeper;
+mod recover;
 #[cfg(test)]
 pub(crate) use keeper::leaked;
 mod arrivals;
@@ -1139,5 +1340,7 @@ mod tests_inc;
 mod tests_recv;
 #[cfg(test)]
 mod tests_reserve;
+#[cfg(test)]
+mod tests_slab;
 #[cfg(test)]
 mod tests_zc;

@@ -4,8 +4,9 @@
 //! directories ([`create_dir_all`], [`DirBuilder`], [`read_dir`] streamed a
 //! page at a time) and links. Calls by path, and a regular file's calls
 //! beside its reads, writes, syncs and [`Handle::allocate`], run on the
-//! blocking pool; [`Handle::try_lock_file`], which never waits, runs on the
-//! calling thread, and so does `File::open` on Linux for a regular file on a
+//! blocking pool; [`Handle::lock_file`] and [`Handle::try_lock_file`] run on
+//! the calling thread (the first retries on a timer while the lock is held),
+//! and so does `File::open` on Linux for a regular file on a
 //! local file system whose path the kernel's caches resolve at once.
 //!
 //! A regular file's reads and writes, at the handle's own cursor or at an
@@ -17,10 +18,23 @@
 //! jobs of the blocking pool on the other backends (see `file`). A file
 //! opened for direct IO (`O_DIRECT`, `FILE_FLAG_NO_BUFFERING`) is read and
 //! written with exactly the caller's lengths and offsets, never through the
-//! handle's read-ahead or write-behind. A `File` that is not a regular file
-//! (a FIFO, a terminal, a pipe) is a byte stream the shard's driver serves
-//! like a socket (on Windows, through the completion port, or through jobs
-//! of the blocking pool for a handle opened for synchronous IO). Reads and
+//! handle's read-ahead. A file opened for direct IO, or to sync each write
+//! (`O_DSYNC`, `O_SYNC`, `FILE_FLAG_WRITE_THROUGH`), has no write-behind:
+//! each write at its cursor is one kernel write (on a direct file, of exactly
+//! the caller's bytes) and is Ready only once it landed, with its own result,
+//! so an unaligned direct write answers the kernel's `EINVAL` itself and
+//! moves the cursor nowhere. A write whose future was dropped still lands,
+//! and its answer goes only to a poll of that same write (the same bytes at
+//! the same place); a sync file's reads still go through the read-ahead
+//! (`proofs/tla/lent/LentFile.tla`, scenarios "direct" and "dsync").
+//! `write_owned`, `write_at` and their forms return only once their own write
+//! landed, with its own result. On Windows one opened for overlapped IO
+//! (`FILE_FLAG_OVERLAPPED`) is read and written as one opened for synchronous
+//! IO: a call the system answers pending is waited out before it returns. A
+//! `File` that is not a regular file (a FIFO, a terminal, a pipe) is a byte
+//! stream the shard's driver serves like a socket (on Windows, through the
+//! completion port, or through jobs of the blocking pool for a handle opened
+//! for synchronous IO). Reads and
 //! writes at the cursor are `AsyncRead` and `AsyncWrite` on the handle and
 //! on a shared reference to it (both share the cursor, as `&File` shares its
 //! offset); `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned`,
@@ -73,6 +87,18 @@ pub use self::sync_dir::sync_dir;
 
 /// A file: std's `File` in a [`Handle`], with async reads, writes, seeks and
 /// calls.
+///
+/// A write is accepted into the handle's write-behind and lands after. A
+/// file dropped with bytes there never loses them unsaid: dropped on a worker
+/// or on a thread of the blocking pool, a task writes them, and the runtime's
+/// drop and the process's exit wait for it (the process default runtime's
+/// included); dropped on any other thread (`block_on`'s, one of the
+/// application's), the drop writes them before it returns. Bytes that cannot
+/// be written, a write that failed or the runtime's
+/// [`write_behind_linger`](crate::runtime::Builder::write_behind_linger) run
+/// out, are said at warn and counted in
+/// [`Stats::write_behind_lost`](crate::stats::Stats::write_behind_lost). To be
+/// told of a failure yourself, flush or sync before the drop.
 pub type File = Handle<std::fs::File>;
 
 use core::pin::Pin;

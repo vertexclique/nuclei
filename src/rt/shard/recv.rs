@@ -464,8 +464,8 @@ impl RingChunk {
 
     /// Takes `n` bytes off the front.
     pub(crate) fn consume(&mut self, n: usize) {
-        let n = u32::try_from(n).unwrap_or(u32::MAX);
-        self.start = self.start.saturating_add(n).min(self.end);
+        let n = n.min(self.len());
+        self.start += n as u32;
     }
 
     pub(crate) fn len(&self) -> usize {

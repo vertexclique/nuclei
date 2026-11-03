@@ -6,9 +6,9 @@
 //! futures and wakers only: async code awaits it, and any executor polls it
 //! with its own [`Waker`](core::task::Waker). Every primitive also has
 //! `try_` forms that never wait. The core of this module makes no system
-//! call: no futex, no thread park, no sleep and no clock read. The one
-//! exception is inside the lock-free queues the primitives use, which recycle
-//! waiter nodes and yield the thread when they meet contention. The other
+//! call: no futex, no thread park, no sleep and no clock read. A contended
+//! acquire spins briefly with the processor's pause hint before it queues, and
+//! never yields the thread. The one
 //! exception is the
 //! `blocking_*` methods, which exist for threads that may block and park
 //! the calling thread until their wait is over. Called on a nuclei shard
@@ -56,6 +56,9 @@
 //!   serve to compete again. One that loses [`MAX_BYPASS`](crate::sync::MAX_BYPASS) times is owed a
 //!   handoff: nobody gets in ahead of it, and the next release hands it
 //!   what it waits for directly. Fairness is counted, never timed.
+//!   A waiting future that its user never polls again (kept but not polled,
+//!   or passed to `std::mem::forget`) keeps its place, and the waiters
+//!   behind it wait until it is polled again or dropped.
 //! - **Cancellation-safe.** Dropping a pending future withdraws its
 //!   waiter. If something was handed to it concurrently, the drop passes
 //!   it on. No wakeup is lost. (A [`Barrier`](crate::sync::Barrier) wait is the one exception: an
@@ -67,11 +70,12 @@
 //!   the task's cooperative budget, as IO does
 //!   ([`task::coop`]), and so does an acquire of a
 //!   semaphore, a lock (the reentrant ones too) or a bounded send that
-//!   completes at its first attempt. When the budget is spent the call
-//!   completes nothing, wakes its task and returns `Pending`, so a loop on a
-//!   channel or a lock that is always ready yields to the shard's other
-//!   tasks. A wait that queued and was granted spends nothing: giving the
-//!   grant back would cost it its place. The `try_` forms never spend, and
+//!   completes in the poll that began it, at its first attempt or by a grant
+//!   as it queued. When the budget is spent the call completes nothing,
+//!   wakes its task and returns `Pending`, so a loop on a channel or a lock
+//!   that is always ready yields to the shard's other tasks. A wait granted
+//!   in a later poll, after it queued, spends nothing: giving the grant back
+//!   would cost it its place. The `try_` forms never spend, and
 //!   off a nuclei shard there is no budget. The events, latches, barriers,
 //!   once-cells and `Notify` keep no budget.
 //! - **Reentrancy by [`Owner`](crate::sync::Owner).** The reentrant locks are keyed by an
@@ -153,6 +157,8 @@ mod cancellation;
 mod contend;
 mod event;
 mod fair_semaphore;
+#[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
+mod frames;
 pub(crate) mod internal;
 mod latch;
 mod lazy;
@@ -169,9 +175,6 @@ mod mutex;
 mod notify;
 mod once_cell;
 pub mod oneshot;
-// See the note on its re-export below.
-#[allow(dead_code)]
-mod owned_lock;
 mod owner;
 mod queue;
 mod raw_rwlock;
@@ -181,6 +184,7 @@ mod reentrant_rwlock;
 mod rwlock;
 mod semaphore;
 mod set_once;
+mod siblings;
 mod spin;
 #[cfg(all(test, not(loom)))]
 pub(crate) mod test_support;
@@ -202,11 +206,6 @@ pub use mutex::{
 };
 pub use notify::{Notified, Notify, OwnedNotified};
 pub use once_cell::{OnceCell, SetError};
-// vertexia: the owner-named lock has no consumer in this crate yet; its
-// tests run in `owned_lock`. Trim it if it stays unused.
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use owned_lock::between_take_and_grant;
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};
 pub use reentrant_rwlock::{

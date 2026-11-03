@@ -12,16 +12,20 @@ fn sleep_on(shard: &Shard, at: Instant) -> impl core::future::Future<Output = ()
         let mut wheel = shard.wheel().borrow_mut();
         match key {
             None => {
-                key = Some(wheel.insert(
+                let armed = wheel.insert(
                     shard.time_of(false, crate::time::clock::nanos(at)),
-                    cx.waker(),
-                ));
+                    cx.waker().clone(),
+                );
+                match armed {
+                    Ok(k) => key = Some(k),
+                    Err(_) => return core::task::Poll::Ready(()),
+                }
             }
             Some(k) if wheel.is_fired(k) => {
-                wheel.remove(k);
+                drop(wheel.remove(k));
                 return core::task::Poll::Ready(());
             }
-            Some(k) => wheel.set_waker(k, cx.waker()),
+            Some(k) => drop(wheel.replace_waker(k, cx.waker().clone())),
         }
         let fired = key.is_some_and(|k| wheel.is_fired(k));
         if fired {
@@ -104,6 +108,140 @@ fn a_timer_fired_on_the_way_to_park_runs_its_task_rather_than_parking() {
         .expect("the drive waited on the poller with the task it woke still to run");
     assert!(armed_unfired, "the timer fired before it was due");
     assert!(woke, "the task the timer woke never ran");
+}
+
+/// A turn driven by hand runs a bounded number of tasks: a task that yields
+/// again and again (waiting for a flag a timer's task sets) would otherwise
+/// keep the turn from ever looking at its timers or returning.
+#[test]
+fn a_turn_runs_a_bounded_number_of_tasks() {
+    crate::block_on(async {
+        let runs = std::rc::Rc::new(core::cell::Cell::new(0u32));
+        let counted = std::rc::Rc::clone(&runs);
+        crate::runtime::spawn_local(async move {
+            // A cap of its own, so a turn that never stops still ends the test.
+            while counted.get() < 100_000 {
+                counted.set(counted.get() + 1);
+                crate::task::yield_now().await;
+            }
+        })
+        .detach();
+        crate::Proactor::get()
+            .wait(64, Some(Duration::ZERO))
+            .unwrap();
+        assert!(
+            runs.get() <= 2 * super::DRIVER_INTERVAL,
+            "one turn ran the yielding task {} times",
+            runs.get()
+        );
+    });
+}
+
+/// A notification of a sleeping shard that fails is tried again, so the
+/// shard wakes for its work all the same. Only kqueue's `kevent` and the
+/// port's `PostQueuedCompletionStatus` can fail; Linux's eventfd write
+/// cannot. Each round's sender waits for the shard to say it parks, then
+/// sends with its next notification failing; a round whose send found the
+/// shard awake (its notification not made) is run again.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[test]
+fn a_failed_notification_is_tried_again() {
+    let shared = Arc::clone(&context::own_shard().unwrap().shared);
+    for _ in 0..50 {
+        let (tx, rx) = crate::sync::oneshot::channel::<u32>();
+        let sender = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut backoff = Duration::from_micros(50);
+                while !shared.is_parked() {
+                    assert!(Instant::now() < deadline, "the shard never parked");
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(5));
+                }
+                // Into its wait on the kernel, past its last look.
+                std::thread::sleep(Duration::from_millis(20));
+                crate::rt::park::fail_notifies(1);
+                tx.send(7).unwrap();
+                crate::rt::park::fail_notifies(0) == 0
+            })
+        };
+        let start = Instant::now();
+        let got = crate::block_on(crate::time::timeout(Duration::from_secs(10), rx));
+        let took = start.elapsed();
+        let failed_one = sender.join().unwrap();
+        assert_eq!(got.ok().and_then(Result::ok), Some(7));
+        if failed_one {
+            assert!(
+                took < Duration::from_secs(5),
+                "the failed notification was lost: the shard slept {took:?}"
+            );
+            return;
+        }
+    }
+    panic!("no round's notification found the shard asleep");
+}
+
+/// The tasks bound to the thread that runs a shard are taken while other
+/// threads keep its inbox full: every other interval's turn looks at the
+/// home first, where before the home was looked at only once the inbox was
+/// empty (proofs/tla/sched/Sched.tla `home_after_empty`).
+#[test]
+fn a_home_is_served_while_the_inbox_stays_full() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::rt::sched::Sched;
+
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let _current = context::enter(&shard);
+    let interval = shard.tuning.inbox_interval;
+    // More runnables in the inbox than the runs the home may wait.
+    let mut tasks = Vec::new();
+    for _ in 0..4 * interval {
+        // SAFETY: the schedule sends the task back to this shard, whose
+        // thread runs it here; the future is 'static.
+        let (runnable, task) = unsafe {
+            crate::rt::task::spawn_unchecked(
+                async {},
+                Sched::<false>::counted(Arc::clone(&shard.shared), None, None),
+            )
+        };
+        shard.shared.push_remote(runnable);
+        tasks.push(task);
+    }
+    let ran = Arc::new(AtomicBool::new(false));
+    let home = shard.own_home();
+    let bound = {
+        let ran = Arc::clone(&ran);
+        // SAFETY: as above; the task is bound to the shard's own home.
+        let (runnable, task) = unsafe {
+            crate::rt::task::spawn_unchecked(
+                async move { ran.store(true, Ordering::SeqCst) },
+                Sched::<true>::counted(Arc::clone(&shard.shared), Some(Arc::clone(&home)), None),
+            )
+        };
+        // SAFETY: this thread is the home's, and the new task is on no list.
+        unsafe { home.push_task(runnable.links()) };
+        // A wake of the bound task from another thread.
+        home.push(runnable);
+        task
+    };
+    let mut runs = 0;
+    while !ran.load(Ordering::SeqCst) && runs < 2 * interval {
+        let runnable = shard.next().expect("work is queued");
+        shard.run(runnable);
+        runs += 1;
+    }
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the bound task waited {runs} runs behind a full inbox"
+    );
+    drop((bound, tasks));
 }
 
 /// A waker that holds a shard's `Shared`, as the one of a worker's loop
@@ -215,4 +353,207 @@ fn a_future_that_keeps_waking_itself_still_has_its_io_driven() {
     });
     assert_eq!(got.unwrap(), 1);
     drop(writer.join().unwrap());
+}
+
+/// The leaf push from a task's code on a watched shard (`context::push_lifo_marked`): with no
+/// claim up it fills the empty LIFO slot and puts the poll's word back, so the poll is outside
+/// again; it backs out, the word put back, when the slot holds a task, for another shard, and with
+/// a claim up, which it leaves pending for the full bracket to settle.
+#[test]
+fn a_leaf_push_fills_an_empty_slot_or_backs_out() {
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let slot = crate::rt::handoff::slot::Slot::new(false);
+    let _entered = context::enter_watched(&shard, Some(&slot));
+    let addr = shard.shared_addr();
+    let info = crate::rt::task::ScheduleInfo::new(false);
+    /// A schedule the test never runs: it drops what it is handed.
+    struct Ignore;
+    // SAFETY: the runnable is not touched after the drop.
+    unsafe impl crate::rt::task::Schedule for Ignore {
+        fn schedule(&self, runnable: crate::rt::task::Runnable, _: crate::rt::task::ScheduleInfo) {
+            drop(runnable);
+        }
+    }
+    let task = || crate::rt::task::spawn(async {}, Ignore).0;
+    let (_, polled) = context::poll(&shard.shared, || {
+        let word = slot.word();
+        assert!(
+            context::push_lifo_marked(task(), info, |s| s.shared_addr() == addr).is_ok(),
+            "the leaf did not fill the empty slot"
+        );
+        assert_eq!(slot.word(), word, "the leaf left its mark up");
+        assert_eq!(shard.queued(), 1);
+        let back = context::push_lifo_marked(task(), info, |s| s.shared_addr() == addr)
+            .expect_err("the leaf pushed into a slot that holds a task");
+        assert_eq!(slot.word(), word);
+        let back = context::push_lifo_marked(back, info, |s| s.shared_addr() == addr ^ 1)
+            .expect_err("the leaf pushed for another shard");
+        assert_eq!(slot.word(), word);
+        drop(shard.lifo.take());
+        slot.claim();
+        let back = context::push_lifo_marked(back, info, |s| s.shared_addr() == addr)
+            .expect_err("the leaf pushed with a claim up");
+        assert_eq!(slot.word(), word, "the leaf backed out with its mark up");
+        assert_eq!(shard.queued(), 0);
+        assert!(slot.take(), "the leaf settled the claim");
+        drop(back);
+    });
+    assert_eq!(polled, context::Polled::Detached);
+}
+
+/// The leaf push from a task's code whose shard was taken under a call that has ended since: a
+/// nested poll in the call (a nested `block_on`'s) found the take, and the call's end put the
+/// slot back as the one the task's code runs outside of. The leaf finds the claim up and backs
+/// out, and the full bracket finds no shard.
+#[test]
+fn a_leaf_push_after_a_take_under_a_call_backs_out_to_no_shard() {
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let slot = crate::rt::handoff::slot::Slot::new(false);
+    let _entered = context::enter_watched(&shard, Some(&slot));
+    let addr = shard.shared_addr();
+    let info = crate::rt::task::ScheduleInfo::new(false);
+    /// A schedule the test never runs: it drops what it is handed.
+    struct Ignore;
+    // SAFETY: the runnable is not touched after the drop.
+    unsafe impl crate::rt::task::Schedule for Ignore {
+        fn schedule(&self, runnable: crate::rt::task::Runnable, _: crate::rt::task::ScheduleInfo) {
+            drop(runnable);
+        }
+    }
+    let (_, polled) = context::poll(&shard.shared, || {
+        let word = slot.word();
+        {
+            let call = context::bracketed();
+            assert!(call.shard().is_some(), "the call found no shard");
+            let (_, nested) = context::poll(&shard.shared, || {
+                slot.claim();
+                assert!(slot.take(), "the nested poll was not taken");
+            });
+            assert_eq!(nested, context::Polled::Detached);
+        }
+        assert_eq!(slot.word(), word, "the call's end left another word");
+        let task = crate::rt::task::spawn(async {}, Ignore).0;
+        let back = context::push_lifo_marked(task, info, |s| s.shared_addr() == addr)
+            .expect_err("the leaf pushed on a taken shard");
+        assert_eq!(slot.word(), word, "the leaf left its mark up");
+        assert_eq!(shard.queued(), 0);
+        assert!(
+            context::current(|current| current.is_none()),
+            "the full bracket found the taken shard"
+        );
+        drop(back);
+    });
+    assert_eq!(polled, context::Polled::Detached);
+}
+
+/// The time to the precise deadline a shard's poller has its own timer armed
+/// for: epoll's timerfd, or the `EVFILT_TIMER` the next wait submits.
+#[cfg(any(target_os = "linux", target_os = "android", precise_timer))]
+fn precise_armed_in(shard: &Shard) -> Option<Duration> {
+    match &shard.driver {
+        super::Driver::Poll(poller) => poller.borrow().precise_armed_in(),
+        #[cfg(ring)]
+        _ => None,
+    }
+}
+
+// The pollers that arm a timer of their own for a precise deadline: epoll and
+// kqueue's. A ring's timeout and a completion port's timer end the wait to
+// the microsecond by themselves, so they keep no armed deadline to go stale.
+#[cfg(any(target_os = "linux", target_os = "android", precise_timer))]
+#[test]
+fn an_advance_of_a_running_clock_moves_the_pollers_precise_timer() {
+    let rt = crate::runtime::Builder::new()
+        .worker_threads(0)
+        .build()
+        .unwrap();
+    let inner = rt.inner();
+    // Altered, and running.
+    inner.clock.advance(Duration::from_millis(1));
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::Backend::Poll,
+    })
+    .unwrap();
+    let _runtime = context::set_runtime(inner);
+    let _current = context::enter(&shard);
+    // On a top-level slot boundary of the microsecond wheel, so its next
+    // work is this deadline and not a move down on the way to it.
+    let at = (inner.clock.now_nanos() / 1_000 + 6_000_000)
+        .next_multiple_of(crate::time::wheel::TOP_SLOT)
+        * 1_000;
+    let lead = Duration::from_nanos(at - inner.clock.now_nanos());
+    let key = shard
+        .wheel_of(true)
+        .borrow_mut()
+        .insert(shard.time_of(true, at), Waker::noop().clone())
+        .unwrap();
+    assert!(shard.timer_wait(true).is_some());
+    let first = precise_armed_in(&shard).expect("the poller armed its timer");
+    assert!(first <= lead, "{first:?}");
+    let by = lead - Duration::from_secs(5);
+    inner.clock.advance(by);
+    assert!(shard.timer_wait(true).is_some());
+    let second = precise_armed_in(&shard).expect("the poller's timer is armed");
+    assert!(second <= Duration::from_secs(5), "{second:?}");
+    // Moved by the advance it is `by` nearer than it was, less the time
+    // between the two looks, however long that took on a loaded host.
+    assert!(
+        second + by - Duration::from_secs(1) < first,
+        "the poller's timer stayed at the deadline as the system saw it before the advance: {first:?} left before, {second:?} after"
+    );
+    drop(shard.wheel_of(true).borrow_mut().remove(key));
+}
+
+#[test]
+fn a_park_that_backs_out_again_and_again_still_looks_at_the_driver() {
+    use core::cell::RefCell;
+    use core::task::{Poll, Waker};
+    use std::rc::Rc;
+
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let _current = context::enter(&shard);
+    shard.spin.spend();
+    let before = shard.looks.get();
+    let stored: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+    let hook_stored = Rc::clone(&stored);
+    super::run::BEFORE_PARK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            if let Some(waker) = hook_stored.borrow().as_ref() {
+                waker.wake_by_ref();
+            }
+        }));
+    });
+    let polls = 3 * super::DRIVER_INTERVAL;
+    let mut seen = 0u32;
+    shard.block_on(core::future::poll_fn(|cx| {
+        *stored.borrow_mut() = Some(cx.waker().clone());
+        seen += 1;
+        if seen >= polls {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }));
+    super::run::BEFORE_PARK.with(|hook| *hook.borrow_mut() = None);
+    assert!(
+        shard.looks.get() - before >= 2,
+        "the driver was never looked at while the park kept backing out"
+    );
 }

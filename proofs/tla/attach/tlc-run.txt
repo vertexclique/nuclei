@@ -23,3 +23,16 @@ MT_no_resubmit                      91         65      1  violated:Served       
 WT_late                             41         34      1  violated:NoLateResubmit               violated:NoLateResubmit               yes
 
 results matching EXPECTED.txt: 18 of 18
+
+Added since, as CI ran them: TLA+ run 41452470703 on 9bdde6f1, 2026-11-02, one worker each (the
+share jobs of .github/workflows/tla.yml): a retire and an attach performed in one go (Merged.tla).
+
+configuration                generated   distinct    sec  result                                expected                              match
+MG_holder                          121         57      1  pass                                  pass                                  yes
+MG_holder_live                     121         57      1  pass                                  pass                                  yes
+MG_posted                          100         59      1  pass                                  pass                                  yes
+MG_posted_live                     100         59      1  pass                                  pass                                  yes
+M_holder_fails                      93         45      1  violated:NoSpuriousError              violated:NoSpuriousError              yes
+M_requester_fails                   85         53      1  violated:NoSpuriousError              violated:NoSpuriousError              yes
+W_merged                            52         27      1  violated:NoMerged                     violated:NoMerged                     yes
+W_late_refusal                      42         25      1  violated:NoLateRefusal                violated:NoLateRefusal                yes

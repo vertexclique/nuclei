@@ -42,6 +42,9 @@ impl Piece {
         }
     }
 
+    /// The bytes the piece holds still. Inlined at every look: the reads that take a piece
+    /// call it on their fast path, and the inliner's cost puts it near its limit.
+    #[inline(always)]
     fn filled(&self) -> &[u8] {
         match self {
             Piece::Pool(buf) => buf.filled(),

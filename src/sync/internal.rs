@@ -227,7 +227,9 @@ pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
     let mut cx = Context::from_waker(&waker);
     let mut future = core::pin::pin!(future);
     loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+        // A thread parked in a wait runs nothing else, so its polls are unbudgeted: a spent
+        // budget of the poll around it (a task's) must not refuse every poll and spin.
+        if let Poll::Ready(output) = crate::coop::outside(|| future.as_mut().poll(&mut cx)) {
             return output;
         }
         std::thread::park();
@@ -258,7 +260,7 @@ pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
     let mut cx = Context::from_waker(&waker);
     let mut future = core::pin::pin!(future);
     loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+        if let Poll::Ready(output) = crate::coop::outside(|| future.as_mut().poll(&mut cx)) {
             return output;
         }
         park.0.wait();
@@ -281,10 +283,12 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
         use core::task::{Context, Poll};
 
         let mut future = core::pin::pin!(future);
-        match future
-            .as_mut()
-            .poll(&mut Context::from_waker(std::task::Waker::noop()))
-        {
+        // Unbudgeted: a spent budget would refuse a free lock and read as a wait on this thread.
+        match crate::coop::outside(|| {
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+        }) {
             Poll::Ready(output) => Ok(output),
             // Nothing else runs on this target, so whoever holds it is this
             // thread, further up its own stack.
@@ -296,14 +300,103 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
     }
 }
 
+/// Runs `f`, user code reached while unwinding from an earlier panic (the
+/// rest of a wake list, a give-back in a guard): a second panic there would
+/// abort the process, so it is caught and its payload dropped, the panic
+/// hook having reported it already.
+pub(crate) fn during_unwind(f: impl FnOnce()) {
+    if let Some(panic) = crate::rt::caught::catch(f) {
+        crate::rt::caught::drop_payload(panic);
+    }
+}
+
+/// Runs a give-back through [`during_unwind`] when dropped, which only an
+/// unwind does: the normal path ends in [`disarm`](Self::disarm), which costs
+/// nothing. For what was taken before user code that may panic runs.
+#[must_use = "dropped at once, it runs its give-back"]
+pub(crate) struct OnUnwind<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnUnwind<F> {
+    #[inline(always)]
+    pub(crate) fn new(undo: F) -> Self {
+        Self(Some(undo))
+    }
+
+    /// Ends the guard without running `undo`, which then is never dropped
+    /// either: it holds borrows and `Copy` values alone.
+    #[inline(always)]
+    pub(crate) fn disarm(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl<F: FnOnce()> Drop for OnUnwind<F> {
+    #[cold]
+    fn drop(&mut self) {
+        if let Some(undo) = self.0.take() {
+            during_unwind(undo);
+        }
+    }
+}
+
+/// A wait that holds a place in a queue, which a frame that opens over it can
+/// make it give up (see `frames`).
+pub(crate) trait Withdraw {
+    /// Leaves every queue the future holds a place in, as dropping it does
+    /// (passing on a grant or a nudge it holds), and leaves it fresh: its
+    /// next poll starts over, at the back.
+    fn withdraw(self: core::pin::Pin<&mut Self>);
+}
+
+/// Withdraws every wait under a frame that is about to open on this thread
+/// (see `frames`): one load when there is none.
+#[inline(always)]
+pub(crate) fn freeze_frames() {
+    #[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
+    if super::frames::any() {
+        super::frames::freeze();
+    }
+}
+
+/// [`blocking`] for a wait that queues: on a shard, the wait gives up its
+/// place in line whenever a frame opens over it and asks again, at the back,
+/// once its frame is on top again, so nested blocking waits never wait on
+/// each other with the lock free.
+///
+/// # Panics
+///
+/// On `wasm32`, when the future is not ready at once: see [`wait_here`].
+#[expect(
+    clippy::panic,
+    reason = "documented under `# Panics`: a wait that would park the only thread"
+)]
+pub(crate) fn blocking_in_line<F: core::future::Future + Withdraw>(future: F) -> F::Output {
+    #[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
+    {
+        if crate::rt::context::current(|current| current.is_some()) {
+            return super::frames::in_line(future, |frame| crate::runtime::block_on(frame));
+        }
+        if let Some(shard) = crate::rt::context::own_shard_if_made() {
+            let _entered = crate::rt::context::enter(&shard);
+            return super::frames::in_line(future, |frame| shard.block_on_then_leave(frame));
+        }
+    }
+    match wait_here(future) {
+        Ok(output) => output,
+        Err(stuck) => panic!("{stuck}"),
+    }
+}
+
 /// `future`'s output, waited for on this thread: what every `blocking_*`
 /// method runs, so they all behave the same way.
 ///
-/// On a thread that runs a nuclei shard (inside one of its tasks) it runs a
-/// nested `block_on` on that shard, which keeps running the shard's other
-/// tasks, timers and IO until the future completes. On any other thread it
-/// parks the thread (a system call) until the future's waker fires, so it
-/// must not run on a thread another executor needs for other tasks.
+/// On a thread that runs a nuclei shard (inside one of its tasks), or whose poll lost its
+/// worker's shard to the handoff and can start its own, it runs a nested `block_on` on the shard
+/// it runs or its own, which keeps running that shard's other tasks, timers and IO (the thread's
+/// bound tasks among them) until the future completes. On a thread that runs none but made its
+/// own shard, it runs that shard until the future completes. On any other thread it parks the
+/// thread (a system call) until the future's waker fires, so it must not run on a thread
+/// another executor needs for other tasks.
 ///
 /// # Panics
 ///
@@ -315,7 +408,9 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
 pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
     #[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
     {
-        if crate::rt::context::current(|current| current.is_some()) {
+        if crate::rt::context::current(|current| current.is_some())
+            || (crate::rt::context::lost_a_shard() && crate::rt::context::own_shard().is_ok())
+        {
             return crate::runtime::block_on(future);
         }
         // Only this thread runs its own shard: what waits on it (an edge,
@@ -361,6 +456,29 @@ mod tests {
             *mutex.lock(),
             vec![1, 2, 3, 4],
             "poisoning must not hide what the panicking thread had already written",
+        );
+    }
+
+    #[test]
+    fn a_wait_inside_a_spent_budget_still_polls_its_future() {
+        let (done, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let previous = crate::coop::enter();
+            while crate::coop::try_spend() {}
+            let out = block_on(core::future::poll_fn(|cx| {
+                if crate::coop::spend(cx.waker()) {
+                    core::task::Poll::Ready(7)
+                } else {
+                    core::task::Poll::Pending
+                }
+            }));
+            crate::coop::leave(previous);
+            let _ = done.send(out);
+        });
+        assert_eq!(
+            answer.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(7),
+            "block_on spun on the spent budget of the poll around it"
         );
     }
 }

@@ -21,3 +21,170 @@ M_retarget_relaxed                  99         52      1  violated:WokenPolled  
 W_old_wake                          12         11      1  violated:NoOldWake                    violated:NoOldWake                    yes
 
 results matching EXPECTED.txt: 16 of 16
+
+Added and rechecked since, as CI ran them: TLA+ run 41405501903 on 97d8be4, 2026-11-02, one
+worker each (the share jobs of .github/workflows/tla.yml). These times replace the ones above.
+
+configuration                 generated   distinct    sec  result                                expected                              match
+L_safe                          3520908     936806     11  pass                                  pass                                  yes
+L_rescue                         433576     120736     11  pass                                  pass                                  yes
+M_leaf_no_check                    2737       1125      1  violated:Exclusive                    violated:Exclusive                    yes
+M_leaf_keeps_mark                 50242      16526      4  violated:Rescued                      violated:Rescued                      yes
+W_leaf_back                        1986        823      1  violated:NoLeafBack                   violated:NoLeafBack                   yes
+H_safe                         17520147    4903665     44  pass                                  pass                                  yes
+H_rescue                        2278013     619991     49  pass                                  pass                                  yes
+
+Added and rechecked since, as CI ran them: TLA+ run 41431994577 on 7bb522c, 2026-11-02, one
+worker each (the share jobs of .github/workflows/tla.yml), with a detached thread's calls in the
+model. These times replace the ones above.
+
+configuration                 generated   distinct    sec  result                                expected                              match
+D_safe                           834414     215566      4  pass                                  pass                                  yes
+W_stale_back                      10465       4050      1  violated:NoStaleBack                  violated:NoStaleBack                  yes
+M_taken_cleared                    7845       3078      1  violated:DetachedStaysOut             violated:DetachedStaysOut             yes
+M_leaf_no_check                    2737       1125      1  violated:Exclusive                    violated:Exclusive                    yes
+M_leaf_keeps_mark                 52578      17201      5  violated:Rescued                      violated:Rescued                      yes
+L_safe                          3520908     936806     12  pass                                  pass                                  yes
+L_rescue                         433576     120736     12  pass                                  pass                                  yes
+H_safe                         17520147    4903665     28  pass                                  pass                                  yes
+H_rescue                        2278013     619991     51  pass                                  pass                                  yes
+
+Added and rechecked since, as CI ran them: TLA+ run 41451876799 on 6f04231, 2026-11-02, one
+worker each (the share jobs of .github/workflows/tla.yml): the hand-back (HandBack.tla), with
+its hand-over of the shard's queues. These times replace any above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+HB_safe                          97471      28136     17  pass                                  pass                                  yes
+HB_chain                       1968569     459112      8  pass                                  pass                                  yes
+HB_nested                       150355      43911     27  pass                                  pass                                  yes
+HB_end                           27091       8812      7  pass                                  pass                                  yes
+HB_block_loan                    29358       8906      2  pass                                  pass                                  yes
+HB_close                         41047      11792      6  pass                                  pass                                  yes
+HB_drain                         34827       9624      5  pass                                  pass                                  yes
+HB_two                         1016585     244584      8  pass                                  pass                                  yes
+HB_two_done                      15784       4466      7  pass                                  pass                                  yes
+HB_chain_done                    48195      12957     12  pass                                  pass                                  yes
+HB_bound                         13862       4326      5  pass                                  pass                                  yes
+M_no_handback                      663        309      1  violated:NoFailedWith                 violated:NoFailedWith                 yes
+M_lend_no_mark                   28550       9309      3  violated:Exclusive                    violated:Exclusive                    yes
+M_lend_no_check                  28532       9305      2  violated:Exclusive                    violated:Exclusive                    yes
+M_lend_no_wait                    6020       2044      2  violated:Exclusive                    violated:Exclusive                    yes
+M_borrow_no_wait                   879        392      2  violated:Exclusive                    violated:Exclusive                    yes
+M_lend_pinned                     9432       3052      2  violated:ExclusiveValue               violated:ExclusiveValue               yes
+M_lend_from_borrower            457737     113176      5  violated:ExclusiveValue               violated:ExclusiveValue               yes
+M_lend_lost_on_take              28532       9305      2  violated:LendHeld                     violated:LendHeld                     yes
+M_defer_drops                     8465       2802      2  violated:LendHeld                     violated:LendHeld                     yes
+M_close_no_wake                  35521      10056     13  violated:HandBackDone                 violated:HandBackDone                 yes
+M_lend_no_cas                    22372       6792      3  violated:LentHasBorrower              violated:LentHasBorrower              yes
+M_gone_no_cas                    22476       6794      2  violated:LenderHasLoan                violated:LenderHasLoan                yes
+M_panic_keeps_loan                8149       2676      1  violated:LentHasBorrower              violated:LentHasBorrower              yes
+M_drain_early                    27255       7464      8  violated:HandBackDone                 violated:HandBackDone                 yes
+M_drain_refuses                   3692       1440      2  violated:NoFailedWith                 violated:NoFailedWith                 yes
+M_wait_runs_tasks                 6269       2140      1  violated:LentHasBorrower              violated:LentHasBorrower              yes
+M_lend_keeps_queues              11220       3554      2  violated:BoundOnCreator               violated:BoundOnCreator               yes
+M_back_keeps_queues              10769       3407      2  violated:BoundOnCreator               violated:BoundOnCreator               yes
+W_loan                            7911       2601      2  violated:NoLoan                       violated:NoLoan                       yes
+W_defer                           8808       2949      2  violated:NoDefer                      violated:NoDefer                      yes
+W_lend_taken                     29643       9761      2  violated:NoLendTaken                  violated:NoLendTaken                  yes
+W_gone                            5032       1787      2  violated:NoGone                       violated:NoGone                       yes
+W_cas_lost                       23158       7081      2  violated:NoCasLost                    violated:NoCasLost                    yes
+W_hb_stale_back                   2352        993      2  violated:NoStaleBack                  violated:NoStaleBack                  yes
+W_hb_detached_call                 490        235      1  violated:NoDetachedCall               violated:NoDetachedCall               yes
+W_nested_detach                   3288       1379      2  violated:NoNestedDetach               violated:NoNestedDetach               yes
+W_nested_loan                    57305      18242      2  violated:NoNestedLoan                 violated:NoNestedLoan                 yes
+W_panic_loan                      8715       2909      2  violated:NoPanicLoan                  violated:NoPanicLoan                  yes
+W_cancel_wait                     9532       3146      2  violated:NoCancelWait                 violated:NoCancelWait                 yes
+W_drain_loan                     34502      10383      2  violated:NoDrainLoan                  violated:NoDrainLoan                  yes
+W_bound_loan                      8651       2827      2  violated:NoBoundLoan                  violated:NoBoundLoan                  yes
+
+results matching EXPECTED.txt: 42 of 42
+
+Added and rechecked since, as CI ran them: TLA+ run 41458339654 on 1f85b7b, 2026-11-02, one
+worker each (the share jobs of .github/workflows/tla.yml), with a nested poll, the full and failing
+fences, unwinds, both claim swaps, two calls a poll and the runner's life in the models: every
+configuration of the family. These times replace the ones above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+H_safe                        17520147    4903665     39  pass                                  pass                                  yes
+H_rescue                       2278013     619991     58  pass                                  pass                                  yes
+M_no_fence                        2387        959      1  violated:Exclusive                    violated:Exclusive                    yes
+M_no_recheck                      1737        726      1  violated:Exclusive                    violated:Exclusive                    yes
+M_no_poll_check                   1885        789      1  violated:Exclusive                    violated:Exclusive                    yes
+M_no_bracket_check                1756        737      2  violated:Exclusive                    violated:Exclusive                    yes
+M_no_call_mark                    1581        668      2  violated:Exclusive                    violated:Exclusive                    yes
+M_call_stays_marked              46155      16265      4  violated:Rescued                      violated:Rescued                      yes
+M_slot_reuse                      3062       1274      1  violated:Exclusive                    violated:Exclusive                    yes
+M_bound_any                       2241        931      1  violated:BoundOnCreator               violated:BoundOnCreator               yes
+M_no_handoff                     11373       3508      2  violated:Rescued                      violated:Rescued                      yes
+W_handoff                         1024        441      1  violated:NoHandoff                    violated:NoHandoff                    yes
+W_cancel                           951        408      1  violated:NoCancel                     violated:NoCancel                     yes
+W_detached_call                   2982       1225      2  violated:NoDetachedCall               violated:NoDetachedCall               yes
+W_runner_cancel                   1291        549      1  violated:NoRunnerCancel               violated:NoRunnerCancel               yes
+L_safe                         3520908     936806     12  pass                                  pass                                  yes
+L_rescue                        433576     120736      9  pass                                  pass                                  yes
+M_leaf_no_check                   2737       1125      1  violated:Exclusive                    violated:Exclusive                    yes
+M_leaf_keeps_mark                43657      14548      5  violated:Rescued                      violated:Rescued                      yes
+W_leaf_back                       1986        823      2  violated:NoLeafBack                   violated:NoLeafBack                   yes
+D_safe                          834414     215566      3  pass                                  pass                                  yes
+M_taken_cleared                   7845       3078      1  violated:DetachedStaysOut             violated:DetachedStaysOut             yes
+W_stale_back                     10465       4050      1  violated:NoStaleBack                  violated:NoStaleBack                  yes
+N_safe                          745591     199761      4  pass                                  pass                                  yes
+M_ready_first                    18443       6859      1  violated:DetachedStaysOut             violated:DetachedStaysOut             yes
+M_stopped_on_take                 3062       1251      2  violated:TakenReportsDetached         violated:TakenReportsDetached         yes
+M_blind_take                      2425        984      2  violated:Exclusive                    violated:Exclusive                    yes
+M_blind_contest                   2420        981      1  violated:Exclusive                    violated:Exclusive                    yes
+M_marked_unwind                  59964      21261      4  violated:Rescued                      violated:Rescued                      yes
+F_safe                         1801935     534856      7  pass                                  pass                                  yes
+W_full_handoff                     662        295      2  violated:NoHandoff                    violated:NoHandoff                    yes
+M_full_no_runner_fence            1492        615      1  violated:Exclusive                    violated:Exclusive                    yes
+M_full_no_leaf_fence              1987        828      1  violated:Exclusive                    violated:Exclusive                    yes
+M_full_no_monitor_fence           1677        723      1  violated:Exclusive                    violated:Exclusive                    yes
+F_fail                         2897472     801471     10  pass                                  pass                                  yes
+W_fence_failed                     334        160      1  violated:NoFenceFailed                violated:NoFenceFailed                yes
+M_fail_takes                      2557       1031      2  violated:Exclusive                    violated:Exclusive                    yes
+L_two                          1777814     471826      7  pass                                  pass                                  yes
+D_two                          4168800    1039956     14  pass                                  pass                                  yes
+R_seqcst                            25         19      1  pass                                  pass                                  yes
+M_retarget_relaxed                  99         52      1  violated:WokenPolled                  violated:WokenPolled                  yes
+W_old_wake                          12         11      1  violated:NoOldWake                    violated:NoOldWake                    yes
+T_safe                              69         44      1  pass                                  pass                                  yes
+M_late_ref                          25         20      1  violated:NoLoss                       violated:NoLoss                       yes
+M_keep_ref                          10          9      0  violated:RefsHeld                     violated:RefsHeld                     yes
+W_take                               9          8      2  violated:NoTake                       violated:NoTake                       yes
+W_failed_take                       10          9      1  violated:NoFailedTake                 violated:NoFailedTake                 yes
+M_life_stored                       64         43      1  violated:LifeTrue                     violated:LifeTrue                     yes
+M_back_after_home                   20         16      1  violated:LifeMeansBlocked             violated:LifeMeansBlocked             yes
+W_back_first                        15         12      1  violated:NoBackFirst                  violated:NoBackFirst                  yes
+A_safe                             171         86      1  pass                                  pass                                  yes
+M_no_backout_ring                  151         78      1  violated:Watched                      violated:Watched                      yes
+M_no_wake_ring                     160         80      1  violated:Watched                      violated:Watched                      yes
+M_no_second_look                   142         73      1  violated:Watched                      violated:Watched                      yes
+W_backout_asleep                    50         31      1  violated:NoBackOutAsleep              violated:NoBackOutAsleep              yes
+
+results matching EXPECTED.txt: 55 of 55
+
+Added and rechecked since, run locally on 2026-11-03, one worker each, at the lowest priority on a
+shared host: a take with no spare waiting, two limits of the rescue, the store-buffer mutations of
+Asleep.tla and the signal's reuse (SignalReuse.tla). These times replace any above. The rest of the
+family was not rerun as a whole: D_safe (286951 distinct), N_safe (283406), L_rescue (120736),
+H_safe (4903665), H_rescue (40251), M_no_fence, W_handoff and M_owner_skips_running were rerun and
+keep the state counts of the model before these changes, run the same day.
+
+configuration                 generated   distinct    sec  result                                expected                              match
+G_wait                          301627      86676     21  pass                                  pass                                  yes
+G_wait_spare                     49613      15476      5  pass                                  pass                                  yes
+M_start_drops_gift               35161      11477      4  violated:Rescued                      violated:Rescued                      yes
+W_inside_block                      21         12      1  violated:Rescued                      violated:Rescued                      yes
+M_hook_blocks                     1435        551      2  violated:Rescued                      violated:Rescued                      yes
+A_safe                             171         86      1  pass                                  pass                                  yes
+M_no_backout_ring                  151         78      1  violated:Watched                      violated:Watched                      yes
+M_no_wake_ring                     160         80      0  violated:Watched                      violated:Watched                      yes
+M_no_second_look                   142         73      1  violated:Watched                      violated:Watched                      yes
+W_backout_asleep                    50         31      1  violated:NoBackOutAsleep              violated:NoBackOutAsleep              yes
+M_asleep_look_first                174         91      1  violated:Watched                      violated:Watched                      yes
+M_backout_look_first               244        125      1  violated:Watched                      violated:Watched                      yes
+SR_safe                            101         63      1  pass                                  pass                                  yes
+MS_reuse_held                       22         17      1  violated:NoStaleWake                  violated:NoStaleWake                  yes
+MS_reuse_moved_kept                 20         15      1  violated:WakesItsShard                violated:WakesItsShard                yes
+SR_moved_unchecked                 101         63      0  pass                                  pass                                  yes
+SR_keep_unguarded                  101         63      1  pass                                  pass                                  yes

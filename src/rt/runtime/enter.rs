@@ -31,6 +31,8 @@ impl fmt::Display for RuntimeId {
 /// It stays on the thread that made it.
 #[must_use = "the runtime is set only while the guard lives"]
 pub struct EnterGuard<'a> {
+    // Dropped first: the mark names the runtime `_set` holds.
+    _served: context::ServedMark,
     _set: context::RuntimeSet,
     _runtime: PhantomData<&'a ()>,
     _not_send: PhantomData<*const ()>,
@@ -66,8 +68,11 @@ impl fmt::Display for TryCurrentError {
 impl std::error::Error for TryCurrentError {}
 
 fn enter(inner: &Arc<Inner>) -> EnterGuard<'_> {
+    crate::buf::serve_with_cap(inner.buffer_cap);
+    let set = context::set_runtime(inner);
     EnterGuard {
-        _set: context::set_runtime(inner),
+        _served: context::ServedMark::new(set.previous()),
+        _set: set,
         _runtime: PhantomData,
         _not_send: PhantomData,
     }
@@ -102,6 +107,7 @@ impl Runtime {
         self.inner.workers.stop_all();
         // Detached: dropping the handles does not wait. `Drop` finds none
         // left to join, and no lingering to wait for.
+        drop(self.inner.workers.take_monitor());
         drop(self.inner.workers.take_threads());
         lingering.end();
     }
@@ -132,8 +138,13 @@ impl RuntimeHandle {
 
 /// The index of the worker this code runs on (0, 1, ... among the workers
 /// of its runtime), `None` off the workers (in `block_on`'s own thread, on
-/// the blocking pool, outside any runtime).
+/// the blocking pool, outside any runtime). The rest of a poll whose
+/// worker's shard the handoff moved to another thread still answers that
+/// worker.
 pub fn worker_index() -> Option<usize> {
     let runtime = context::runtime()?;
-    context::current(|shard| shard.and_then(|shard| shard.worker_index(runtime.id)))
+    context::current(|shard| match shard {
+        Some(shard) => shard.worker_index(runtime.id),
+        None => context::lost_shared(|lost| lost.and_then(|s| s.counters.worker_of(runtime.id))),
+    })
 }

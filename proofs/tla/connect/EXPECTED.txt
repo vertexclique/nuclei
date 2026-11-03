@@ -6,3 +6,12 @@ M_no_retry        Connect   violated:NoWouldBlock
 M_fresh           Connect   violated:OwnSocket
 M_no_restart      Connect   violated:OkMeansQueued
 W_retried         Connect   violated:NeverRetried
+T_readiness       TcpConnect   pass
+T_ring            TcpConnect   pass
+T_ring_moves      TcpConnect   pass
+T_ring_drops      TcpConnect   pass
+T_port            TcpConnect   pass
+MT_ealready_error TcpConnect   violated:OneResult
+MT_no_wake        TcpConnect   violated:Termination
+MT_cancel_forgets_dial TcpConnect violated:Termination
+WT_redial_already TcpConnect   violated:NoAlready

@@ -469,6 +469,7 @@ mod tests {
     /// shard runs included.
     #[cfg(all(target_os = "linux", feature = "iouring"))]
     #[test]
+    #[cfg_attr(miri, ignore = "probes the kernel for io_uring")]
     fn the_probe_decides_auto_on_this_machine() {
         let available = super::usable().is_ok();
         assert_eq!(

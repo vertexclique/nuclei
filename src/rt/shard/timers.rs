@@ -4,8 +4,10 @@
 //! path's part in a paused clock (publishing the earliest deadline, trying
 //! the jump, waiting for one in progress).
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
+use core::task::Waker;
 use std::time::{Duration, Instant};
+use std::vec::Drain;
 
 use super::Shard;
 use crate::sync::internal::Ordering;
@@ -42,7 +44,7 @@ impl Shard {
     }
 
     /// The microsecond wheel's time now, rounded down as `wheel_now`.
-    fn precise_now(&self) -> u64 {
+    pub(super) fn precise_now(&self) -> u64 {
         units(crate::time::clock::now_nanos(), MICROS, false)
     }
 
@@ -58,9 +60,14 @@ impl Shard {
         let fine = if precise.armed() == 0 {
             None
         } else {
-            precise
+            let own = precise
                 .next_deadline()
-                .map(|us| self.epoch + Duration::from_micros(us))
+                .map(|us| self.epoch + Duration::from_micros(us));
+            // Armed here, or counted for the wheels kept aside (`foreign`).
+            match (own, self.side_deadline()) {
+                (Some(own), Some(side)) => Some(own.min(side)),
+                (own, side) => own.or(side),
+            }
         };
         match (coarse, fine) {
             (Some(coarse), Some(fine)) if fine < coarse => Some((fine, true)),
@@ -112,7 +119,18 @@ impl Shard {
         let now = inner.clock.now();
         if !inner.clock.is_paused() {
             let wait = next.map(|at| at.saturating_duration_since(now));
-            self.arm_precise(parking, earliest, wait);
+            // The poller's own timer counts the system's time, so it is given
+            // the deadline as the system sees it: an advance moves that, the
+            // deadline on the clock staying, and the timer is armed again
+            // (proofs/tla/precise, `M_key_on_clock`).
+            let system = earliest.zip(wait).map(|((at, precise), wait)| {
+                let at = inner
+                    .clock
+                    .system_instant(at)
+                    .unwrap_or_else(|| Instant::now() + wait);
+                (at, precise)
+            });
+            self.arm_precise(parking, system, wait);
             return wait;
         }
         if next.is_some_and(|at| at <= now) {
@@ -157,10 +175,22 @@ impl Shard {
     /// Fires the due timers from inside a task's poll (`time::advance`): the
     /// tasks they wake go to the queue in deadline order, ahead of a task
     /// that yields next, and not to the LIFO slot.
+    ///
+    /// The caller is the one that called the wakers: a waker that panics
+    /// does so out of this call, after every fired timer was woken.
     pub(crate) fn fire_timers_now(&self) {
-        crate::rt::context::with_in_task(false, || self.fire_timers());
+        crate::rt::context::with_in_task(false, || {
+            if let Some(panic) = crate::rt::caught::catch(|| self.fire_armed_timers()) {
+                // It reaches the caller, so the worker's loop has nothing to log.
+                FIRE_PANIC.set(false);
+                std::panic::resume_unwind(panic);
+            }
+        });
     }
 
+    /// Fires the due timers from the run loop. A waker that panics there
+    /// unwinds out of the loop after every fired timer was woken; the
+    /// worker's run catches it (`take_fire_panic`) and goes on.
     #[inline]
     pub(super) fn fire_timers(&self) {
         if self.shared.timer_ops.is_empty()
@@ -174,10 +204,7 @@ impl Shard {
 
     fn fire_armed_timers(&self) {
         if !self.shared.timer_ops.is_empty() {
-            let mut wheel = self.wheel.borrow_mut();
-            self.shared
-                .timer_ops
-                .take_all(|op| op.apply(self, &mut wheel));
+            self.apply_timer_ops();
         }
         if self.precise.borrow().armed() != 0 {
             self.fire_precise();
@@ -190,9 +217,51 @@ impl Shard {
         // while the wakers run (a wake may arm a timer again).
         let mut fired = self.fired.take();
         self.wheel.borrow_mut().advance(now, &mut fired);
-        for waker in fired.drain(..) {
+        self.wake_fired(fired);
+    }
+
+    /// Applies the timer changes other threads posted. The wakers they
+    /// remove are dropped, and the ones of timers already due are woken,
+    /// after the wheel is let go: both are user code.
+    fn apply_timer_ops(&self) {
+        // The posted changes belong to the wheels of the runtime the shard
+        // serves, which are not in place while a nested future of another is
+        // polled: they wait for the loop's next look.
+        if self.foreign_poll.get() {
+            return;
+        }
+        let mut fired = self.fired.take();
+        let mut removed = Vec::new();
+        {
+            let mut wheel = self.wheel.borrow_mut();
+            self.shared
+                .timer_ops
+                .take_all(|op| removed.extend(op.apply(self, &mut wheel, &mut fired)));
+        }
+        let dropped = if removed.is_empty() {
+            None
+        } else {
+            crate::rt::caught::catch(|| drop(removed))
+        };
+        self.wake_fired(fired);
+        if let Some(panic) = dropped {
+            FIRE_PANIC.set(true);
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Wakes the fired wakers in order, and keeps the emptied buffer for the
+    /// next fire. A waker that panics does not leave the rest unwoken (their
+    /// timers are gone from the wheel, so nothing else would wake them): the
+    /// guard wakes them and the panic goes on.
+    #[inline(always)]
+    pub(super) fn wake_fired(&self, mut fired: Vec<Waker>) {
+        let mut rest = Firing(fired.drain(..));
+        for waker in rest.0.by_ref() {
             waker.wake();
         }
+        // Fully drained: the vector is empty and the guard has nothing to do.
+        core::mem::forget(rest);
         self.fired.replace(fired);
     }
 
@@ -203,9 +272,50 @@ impl Shard {
         let now = self.precise_now();
         let mut fired = self.fired.take();
         self.precise.borrow_mut().advance(now, &mut fired);
-        for waker in fired.drain(..) {
-            waker.wake();
+        self.wake_fired(fired);
+        if !self.side.borrow().is_empty() {
+            self.fire_side();
         }
-        self.fired.replace(fired);
+    }
+}
+
+thread_local! {
+    /// Set when a timer's waker panicked as it fired on this thread's loop.
+    static FIRE_PANIC: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the panic the worker's run just caught came from a timer's waker
+/// firing, which it logs and goes on from; clears the mark.
+pub(super) fn take_fire_panic() -> bool {
+    FIRE_PANIC.replace(false)
+}
+
+/// Whether the mark is set (tests).
+#[cfg(test)]
+pub(crate) fn fire_panic_set() -> bool {
+    FIRE_PANIC.get()
+}
+
+/// Guard of a `block_on`, forgotten on its normal path: an unwind out of it
+/// reaches a caller, not the worker's run, so the mark of a timer's panic
+/// goes with it.
+pub(super) struct ClearOnUnwind;
+
+impl Drop for ClearOnUnwind {
+    fn drop(&mut self) {
+        FIRE_PANIC.set(false);
+    }
+}
+
+/// The wakers still to wake. Only an unwind drops it with some left (a wake
+/// panicked): it wakes them, each guarded against a second panic.
+struct Firing<'a>(Drain<'a, Waker>);
+
+impl Drop for Firing<'_> {
+    fn drop(&mut self) {
+        FIRE_PANIC.set(true);
+        for waker in self.0.by_ref() {
+            crate::sync::internal::during_unwind(|| waker.wake());
+        }
     }
 }

@@ -1,14 +1,21 @@
 ----------------------------- MODULE SideBiased -----------------------------
 (***************************************************************************)
-(* The side guard biased to its owner (Phase 2 of the network-path plan),  *)
-(* on a machine whose stores wait in a store buffer, as x86's do. No code  *)
-(* is written yet; the planned code is src/io/side.rs: `Side::try_hold`    *)
-(* and `Side::poll` (the takes), `Side::contend` (the poll that finds the  *)
-(* side held), `Side::defer` and `Side::take_for_request` (the calls that  *)
-(* leave DEFER and REQ), `Held::release_or_again` (the release); the     *)
-(* fence is `heavy` in src/rt/handoff/fence.rs; the shard's move is        *)
+(* The side guard biased to its owner, on a machine whose stores wait in a *)
+(* store buffer, as x86's do (src/io/side.rs: `Side::role`, `Side::claim`, *)
+(* `Side::try_biased`, `Side::take_foreign` and `Side::poll` (the takes),  *)
+(* `Side::contend` (the poll that finds the side held), `Side::defer` and  *)
+(* `Side::take_for_request` (the calls that leave DEFER and REQ),          *)
+(* `Held::release_or_again` and `Side::release_biased` (the releases),    *)
+(* `Side::unserved`, `Side::none_holds_biased`, `Side::claim_given_up`    *)
+(* and `Side::leave_waker` (a foreign call whose fence failed),            *)
+(* `Side::give_up` (the claimant letting go of its claim, called from     *)
+(* `Source::give_up_claims` in src/io/source/requests.rs as its shard     *)
+(* lets go of the source, src/rt/shard/going.rs); the fence is            *)
+(* `heavy_retried` in src/rt/handoff/fence.rs; the shard's move is         *)
+(* Who the owner is (`Side::claim`, `SourceHooks::owner`) is also       *)
+(* checked in Claim.tla.                                                   *)
 (* `Slot::claim`, `Slot::take` and `Slot::come_back` in                    *)
-(* src/rt/handoff/slot.rs, driven by src/rt/handoff/monitor.rs.            *)
+(* src/rt/handoff/slot.rs, driven by src/rt/handoff/monitor.rs).           *)
 (*                                                                          *)
 (* Who acts. A socket's side has an owner: the thread running the socket's *)
 (* home shard. The owner serves the driver's edges (completions) and most  *)
@@ -56,6 +63,21 @@
 (* release, switches the side to shared when it sees UNFENCED            *)
 (* (`Side::switch_if_unfenced`), so the woken poll takes through the word. *)
 (*                                                                          *)
+(* The claimant may never take the side again. Its shard may let go of the *)
+(* source for good (`ClaimStops`: a thread's own shard whose `block_on`    *)
+(* returned, a worker that went): it then gives its claim up, after its   *)
+(* last hold, with a locked instruction, and looks once more for work a   *)
+(* fenceless call left before it saw that, which it does through the word *)
+(* (`give_up`). A fenceless call that finds the claim given up takes the  *)
+(* side itself; one that left its work looks at the claim, and the mode   *)
+(* (the claimant may have switched it as it let go, and looked for work   *)
+(* then), again after a full fence of its own (`claim_given_up`), so one  *)
+(* of the two looks sees the other's store. Or the source may be homed elsewhere while the       *)
+(* claimant's thread still runs it (`Rehomed`): the claimant's own calls   *)
+(* are then foreign ones, and when its fence fails it reads its own `own`, *)
+(* which needs no fence, holds nothing, and takes the side itself rather   *)
+(* than leave its work to itself (`none_holds_biased`).                    *)
+(*                                                                          *)
 (* What must never happen. Two threads hold the side at once. Work a       *)
 (* foreign call left (a waiting poll, a DEFER, a REQ, an edge's READY) is  *)
 (* never done. A thread waits for another other than by sleeping until it *)
@@ -90,6 +112,8 @@ CONSTANTS                                                                    \* 
     Handoffs,   \* 0, or 1 when the monitor may move the home shard once
     FenceFails, \* "never", "maybe" (each foreign call's heavy fence may fail) or "always"
     OldCalls,   \* the calls the first owner makes once it is a foreign thread
+    ClaimStops, \* TRUE: the claimant's shard lets go of the source for good after its edges, and runs nothing after
+    Rehomed,    \* TRUE: the source is homed elsewhere, the claimant's thread still runs it: its calls are foreign ones
     Mutation    \* "none", or the name of the one rule this run takes away
 
 First == 1          \* the thread that runs the home shard first
@@ -128,7 +152,8 @@ variables                                                                    \* 
     buf = [t \in Threads |-> <<>>],         \* each thread's store buffer, oldest first, of <<word, value>> pairs
     intent = 0,                             \* the foreign word: only locked instructions write it, so it is never buffered
     unfenced = FALSE,                       \* intent's UNFENCED bit: a foreign call's heavy fence failed
-    ownerClaim = "none",                    \* the owner's claim of the side: "none", "cas" (won, shard not recorded), "cell"
+    ownerClaim = IF Rehomed THEN "cell" ELSE "none",   \* the owner's claim: "none", "cas" (won, shard not recorded), "cell",
+                                            \* "left" (given up); a source homed elsewhere was claimed before it moved
     nudges = 0,                             \* nudges posted to the owner's shard and not served yet
     busy = FALSE,                           \* today's flag word, written only by locked instructions: BUSY ...
     ready = FALSE,                          \* ... READY, an edge came while a holder held the word ...
@@ -154,7 +179,9 @@ variables                                                                    \* 
     unservedSeen = FALSE,                   \* (record) a foreign call's fence failed with an owner claimed
     failShared = FALSE,                     \* (record) a foreign call's fence failed with no owner claimed: shared
     nudgePass = FALSE,                      \* (record) the owner took the side for a nudge
-    switchedUnfenced = FALSE;               \* (record) the owner switched the side on UNFENCED
+    switchedUnfenced = FALSE,               \* (record) the owner switched the side on UNFENCED
+    leftShard = FALSE,                      \* the claimant's shard let go of the source for good
+    givenUpSeen = FALSE;                    \* (record) a fenceless call found the claim given up and took the side
 
 define                                                                       \* names the code and the properties use:
     \* Every thread and the monitor finished.
@@ -257,8 +284,10 @@ O_out:                                                                       \* 
     \* its slot (`Slot::come_back`), for an edge or a nudge.
     \* (With fences that never fail no nudge comes, and the owner is finished after its edges.)
     await claim[self] = TAKEN \/ edgesLeft > 0 \/ nudges > 0                \* work, its shard taken,
-          \/ CallersDone \/ FenceFails = "never";                            \* or no nudge can come
+          \/ CallersDone \/ FenceFails = "never" \/ ClaimStops;              \* no nudge can come, or the shard goes
     if claim[self] = TAKEN then goto F_loop;                                 \* its shard was taken: a foreign thread from now on
+    elsif leftShard then goto Done;                                          \* its shard let go of the source: it runs nothing more
+    elsif ClaimStops /\ edgesLeft = 0 then goto O_leave;                     \* its edges done, the shard lets go of the source for good
     elsif edgesLeft = 0 /\ nudges = 0 then goto Done;                        \* nothing left and no nudge to come: finished
     else                                                                     \* back in:
         if claim[self] = PENDING then claim[self] := NONE; end if;           \* a pending claim is cancelled first
@@ -268,8 +297,15 @@ O_out:                                                                       \* 
         else                                                                 \* else an edge:
             edgesLeft := edgesLeft - 1;                                      \* begun
         end if;                                                              \* either takes the side like an edge
-        dirty := TRUE;                                                       \* it brought work for the driver's part
-        role := "owner";                                                     \* and runs the owner's code
+        if Rehomed then                                                      \* the source is homed elsewhere: the claimant's call is a foreign one,
+            role := "rehomed";                                               \* with no driver's part (the home's driver serves the edges);
+            kind := "defer";                                                 \* a take and a release, leaving its own bit
+            fresh[self] := TRUE;                                             \* a new take
+            goto F_mode;                                                     \* the foreign take (back here once done, `F_next`)
+        else                                                                 \* else its owner's take,
+            dirty := TRUE;                                                   \* which brought work for the driver's part,
+            role := "owner";                                                 \* and runs the owner's code
+        end if;                                                              \* the call begins
     end if;                                                                  \* the owner is inside its shard
 O_mode:                                                                      \* the owner's take: mode
     \* The owner's take (`Side::try_hold`, `Side::poll`): a plain load of mode first.
@@ -359,6 +395,31 @@ O_claim:                                                                     \* 
 O_cell:                                                                      \* the claim's shard recorded (`claimed`)
     ownerClaim := "cell";                                                    \* a nudge can reach it from now on
     goto O_own;                                                              \* then the biased take
+O_leave:                                                                     \* the shard lets go of the source (`Side::give_up`), holding nothing
+    \* A side gone shared still has its look: a fenceless call may have left work before the switch.
+    \* MUTATION claim_kept: the claim stays as the shard goes, as before the fix.
+    if Mutation = "claim_kept" then                                          \* (mutated)
+        leftShard := TRUE;                                                   \* the shard runs nothing more
+        goto Done;                                                           \* finished
+    end if;                                                                  \* else the claim goes
+O_tag:                                                                       \* the compare-and-swap of the owner word, locked:
+    Lock();                                                                  \* its buffer, `own := 0` in it, drains first
+    ownerClaim := "left";                                                    \* the claim is given up
+O_llook:                                                                     \* a full fence, then a look at the word
+    \* MUTATION leave_no_look: the claimant gives its claim up and looks for no work left before it.
+    Lock();                                                                  \* the full fence
+    if Mutation = "leave_no_look" \/ ~Flagged then                          \* nothing to do:
+        leftShard := TRUE;                                                   \* the shard runs nothing more
+        goto Done;                                                           \* finished
+    end if;                                                                  \* work a fenceless call left: done here, through the word
+O_lswitch:                                                                   \* shared first
+    Store("mode", "shared");                                                 \* mode := shared, a plain store
+O_ltake:                                                                     \* today's take
+    Lock();                                                                  \* a locked instruction
+    leftShard := TRUE;                                                       \* (the shard runs nothing after this)
+    if busy then goto Done;                                                  \* held: the holder does the work as it lets go
+    else busy := TRUE; role := "leave"; goto X_cas;                          \* free: the work is done here
+    end if;                                                                  \* the leave is over
 F_loop:                                                                      \* a foreign thread's next call
     if todo[self] = <<>> then goto Done;                                     \* no call left: finished
     else                                                                     \* the next call:
@@ -403,7 +464,7 @@ F_take:                                                                      \* 
     elsif kind = "req" then req := TRUE;                                     \* a request's REQ too
     end if;                                                                  \* (a poll raises no flag)
     if ~busy then busy := TRUE; goto F_step;                                 \* free: the thread holds the side
-    elsif kind # "poll" then goto F_loop;                                    \* held: the flag is the holder's work, and the call goes on
+    elsif kind # "poll" then goto F_next;                                    \* held: the flag is the holder's work, and the call goes on
     end if;                                                                  \* held, for a poll: it contends
 F_reg:                                                                       \* today's contended poll: its waker
     \* Held (today's `Side::contend`): the waker joins the contended set.
@@ -436,15 +497,21 @@ F_lflag:                                                                     \* 
 F_lrecheck:                                                                  \* the look once more at own
     \* As today's poll looks once more: free now, it takes the side; held, the holder does the work.
     if ~prevBusy /\ ReadAt(mem, buf[self], "own") = 0 then goto F_switch;    \* a plain load of own: 0, the side came free
-    elsif kind # "poll" then goto F_loop;                                    \* held: a defer or a request goes on
+    elsif kind # "poll" then goto F_next;                                    \* held: a defer or a request goes on
     else goto F_park;                                                        \* held: a poll sleeps
     end if;                                                                  \* the leave is over
 F_unserved:                                                                  \* a failed fence (`Side::unserved`): the claim
     Lock();                                                                  \* a full fence of this thread's own
-    if ownerClaim = "none" then                                              \* no owner claimed: none holds biased,
+    \* `none_holds_biased`: no claim; the claim given up; or this thread runs the claimant shard and its own `own`,
+    \* which needs no fence, says it holds nothing.
+    \* MUTATION self_nudge: the claimant's own call with the source homed elsewhere leaves its work to itself.
+    if ownerClaim \in {"none", "left"}                                       \* no live claim,
+       \/ (self = owner /\ ReadAt(mem, buf[self], "own") = 0                 \* or the claimant's own thread, holding nothing,
+           /\ Mutation # "self_nudge") then                                  \* (unless mutated)
+        if ownerClaim = "left" then givenUpSeen := TRUE; end if;             \* (record)
         failShared := TRUE;                                                  \* (record)
-        goto F_switch;                                                       \* so the side goes shared, through the word
-    end if;                                                                  \* an owner claimed: its work is left
+        goto F_switch;                                                       \* the side goes shared, through the word
+    end if;                                                                  \* a live claim: its work is left
 F_unfence:                                                                   \* UNFENCED up
     Lock();                                                                  \* a locked fetch_or of intent's UNFENCED bit
     unfenced := TRUE;                                                        \* the owner switches when it sees it
@@ -460,12 +527,22 @@ F_uflag:                                                                     \* 
     elsif kind = "defer" then defer := TRUE;                                 \* DEFER for a defer,
     else req := TRUE;                                                        \* REQ for a request
     end if;                                                                  \* left for the owner
+F_urecheck:                                                                  \* `claim_given_up`: a full fence, then the claim and the mode again
+    \* A claimant that gave its claim up, or switched the side as it let go, may have looked for work before this
+    \* flag was left; in shared mode none holds biased, so the call takes the word as any other.
+    \* MUTATION no_recheck_claim: the call does not look at the claim or the mode again.
+    Lock();                                                                  \* the full fence
+    if (ownerClaim = "left" \/ ReadAt(mem, buf[self], "mode") = "shared")   \* given up, or shared, meanwhile:
+       /\ Mutation # "no_recheck_claim" then
+        if ownerClaim = "left" then givenUpSeen := TRUE; end if;             \* (record)
+        goto F_switch;                                                       \* the call takes the side itself, shared first
+    end if;                                                                  \* else the claimant is asked
 F_nudge:                                                                     \* the nudge
     \* MUTATION nudge_lost: the nudge never reaches the owner's shard.
     if ownerClaim = "cell" /\ Mutation # "nudge_lost" then                  \* the claim's shard is recorded:
         nudges := nudges + 1;                                                \* it is asked to take and let go of the side
     end if;                                                                  \* (a claimant not recorded yet takes it next anyway)
-    if kind # "poll" then goto F_loop; end if;                               \* a defer or a request goes on; a poll sleeps
+    if kind # "poll" then goto F_next; end if;                               \* a defer or a request goes on; a poll sleeps
 F_park:                                                                      \* asleep until woken
     \* The poll returned Pending: the thread sleeps until a holder wakes it.
     await self \in woken;                                                    \* a wake came
@@ -480,6 +557,8 @@ F_brel:                                                                      \* 
     Lock();                                                                  \* (mutated) it lets go by clearing intent
     intent := 0;                                                             \* with a locked store
     goto F_loop;                                                             \* and the call is finished
+F_next:                                                                      \* a call that goes on: the claimant's own back outside
+    if role = "rehomed" then goto O_out; else goto F_loop; end if;          \* (`O_out`), any other's to its next call
 X_cas:                                                                       \* today's release: the compare-and-swap
     \* Today's release: one compare-and-swap from BUSY to zero; flags left meanwhile make it fail.
     Lock();                                                                  \* a locked instruction
@@ -506,7 +585,8 @@ X_after:                                                                     \* 
     woken := woken \cup owed;                                                \* let go: the taken wakers are woken
     owed := {};                                                              \* and forgotten
     retaking := FALSE;                                                       \* a release's retake is over too
-    if role = "owner" then goto O_out;                                       \* the owner's edge is finished
+    if role \in {"owner", "rehomed"} then goto O_out;                        \* the owner's edge is finished
+    elsif role = "leave" then goto Done;                                     \* the shard that let go runs nothing more
     else goto F_loop;                                                        \* the foreign call is finished
     end if;                                                                  \* back to the caller's code
 end process;                                                                 \* end of a thread
@@ -573,4 +653,6 @@ NoUnserved == ~(unservedSeen /\ switchedUnfenced)                            \* 
 NoFailShared == ~failShared                                                  \* never shared for a failed fence
 \* The owner takes the side for a nudge.
 NoNudgePass == ~nudgePass                                                    \* never nudged
+\* A fenceless call finds the claim given up and takes the side itself.
+NoGivenUp == ~givenUpSeen                                                    \* never seen
 =============================================================================

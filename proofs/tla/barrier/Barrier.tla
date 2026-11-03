@@ -1,7 +1,8 @@
 ------------------------------- MODULE Barrier -------------------------------
 (***************************************************************************)
-(* The reusable barrier (src/sync/barrier.rs, on the drain role of        *)
-(* src/sync/queue.rs), at the grain of its atomic steps.                   *)
+(* The reusable barrier (src/sync/barrier.rs: `Barrier::arrive`,         *)
+(* `Policy::pass` for `Barrier`, `BarrierWait::poll` and its drop, on the  *)
+(* drain role of src/sync/queue.rs), at the grain of its atomic steps.     *)
 (*                                                                          *)
 (* In plain words: every arrival ever is counted with one fetch_add.       *)
 (* Arrival i belongs to generation i / N, and the one with i % N = N - 1   *)
@@ -10,7 +11,9 @@
 (* pass reads the current generation (from the count) after it took the   *)
 (* arrivals, grants every queued waiter of an older generation and every   *)
 (* arrival of one, and queues the rest. A wait dropped before it completes *)
-(* stays counted; only its node goes.                                      *)
+(* stays counted; only its node goes. A leader's finished wait may be     *)
+(* polled again (safe code can do it); it is fused, so that poll is ready  *)
+(* at once and counts no second arrival.                                   *)
 (*                                                                          *)
 (* What is modelled step by step: the arrival count, the state word's      *)
 (* QUEUED and the drain role's bits, the arrival stack and the waiting     *)
@@ -35,7 +38,8 @@ GenOf(a) == a \div N
 
 (* --algorithm Barrier
 variables
-    count = 0,           \* arrivals ever
+    count = 0,           \* arrivals ever, as the code counts them
+    phantom = 0,         \* (record) arrivals the count holds that no wait made: re-polls of a finished leader
     queuedBit = FALSE,
     draining = FALSE,
     dirty = FALSE,
@@ -49,9 +53,12 @@ variables
     enqueued = [r \in Reqs |-> FALSE],
     dropped = [r \in Reqs |-> FALSE],   \* the wait's future was dropped
     \* records
-    early = FALSE;       \* a wait completed before its generation did
+    early = FALSE;       \* a wait completed before its generation had every real arrival
 
 define
+    \* With c arrivals counted, ph of them phantoms, generation g has every real arrival: N of
+    \* them per generation, made by waits. (A step passes the count it just wrote.)
+    RealComplete(g, c, ph) == c - ph >= (g + 1) * N
     \* A wait completes only once its generation has every arrival.
     NoEarlyRelease == ~early
     \* One leader per generation.
@@ -115,11 +122,13 @@ D_end:
 end procedure;
 
 fair process task \in Tasks
-variables j = 1, me = NoReq, a = 0, claimed = FALSE;
+variables j = 1, me = NoReq, a = 0, claimed = FALSE, again = FALSE;
 begin
 T_wait:
     while j <= Rounds[self] do
         me := <<self, j>>;
+        \* This wait has not been polled after it completed.
+        again := FALSE;
 T_arrive:
         \* One fetch_add: the arrival's generation, and whether it completes it.
         a := count;
@@ -128,6 +137,8 @@ T_arrive:
         if a % N = N - 1 then
             leader[me] := TRUE;
             done[me] := TRUE;
+            \* A leader completes its generation: early only if a phantom stands in for a real arrival.
+            early := early \/ ~RealComplete(GenOf(a), count, phantom);
             goto T_leadTr;
         end if;
 T_enqueue:
@@ -147,7 +158,7 @@ T_park:
         end if;
 T_sleep:
         await phase[me] = "granted";
-        early := early \/ count < (gen[me] + 1) * N;
+        early := early \/ ~RealComplete(gen[me], count, phantom);
         done[me] := TRUE;
         goto T_next;
 T_drop:
@@ -176,6 +187,22 @@ T_leadTr:
 T_leadDrain:
         if claimed then
             call Drain();
+        end if;
+T_repoll:
+        \* The leader's finished wait is polled once more (`BarrierWait::poll` on `Arrival::Led`):
+        \* ready at once, counting nothing. MUTATION leader_unfused: the wait keeps no mark that
+        \* it led, so the poll arrives again, a phantom in the count; if that phantom completes
+        \* a generation, it asks for the pass as a leader does.
+        if ~again then
+            again := TRUE;                  \* the one poll after completion is this one
+            if Mutation = "leader_unfused" then
+                a := count;                 \* the phantom's place in the count
+                count := count + 1;         \* the fetch_add of an arrival no wait makes
+                phantom := phantom + 1;     \* (record) one more arrival that is not real
+                if a % N = N - 1 then
+                    goto T_leadTr;          \* the phantom completed a generation: it asks for the pass
+                end if;
+            end if;
         end if;
 T_next:
         j := j + 1;

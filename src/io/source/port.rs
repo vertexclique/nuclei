@@ -48,12 +48,13 @@ use crate::io::sys;
 use crate::rt::counters::{IoKind, tally};
 use crate::rt::park::iocp::{JOB, Port};
 use crate::syscore::windows::{
-    CancelIoEx, CancelSynchronousIo, DUPLICATE_SAME_ACCESS, DWORD, DuplicateHandle,
-    ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, GetCurrentProcess,
-    GetCurrentThread, GetLastError, HANDLE, MSG_PEEK, OVERLAPPED, OVERLAPPED_ENTRY,
-    PostQueuedCompletionStatus, ReadFile, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-    WSA_OPERATION_ABORTED, WSABUF, WSAESHUTDOWN, WSARecv, WSARecvFrom, WSASend, WSASendTo,
-    WriteFile, status_error, winsock,
+    AFD_POLL_HANDLE_INFO, AFD_POLL_INFO, AFD_POLL_LOCAL_CLOSE, AFD_POLL_SEND, CancelIoEx,
+    CancelSynchronousIo, DUPLICATE_SAME_ACCESS, DWORD, DuplicateHandle, ERROR_BROKEN_PIPE,
+    ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, GetCurrentProcess, GetCurrentThread,
+    GetLastError, HANDLE, IO_STATUS_BLOCK, IOCTL_AFD_POLL, MSG_PEEK, NtDeviceIoControlFile,
+    OVERLAPPED, OVERLAPPED_ENTRY, PostQueuedCompletionStatus, ReadFile, SOCKADDR, SOCKADDR_STORAGE,
+    SOCKET, SOCKET_ERROR, STATUS_PENDING, STATUS_SUCCESS, WSA_OPERATION_ABORTED, WSABUF,
+    WSAESHUTDOWN, WSARecv, WSARecvFrom, WSASend, WSASendTo, WriteFile, status_error, winsock,
 };
 
 /// Room for one address in an `AcceptEx` buffer: the largest address and
@@ -77,6 +78,8 @@ enum PortMem {
     /// A zero-byte receive: it ends once bytes or the end came, and holds
     /// nothing.
     Ready,
+    /// An AFD poll of the socket for room to send: it ends once there is, and holds nothing.
+    PollSend,
     /// A read into the slot's own room.
     RecvRoom,
     /// A send of the bytes `from..to` of the slot's own room.
@@ -106,6 +109,15 @@ pub(crate) struct PortState {
     /// the jobs making its calls hold. Set as the source registers, with
     /// both sides held; read with one.
     sync: UnsafeCell<Option<Arc<OwnedHandle>>>,
+    /// The port the handle's completions go to, with the handle it was bound for (a revival
+    /// brings another, bound nowhere yet): where its operations are issued, its shard's, or, while
+    /// it waits to move (`moving`), the port it could not move off. Written with both sides
+    /// held; read with one.
+    bound: UnsafeCell<Option<(Raw, Arc<Port>)>>,
+    /// The source is registered with a shard whose port its handle could not move to, with an
+    /// operation out that is never cancelled (a TCP send): its operations go to `bound`, whose
+    /// keeper drains it, until none is out and the move is made again (`attach_port`).
+    moving: core::sync::atomic::AtomicBool,
 }
 
 /// A side's operation slot.
@@ -136,6 +148,9 @@ struct Inner {
     accept: [u8; 2 * ACCEPT_ADDR],
     /// How a blocking job's call ended, for its packet.
     job_code: Option<i32>,
+    /// The AFD poll of a send that found no room, which the driver reads and writes until its
+    /// packet.
+    poll: AFD_POLL_INFO,
 }
 
 // SAFETY: a slot is touched by the side's holder before the call, by the
@@ -174,6 +189,16 @@ impl Default for Slot {
                 addr_len: 0,
                 accept: [0; 2 * ACCEPT_ADDR],
                 job_code: None,
+                poll: AFD_POLL_INFO {
+                    Timeout: 0,
+                    NumberOfHandles: 0,
+                    Exclusive: 0,
+                    Handles: [AFD_POLL_HANDLE_INFO {
+                        Handle: core::ptr::null_mut(),
+                        Events: 0,
+                        Status: 0,
+                    }],
+                },
             }),
             job: Job::default(),
         }
@@ -329,7 +354,9 @@ impl<'a> PortIo<'a> {
         match self {
             PortIo::Here { source } => source.home_held().map(|home| PortIssuer {
                 source,
-                port: Arc::clone(home.port()),
+                port: source
+                    .bound_port()
+                    .unwrap_or_else(|| Arc::clone(home.port())),
             }),
             PortIo::NotYet => None,
         }
@@ -453,7 +480,7 @@ impl PortIssuer<'_> {
                 inner.issued_at = None;
             }
             // SAFETY: the call did not take the slot.
-            unsafe { finish(slot, Some(code), 0, None) };
+            unsafe { finish(slot, Some(code), 0, false, None) };
         }
         id
     }
@@ -469,6 +496,9 @@ fn start(
     want: Want,
     datagrams: bool,
 ) -> Result<(), i32> {
+    if let Want::Ready { read: false } = want {
+        return start_poll(inner, ov, socket);
+    }
     let null = core::ptr::null();
     let fail = |inner: &mut Inner, mem: PortMem, err: io::Error| -> Result<(), i32> {
         inner.mem = Some(mem);
@@ -712,6 +742,48 @@ fn start(
     }
 }
 
+/// An AFD poll of `socket` for room to send, with `ov`: what a datagram's send from the task that
+/// found no room (`WSAEWOULDBLOCK`) waits on, as a unix one waits for its edge. The poll's
+/// status lands in the `OVERLAPPED` (an `IO_STATUS_BLOCK` in its first two fields), and the
+/// packet names it, so it comes back as any other operation of the slot does. `Ok`: a packet
+/// will come (the call completes on the socket's port, at once or later).
+fn start_poll(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET) -> Result<(), i32> {
+    inner.poll = AFD_POLL_INFO {
+        Timeout: i64::MAX,
+        NumberOfHandles: 1,
+        Exclusive: 0,
+        Handles: [AFD_POLL_HANDLE_INFO {
+            Handle: socket as HANDLE,
+            Events: AFD_POLL_SEND | AFD_POLL_LOCAL_CLOSE,
+            Status: 0,
+        }],
+    };
+    inner.mem = Some(PortMem::PollSend);
+    let info = core::ptr::from_mut(&mut inner.poll).cast::<c_void>();
+    let len = size_of::<AFD_POLL_INFO>() as u32;
+    // SAFETY: the poll's memory and the OVERLAPPED live in the slot until the packet; the
+    // kernel reads and writes the poll there and its status into the OVERLAPPED.
+    let status = unsafe {
+        NtDeviceIoControlFile(
+            socket as HANDLE,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            ov.cast::<c_void>(),
+            ov.cast::<IO_STATUS_BLOCK>(),
+            IOCTL_AFD_POLL,
+            info,
+            len,
+            info,
+            len,
+        )
+    };
+    match status {
+        STATUS_SUCCESS | STATUS_PENDING => Ok(()),
+        other => Err(crate::syscore::windows::status_error(other)
+            .unwrap_or(crate::syscore::windows::WSAEINVAL)),
+    }
+}
+
 /// The wants that are no stream's: a listener's, a datagram socket's, a
 /// connect.
 enum NotStream {
@@ -945,6 +1017,9 @@ pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY, shard: Option<&crate::rt
     // SAFETY: the caller's: the slot is of a live source (its reference
     // was held for the kernel), and the kernel or the job is done with it.
     let slot = unsafe { &*entry.lpOverlapped.cast::<Slot>().cast_const() };
+    // A datagram cut to its buffer completes as a success with this status (`status_error`).
+    let cut = entry.lpCompletionKey != JOB
+        && entry.Internal as i32 == crate::syscore::windows::STATUS_BUFFER_OVERFLOW;
     let code = if entry.lpCompletionKey == JOB {
         // SAFETY: as above; the job wrote its end before the packet.
         unsafe { (*slot.inner.get()).job_code.take() }
@@ -952,7 +1027,15 @@ pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY, shard: Option<&crate::rt
         status_error(entry.Internal as i32)
     };
     // SAFETY: as above.
-    unsafe { finish(slot, code, entry.dwNumberOfBytesTransferred as usize, shard) };
+    unsafe {
+        finish(
+            slot,
+            code,
+            entry.dwNumberOfBytesTransferred as usize,
+            cut,
+            shard,
+        )
+    };
 }
 
 /// Ends the operation of `slot`, which failed with `code` or ran (`None`)
@@ -966,6 +1049,7 @@ unsafe fn finish(
     slot: &Slot,
     code: Option<i32>,
     bytes: usize,
+    cut: bool,
     shard: Option<&crate::rt::shard::Shard>,
 ) {
     // SAFETY: the caller's: the slot is this thread's until the outcome is
@@ -988,7 +1072,7 @@ unsafe fn finish(
     {
         port.time(kind, at);
     }
-    let outcome = outcome(inner, mem, code, bytes);
+    let outcome = outcome(inner, mem, code, bytes, cut);
     source.op_done(
         Done {
             outcome,
@@ -1001,7 +1085,7 @@ unsafe fn finish(
 
 /// The outcome of an operation on `mem`, from what the kernel left in the
 /// slot.
-fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> Outcome {
+fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize, cut: bool) -> Outcome {
     // Made once: an error is counted as it is made.
     let answer = match mem {
         PortMem::Ready | PortMem::RecvRoom | PortMem::Recv(_) | PortMem::RecvLent(_) => {
@@ -1012,7 +1096,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
     #[cfg(feature = "io-stats")]
     tally_of(&mem, &answer);
     match mem {
-        PortMem::Ready => Outcome::Ready(match answer {
+        PortMem::Ready | PortMem::PollSend => Outcome::Ready(match answer {
             Answer::Done(result) => Answer::Done(result.map(drop)),
             Answer::Undone { not_ready } => Answer::Undone { not_ready },
         }),
@@ -1076,7 +1160,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
                 Answer::Done(Err(err)) => Answer::Done(Err(err)),
                 Answer::Undone { not_ready } => Answer::Undone { not_ready },
             };
-            Outcome::RecvLentFrom(buf, answer)
+            Outcome::RecvLentFrom(buf, answer, cut)
         }
         PortMem::NoAccept => Outcome::Accept(match answer {
             Answer::Done(Ok(_)) => Answer::Done(Err(io::ErrorKind::Other.into())),
@@ -1115,7 +1199,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
 #[cfg(feature = "io-stats")]
 fn io_kind(mem: &PortMem) -> Option<IoKind> {
     match mem {
-        PortMem::Ready => None,
+        PortMem::Ready | PortMem::PollSend => None,
         PortMem::RecvRoom
         | PortMem::Recv(_)
         | PortMem::RecvLent(_)
@@ -1220,9 +1304,16 @@ impl Source {
     /// Registers the source with port shard `shard` under `token`, with
     /// both sides held: its socket's completions go to the shard's port
     /// from now on (moved from a port it had, whose shard went). A handle
-    /// with operations still out cannot move: the registration then waits
-    /// for them to end, and is made again by the tasks they wake (see
-    /// [`waits_for_ops`](Self::waits_for_ops)).
+    /// with operations still out cannot move. If it has a port it is bound
+    /// to, the source is registered with `shard` all the same and its
+    /// operations go on to that port, whose keeper drains it while the
+    /// source waits to move (`moving`): a TCP send there, never cancelled,
+    /// may wait for its peer, and the peer for a read of this source. Once
+    /// none of its operations is out, or its send ended, the source is
+    /// evicted and registered again, and the move is made
+    /// (proofs/tla/port/PortKeep.tla, `Duplex`). With no port yet, the
+    /// registration waits for the operations to end, and is made again by
+    /// the tasks they wake (see [`waits_for_ops`](Self::waits_for_ops)).
     pub(super) fn attach_port(
         &self,
         shard: Arc<crate::rt::shard::Shared>,
@@ -1243,12 +1334,30 @@ impl Source {
                 .map(|()| None),
             _ => shard.port().bind(fd as usize as HANDLE).map(|()| None),
         };
-        let bound = match bind() {
-            Err(_) if self.waits_for_ops() => {
-                self.reg.state.store(super::UNREGISTERED, Ordering::Release);
-                shard.release_source(token);
-                return Ok(());
-            }
+        // The port this handle is bound to, if any (a revival's new handle is bound nowhere).
+        // SAFETY: both sides are held.
+        let old = unsafe { (*self.port.bound.get()).clone() }
+            .filter(|(bound, _)| *bound == fd)
+            .map(|(_, port)| port);
+        // Bound to this shard's port already (its thread's `block_on` again): nothing moves, and
+        // a bind would fail with a send of the handle's still out.
+        let here = old
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, shard.port()));
+        let bound = match if here { Ok(None) } else { bind() } {
+            Err(_) if self.waits_for_ops() => match old {
+                Some(old) if !Arc::ptr_eq(&old, shard.port()) => {
+                    if !self.port.moving.swap(true, Ordering::AcqRel) {
+                        old.wait_for_move();
+                    }
+                    Ok(None)
+                }
+                _ => {
+                    self.reg.state.store(super::UNREGISTERED, Ordering::Release);
+                    shard.release_source(token);
+                    return Ok(());
+                }
+            },
             // None is out (any more): once more, and that answer stands.
             Err(_) => bind(),
             bound => bound,
@@ -1263,7 +1372,18 @@ impl Source {
             }
         };
         // SAFETY: both sides are held.
-        unsafe { *self.port.sync.get() = sync };
+        unsafe {
+            if !self.port.moving.load(Ordering::Acquire) {
+                // The handle's completions go to this shard's port now (a byte stream's calls
+                // made on the pool, to whichever port its packets are posted).
+                let old = (*self.port.bound.get()).replace((fd, Arc::clone(shard.port())));
+                if sync.is_some() {
+                    *self.port.bound.get() = None;
+                }
+                drop(old);
+            }
+            *self.port.sync.get() = sync;
+        }
         self.reg.ops.store(true, Ordering::Release);
         self.reg
             .home
@@ -1275,11 +1395,35 @@ impl Source {
         Ok(())
     }
 
+    /// The port the source's handle is bound to, for its operations; `None` for a handle bound
+    /// nowhere yet. The caller holds a side.
+    fn bound_port(&self) -> Option<Arc<Port>> {
+        let fd = self.fd.load(Ordering::Acquire);
+        // SAFETY: a side is held, so no writer (which holds both) is at work.
+        unsafe { (*self.port.bound.get()).as_ref() }
+            .filter(|(bound, _)| *bound == fd)
+            .map(|(_, port)| Arc::clone(port))
+    }
+
+    /// Whether the source waits to move off the port its handle is bound to (see
+    /// [`attach_port`](Self::attach_port)).
+    pub(super) fn moving(&self) -> bool {
+        self.port.moving.load(Ordering::Acquire)
+    }
+
     /// The source's registration with a port goes: every operation it has
     /// out that may be cancelled is (its packet still comes, wherever the
     /// socket's completions go then); a TCP send goes on (see
     /// [`may_cancel`](Self::may_cancel)). Both sides are held.
     pub(super) fn detach_port(&self) {
+        // A source that waited to move goes: the port it waited on waits for it no more (its
+        // handle stays bound there until a registration moves it).
+        if self.port.moving.swap(false, Ordering::AcqRel)
+            // SAFETY: both sides are held.
+            && let Some((_, old)) = unsafe { (*self.port.bound.get()).as_ref() }
+        {
+            old.moved();
+        }
         // SAFETY: both sides are held; the jobs keep their own copies.
         if unsafe { (*self.port.sync.get()).take() }.is_some() {
             for slot in &self.port.slots {

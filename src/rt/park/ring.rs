@@ -10,6 +10,7 @@
 //! all to the kernel first, so the wake's read is always in when it sleeps.
 
 use core::mem::MaybeUninit;
+use core::sync::atomic::AtomicU64;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -17,8 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::Notifier;
-use crate::syscore::linux::iouring::ops::NOT_AN_OP;
-use crate::syscore::linux::iouring::ring::sys::IORING_SETUP_SINGLE_ISSUER;
+use crate::rt::shard::ring::RECOVER;
+use crate::syscore::linux::iouring::ops::{NOT_AN_OP, WAKE_LOW};
+use crate::syscore::linux::iouring::ring::sys::{IORING_SETUP_SINGLE_ISSUER, IORING_SETUP_SQPOLL};
 use crate::syscore::linux::iouring::ring::{IoUringCqe, Ring, RingConfig, SqFull, Sqe};
 
 /// Where a wait puts the completions it reaps, and how many it may.
@@ -89,22 +91,34 @@ impl CqeSink for CqeBatch {
     }
 }
 
+/// Where every ring's armed read of its eventfd lands. Nothing reads it, and it lives as long as
+/// the process: the read may complete after its poller went, on a ring the kernel keeps (a receive
+/// group's copy of the ring's descriptor holds it, or a group kept for good), when a waker that
+/// saw the shard parked, or a thread that kept its notifier, writes the eventfd then; so its 8
+/// bytes never land in memory that was freed (`proofs/tla/keeper/Kept.tla`).
+static WAKE_SINK: AtomicU64 = AtomicU64::new(0);
+
 /// A shard's ring.
 pub(crate) struct RingPoller {
     ring: Ring,
     wake: Arc<OwnedFd>,
-    /// Where the armed read of the eventfd lands; boxed, so it stays put
-    /// while the read is out.
-    wake_buf: Box<u64>,
     wake_armed: bool,
+    /// The user data of this runner's wake read: [`NOT_AN_OP`], one less for each runner that took
+    /// the ring over since (see [`adopt`](Self::adopt)).
+    wake_id: u64,
     /// Entries that found the submission queue full, in order.
     waiting: VecDeque<Sqe>,
     /// The shard's thread made itself the issuer.
     enabled: bool,
+    /// The next wait has a cold chore: the ring is not enabled yet, or a look found the kernel
+    /// starting or stopping to hold completions, so the drop count is read.
+    attend: bool,
     /// The kernel held completions the queue had no room for, at the last
     /// look; how many times that began.
     overflowed: bool,
     overflows: u64,
+    /// The kernel's count of dropped completions at the last report of a loss.
+    dropped_seen: u32,
     /// The last look that entered the kernel brought completions: the kernel may run only part of
     /// its task work in one enter, so the next look enters too.
     entered_with_more: bool,
@@ -140,12 +154,14 @@ impl RingPoller {
         Ok(Self {
             ring,
             wake: Arc::new(wake),
-            wake_buf: Box::new(0),
             wake_armed: false,
+            wake_id: NOT_AN_OP,
             waiting: VecDeque::new(),
             enabled: false,
+            attend: true,
             overflowed: false,
             overflows: 0,
+            dropped_seen: 0,
             entered_with_more: false,
         })
     }
@@ -193,6 +209,7 @@ impl RingPoller {
             match self.ring.submit() {
                 Ok(_) => {}
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if self.dropped_reported(&err) => continue,
                 Err(err) if matches!(err.raw_os_error(), Some(libc::EBUSY | libc::EAGAIN)) => {
                     return Ok(false);
                 }
@@ -217,17 +234,46 @@ impl RingPoller {
         }
     }
 
+    /// Whether the ring has a kernel submission thread, which issues every request and so runs
+    /// every completion's work, whatever thread runs the shard.
+    pub(crate) fn sqpoll(&self) -> bool {
+        self.ring.flags() & IORING_SETUP_SQPOLL != 0
+    }
+
+    /// Hands `f` the user data of each entry queued here that the kernel has not taken yet: the
+    /// thread that enters the kernel next submits it.
+    pub(crate) fn pending(&self, mut f: impl FnMut(u64)) {
+        self.ring.pending(&mut f);
+        self.waiting.iter().for_each(|sqe| f(sqe.data()));
+    }
+
+    /// The calling thread takes the ring over from a runner the monitor took its shard from
+    /// (`ShardRing::adopt`), before it enters the kernel: the wake read that runner submitted
+    /// completes as work queued to it, which a thread in a wait no signal ends never runs, so a
+    /// wake from another thread would end no wait of this one. A read in the kernel (not among
+    /// `pending`, which this thread submits) is cancelled (the cancel's own completion carries
+    /// `ignored`), and the next wait arms one of this thread's, under the next wake id: the old
+    /// one's completion, whenever its thread runs it, is a wake and no more
+    /// (proofs/tla/ring/RingHandoff.tla).
+    pub(crate) fn adopt(&mut self, ignored: u64, pending: &[u64]) {
+        if !self.wake_armed || pending.binary_search(&self.wake_id).is_ok() {
+            return;
+        }
+        self.push(Sqe::async_cancel(self.wake_id).user_data(ignored));
+        self.wake_id = if self.wake_id == WAKE_LOW {
+            NOT_AN_OP
+        } else {
+            self.wake_id - 1
+        };
+        self.wake_armed = false;
+    }
+
     fn arm_wake(&mut self) {
         if self.wake_armed {
             return;
         }
-        let sqe = Sqe::read(
-            self.wake.as_raw_fd(),
-            core::ptr::from_mut(&mut *self.wake_buf).cast(),
-            8,
-            0,
-        )
-        .user_data(NOT_AN_OP);
+        let sqe = Sqe::read(self.wake.as_raw_fd(), WAKE_SINK.as_ptr().cast(), 8, 0)
+            .user_data(self.wake_id);
         // Past a full queue the wake waits first in line, and a wait that may
         // sleep hands it to the kernel before it does (see `wait`).
         if self.ring.push(&sqe).is_err() {
@@ -244,8 +290,8 @@ impl RingPoller {
         timeout: Option<Duration>,
         out: &mut impl CqeSink,
     ) -> io::Result<bool> {
-        if !self.enabled {
-            self.enable()?;
+        if self.attend {
+            self.attend()?;
         }
         self.arm_wake();
         self.flush_waiting();
@@ -261,7 +307,13 @@ impl RingPoller {
         let looking =
             timeout == Some(Duration::ZERO) || (!self.waiting.is_empty() && !self.submit_now()?);
         let mut entered = false;
-        let result = if looking {
+        #[cfg(test)]
+        let report = ENTER_EBADR_FOR_TEST.with(|n| n.replace(n.get().saturating_sub(1))) > 0;
+        #[cfg(not(test))]
+        let report = false;
+        let result = if report {
+            Err(io::Error::from_raw_os_error(libc::EBADR))
+        } else if looking {
             self.ring
                 .submit_or_look(self.entered_with_more)
                 .map(|e| entered = e)
@@ -274,7 +326,7 @@ impl RingPoller {
                 if matches!(
                     err.raw_os_error(),
                     Some(libc::EINTR) | Some(libc::EBUSY) | Some(libc::EAGAIN)
-                ) => {}
+                ) || self.dropped_reported(&err) => {}
             Err(err) => return Err(err),
         }
         let (woken, got) = self.reap(out);
@@ -285,6 +337,68 @@ impl RingPoller {
         Ok(woken)
     }
 
+    /// The cold chores a wait starts with: enables the ring, and reads the drop count. The flag
+    /// stays set when the enable fails.
+    #[cold]
+    #[inline(never)]
+    fn attend(&mut self) -> io::Result<()> {
+        if !self.enabled {
+            self.enable()?;
+        }
+        self.dropped(false);
+        self.attend = false;
+        Ok(())
+    }
+
+    /// Whether `err`, an enter's error, is the kernel's report that it dropped completions: its
+    /// queue was full and it had no memory for an overflow entry. The ring works after, so the
+    /// loss is counted and said once, the shard's ring is asked to recover, and the caller goes
+    /// on as after an interrupted enter.
+    fn dropped_reported(&mut self, err: &io::Error) -> bool {
+        err.raw_os_error() == Some(libc::EBADR) && self.dropped(true)
+    }
+
+    /// Counts and says the completions the kernel dropped since the last report, and asks the
+    /// ring to recover from them. A drop is seen at the kernel's `EBADR` at the next wait that
+    /// sleeps, and by the count, read at the start of the wait after a look finds the kernel
+    /// starting or stopping to hold completions past the queue (`look_for_overflow`); a shard
+    /// that never sleeps sees it then. `reported`: the kernel just said so (`EBADR`), which is a
+    /// loss even when its count did not move. Whether there was one. On the cold paths only.
+    #[cold]
+    #[inline(never)]
+    fn dropped(&mut self, reported: bool) -> bool {
+        let now = self.ring.completions_dropped();
+        let mut lost = now.wrapping_sub(self.dropped_seen);
+        if lost == 0 {
+            if !reported {
+                return false;
+            }
+            // The kernel reports only after it dropped one, so a count that did not move still means one.
+            lost = 1;
+        }
+        self.dropped_seen = now;
+        crate::rt::counters::completions_dropped(u64::from(lost));
+        log::error!(
+            "the kernel dropped {lost} io_uring completions for want of memory, so the shard cancels its operations and ends those that do not end with an error; give the process more memory"
+        );
+        self.ask_recovery();
+        true
+    }
+
+    /// Asks the shard's ring to recover from dropped completions: a no-op entry whose completion
+    /// reaches the ring as a request (see `shard::ring::recover`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn ask_recovery(&mut self) {
+        self.push(Sqe::nop().user_data(RECOVER));
+    }
+
+    /// As the kernel's report of a drop, for a test: counted, said, and the ring asked.
+    #[cfg(test)]
+    pub(crate) fn drop_for_test(&mut self) {
+        self.dropped(true);
+    }
+
     /// Takes the completions that have arrived into `out`, as many as it has room for, without
     /// entering the kernel. Returns whether a wake came and how many completions it took
     /// (the wake not counted).
@@ -292,9 +406,12 @@ impl RingPoller {
         let mut woken = false;
         let mut got = 0;
         for cqe in self.ring.completions().take(out.room()) {
-            if cqe.user_data == NOT_AN_OP {
+            if cqe.user_data >= WAKE_LOW {
                 woken = true;
-                self.wake_armed = false;
+                // A wake read an earlier runner armed is only a wake: this runner's stays armed.
+                if cqe.user_data == self.wake_id {
+                    self.wake_armed = false;
+                }
             } else {
                 out.put(cqe);
                 got += 1;
@@ -312,6 +429,7 @@ impl RingPoller {
         if overflowed != self.overflowed {
             self.overflows += u64::from(overflowed);
             self.overflowed = overflowed;
+            self.attend = true;
         }
     }
 
@@ -336,6 +454,13 @@ impl RingPoller {
     pub(crate) fn ring(&self) -> &Ring {
         &self.ring
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many of the next waits on this thread get `EBADR` from their enter, as when the kernel
+    /// dropped completions, for a test.
+    pub(crate) static ENTER_EBADR_FOR_TEST: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -375,6 +500,48 @@ mod tests {
         // Re-armed: a second wake ends a second wait.
         p.notifier().notify();
         assert!(p.wait(Some(Duration::from_secs(10)), &mut out).unwrap());
+    }
+
+    /// The wake's read is still armed as its poller goes, on a ring the kernel keeps (as a receive
+    /// group's copy of its descriptor keeps it), and a waker that kept the notifier writes the
+    /// eventfd after: the read completes and writes its 8 bytes, none of them into memory the
+    /// poller freed. The memory the allocator hands out next is what such a write would hit;
+    /// under a sanitizer's allocator, which hands out no freed memory, the test sees nothing
+    /// (`proofs/tla/keeper/Kept.tla`).
+    #[test]
+    fn a_wake_after_its_poller_went_writes_no_memory_the_poller_freed() {
+        let Ok(mut p) = RingPoller::new(&RingConfig::new(8).handed_over(), 0) else {
+            eprintln!("skipping: io_uring unavailable");
+            return;
+        };
+        p.enable().unwrap();
+        let mut out = Vec::new();
+        // The look arms the wake's read and hands it to the kernel.
+        assert!(!p.wait(Some(Duration::ZERO), &mut out).unwrap());
+        // SAFETY: a plain syscall on our own ring's descriptor; the copy is owned at once.
+        let kept = unsafe {
+            let fd = libc::dup(p.ring.as_raw_fd());
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        };
+        let notifier = p.notifier();
+        drop(p);
+        const MARK: u64 = 0x5eed_5eed_5eed_5eed;
+        let fresh: Vec<Box<u64>> = (0..64).map(|_| Box::new(MARK)).collect();
+        notifier.notify();
+        let mut ready = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&kept),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd of our own.
+        let n = unsafe { libc::poll(&mut ready, 1, 10_000) };
+        assert_eq!(n, 1, "the wake's read never completed");
+        for each in &fresh {
+            // SAFETY: our own live box, read as the kernel may have written it.
+            let now = unsafe { core::ptr::read_volatile(&**each) };
+            assert_eq!(now, MARK, "the wake's read wrote memory its poller freed");
+        }
     }
 
     #[test]

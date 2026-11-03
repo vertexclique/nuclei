@@ -6,6 +6,20 @@ use std::os::fd::RawFd;
 
 use super::interrupted;
 
+/// See [`super::unacked`]: `SIOCOUTQ` (libc names it `TIOCOUTQ`, the same value) counts the bytes
+/// sent and not yet acknowledged, and those not yet sent.
+pub(crate) fn unacked(fd: RawFd) -> Option<usize> {
+    let mut count: libc::c_int = 0;
+    // SAFETY: `TIOCOUTQ` writes one `c_int` through the pointer, valid for the call; a bad
+    // descriptor is an error the call answers.
+    let ret = unsafe { libc::ioctl(fd, libc::TIOCOUTQ as _, &raw mut count) };
+    if ret < 0 {
+        None
+    } else {
+        usize::try_from(count).ok()
+    }
+}
+
 /// The Linux system call `nr` with `args` (up to six), made directly where the architecture's
 /// call is written out (x86-64, AArch64), else through libc's `syscall`: a count, or the error of
 /// the negated errno the kernel answered. glibc's wrappers add a cancellation-point check (about

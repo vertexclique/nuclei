@@ -85,10 +85,29 @@ pub(super) fn stopped_shard() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, StoppedShard)
 }
 
-/// Whether `err` is an attach refused because its shard stopped first.
-pub(crate) fn is_stopped_shard(err: &io::Error) -> bool {
+/// What an attach answers when the source has no descriptor: a retire
+/// (`get_mut`, `into_inner`) or a close took it out first. Performed with the
+/// retire, or made by a shard after it, the attach is refused for that alone:
+/// the handle's next wait brings the descriptor back and registers it again
+/// (`proofs/tla/attach/Merged.tla`).
+#[derive(Debug)]
+struct NoDescriptor;
+
+impl core::fmt::Display for NoDescriptor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the handle was retired or closed before its registration")
+    }
+}
+
+impl std::error::Error for NoDescriptor {}
+
+/// Whether `err` is an attach refused for now, which fails no IO of the
+/// source: its shard stopped first, or the source had no descriptor. The
+/// registration is back to none, and the tasks waiting on the source look
+/// again, to register it where they poll next.
+pub(crate) fn is_refused_for_now(err: &io::Error) -> bool {
     err.get_ref()
-        .is_some_and(|inner| inner.is::<StoppedShard>())
+        .is_some_and(|inner| inner.is::<StoppedShard>() || inner.is::<NoDescriptor>())
 }
 
 /// What pending requests carry. Each field is written by its requester
@@ -287,7 +306,9 @@ impl Source {
     /// Performs every pending request; both sides are held by the caller.
     /// Returns how an attach went, if one was pending: to the requester,
     /// when it is the one performing (`here`); else a failed attach fails
-    /// the tasks waiting on the source, as a failed registration does.
+    /// the tasks waiting on the source, as a failed registration does, but
+    /// for one refused for now (`is_refused_for_now`), as a retire performed
+    /// in the same go refuses it: the tasks look again.
     fn perform(
         self: &Arc<Self>,
         read: &mut ReadState,
@@ -365,7 +386,7 @@ impl Source {
             self.ops_registered(read, write, after);
         }
         if !here && let Some(Err(err)) = &attached {
-            if is_stopped_shard(err) {
+            if is_refused_for_now(err) {
                 read.wake_all(after);
                 write.wake_all(after);
             } else {
@@ -505,27 +526,43 @@ impl Source {
     }
 
     /// Registers the source with the shard and token the attach carries;
-    /// both sides are held. A failure hands the slot back to the shard.
+    /// both sides are held. A failure hands the slot back to the shard, and
+    /// only then clears the shard it named.
+    ///
+    /// An attach to a ring names its shard and token before it takes the
+    /// ask, and its end clears them only after what it posts to that shard:
+    /// so a shard that waits for its sources (`wait_for_evictions`), looking
+    /// at the ask first and then at the registration, sees one of the two
+    /// until its mailbox holds what the attach left there
+    /// (`proofs/tla/going/Pending.tla`).
     fn attach_now(self: &Arc<Self>) -> io::Result<()> {
-        let ask = self
-            .ask
-            .attach
-            .swap(core::ptr::null_mut(), Ordering::Acquire);
+        let ask = self.ask.attach.load(Ordering::Acquire);
         if ask.is_null() {
             return Ok(());
         }
-        // SAFETY: made by `Arc::into_raw` and taken from the field once.
-        let shard = unsafe { Arc::from_raw(ask) };
-        // Stored before the shard, which the swap above acquired.
+        // Stored before the shard, which the load above acquired.
         let token = self.ask.attach_token.load(Ordering::Relaxed);
+        // SAFETY: the ask holds a count of its shard until the store below takes it.
+        #[cfg(ring)]
+        let ring = unsafe { (*ask).is_ring() };
+        #[cfg(ring)]
+        if ring {
+            self.reg.token.store(token, Ordering::Release);
+            self.reg.home.store(ask as usize, Ordering::Release);
+        }
+        // Release: a shard that finds the ask taken finds the name above. No other attach is
+        // asked meanwhile: one is asked only by the registration that moved the state to
+        // registering, which stays so until a holder of both sides, this one, moves it on.
+        self.ask
+            .attach
+            .store(core::ptr::null_mut(), Ordering::Release);
+        // SAFETY: made by `Arc::into_raw` and taken from the field once, above.
+        let shard = unsafe { Arc::from_raw(ask) };
         let result = match self.fd.load(Ordering::Acquire) {
-            NO_FD => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the handle closed before its registration",
-            )),
+            NO_FD => Err(io::Error::new(io::ErrorKind::NotConnected, NoDescriptor)),
             _ if shard.is_stopped() => Err(stopped_shard()),
             #[cfg(ring)]
-            fd if shard.is_ring() => return self.attach_ring(shard, token, fd),
+            fd if ring => return self.attach_ring(shard, token, fd),
             #[cfg(port)]
             fd => return self.attach_port(shard, token, fd),
             #[cfg(readiness)]
@@ -549,9 +586,16 @@ impl Source {
             Err(_) => {
                 self.reg.state.store(UNREGISTERED, Ordering::Release);
                 shard.release_source(token);
+                self.reg.home.store(0, Ordering::Release);
             }
         }
         result
+    }
+
+    /// Whether an attach to the shard at `home` is asked and not taken yet:
+    /// a shard that leaves waits for it, looking before `registered_with`.
+    pub(crate) fn attach_asked_of(&self, home: usize) -> bool {
+        self.ask.attach.load(Ordering::Acquire) as usize == home
     }
 
     /// The registration goes, and every task waiting on the source is
@@ -652,6 +696,22 @@ impl Source {
         self.leave_failure(err);
         let mut after = After::default();
         self.request(0, &mut after);
+        after.run();
+    }
+
+    /// `shard` let go of the source, its eviction from there done, on the shard's own thread: each
+    /// side `shard` claimed gives the claim up (`Side::give_up`), so that a call whose heavy fence
+    /// fails no longer leaves its work to a shard that may run nothing again
+    /// (proofs/tla/side_biased/SideBiased.tla, `ClaimStops`).
+    pub(crate) fn give_up_claims(self: &Arc<Self>, shard: &Arc<Shared>) {
+        let who = Arc::as_ptr(shard) as usize;
+        let hooks = SourceHooks {
+            claim: Some(shard),
+            ..self.hooks()
+        };
+        let mut after = After::default();
+        self.read.give_up(who, &mut after, &hooks);
+        self.write.give_up(who, &mut after, &hooks);
         after.run();
     }
 

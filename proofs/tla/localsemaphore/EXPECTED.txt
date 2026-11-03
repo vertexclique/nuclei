@@ -10,3 +10,7 @@ M_release_no_serve             MC_Local             violated:NoIdleFront
 W_pass_on                      MC_Local             violated:NoPassOn
 W_front_served                 MC_Local             violated:NoFrontServed
 W_set_aside                    MC_Local             violated:NoSetAside
+L_reentrant                    MC_Local             pass
+L_serve_panic                  MC_Local             pass
+M_join_after_clone             MC_Local             violated:NoIdleFront
+M_serve_stops_at_panic         MC_Local             violated:NoIdleFront

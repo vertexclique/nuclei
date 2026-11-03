@@ -10,7 +10,7 @@ use core::task::{Context, Poll};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use super::header::Header;
-use super::raw::Panic;
+use super::raw::{Panic, drop_unclaimed};
 use super::state::{AWAITER, CLOSED, COMPLETED, FLAGS, REFERENCE, RUNNING, SCHEDULED, TASK};
 use crate::sync::internal::Ordering;
 
@@ -88,11 +88,12 @@ impl<T> Task<T> {
     /// the exchange above needs no frame.
     #[inline(never)]
     fn detach_late(&mut self) {
-        drop(self.set_detached());
+        let_go(self.set_detached());
     }
 
     /// Cancels the task and waits for its future to be dropped. Returns the
-    /// output if the task had already completed.
+    /// output if the task had already completed; `None` means the task's
+    /// future and any output it made are gone.
     pub async fn cancel(self) -> Option<T> {
         let mut this = self;
         this.set_canceled();
@@ -157,6 +158,43 @@ impl<T> Task<T> {
     }
 }
 
+/// What [`close`] found of a task it closed.
+pub(super) struct Closed {
+    /// The task was idle: it is now scheduled, and a reference was added for the caller's
+    /// runnable, which drops the future.
+    pub(super) idle: bool,
+    /// A task awaits the handle.
+    pub(super) awaiter: bool,
+}
+
+/// Closes the task unless it completed or is closed already.
+pub(super) fn close(header: &Header) -> Option<Closed> {
+    let mut state = header.state.load(Ordering::Acquire);
+    loop {
+        if state & (COMPLETED | CLOSED) != 0 {
+            return None;
+        }
+        let idle = state & (SCHEDULED | RUNNING) == 0;
+        let new = if idle {
+            (state | SCHEDULED | CLOSED) + REFERENCE
+        } else {
+            state | CLOSED
+        };
+        match header
+            .state
+            .compare_exchange_weak(state, new, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                return Some(Closed {
+                    idle,
+                    awaiter: state & AWAITER != 0,
+                });
+            }
+            Err(actual) => state = actual,
+        }
+    }
+}
+
 /// Closes the task `ptr` unless it completed. An idle task is scheduled once
 /// more, so its future is dropped where the task runs, and an awaiter is told.
 ///
@@ -166,38 +204,16 @@ impl<T> Task<T> {
 unsafe fn cancel(ptr: *const ()) {
     // SAFETY: the caller's contract.
     let header = unsafe { &*ptr.cast::<Header>() };
-    {
-        let mut state = header.state.load(Ordering::Acquire);
-        loop {
-            if state & (COMPLETED | CLOSED) != 0 {
-                return;
-            }
-            let idle = state & (SCHEDULED | RUNNING) == 0;
-            let new = if idle {
-                (state | SCHEDULED | CLOSED) + REFERENCE
-            } else {
-                state | CLOSED
-            };
-            match header.state.compare_exchange_weak(
-                state,
-                new,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if idle {
-                        // SAFETY: the reference added above goes to the
-                        // runnable, which drops the future when it runs.
-                        unsafe { (header.vtable.schedule)(ptr, super::ScheduleInfo::new(false)) };
-                    }
-                    if state & AWAITER != 0 {
-                        header.notify(None);
-                    }
-                    return;
-                }
-                Err(actual) => state = actual,
-            }
-        }
+    let Some(closed) = close(header) else {
+        return;
+    };
+    if closed.idle {
+        // SAFETY: the reference added by `close` goes to the runnable, which
+        // drops the future when it runs.
+        unsafe { (header.vtable.schedule)(ptr, super::ScheduleInfo::new(false)) };
+    }
+    if closed.awaiter {
+        header.notify(None);
     }
 }
 
@@ -299,17 +315,23 @@ impl<T> Task<T> {
     #[inline(always)]
     fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, Panic>>> {
         let header = self.header();
+        let mut charged = false;
         let mut state = header.state.load(Ordering::Acquire);
         loop {
             if state & CLOSED != 0 {
                 // The future may still be in a run queue or a poll: wait for
-                // it to be dropped.
+                // it to be dropped, then look again, as a cancel whose drop
+                // panicked ends as a completion with the panic.
                 if state & (SCHEDULED | RUNNING) != 0 {
                     header.register(cx.waker());
                     state = header.state.load(Ordering::Acquire);
                     if state & (SCHEDULED | RUNNING) != 0 {
                         return Poll::Pending;
                     }
+                    continue;
+                }
+                if !charged && !crate::coop::spend(cx.waker()) {
+                    return Poll::Pending;
                 }
                 header.notify(Some(cx.waker()));
                 return Poll::Ready(None);
@@ -325,6 +347,12 @@ impl<T> Task<T> {
                 if state & COMPLETED == 0 {
                     return Poll::Pending;
                 }
+            }
+            if !charged {
+                if !crate::coop::spend(cx.waker()) {
+                    return Poll::Pending;
+                }
+                charged = true;
             }
             match header.state.compare_exchange(
                 state,
@@ -365,7 +393,15 @@ impl<T> Task<T> {
     #[inline(never)]
     fn cancel_and_let_go(&mut self) {
         self.set_canceled();
-        drop(self.set_detached());
+        let_go(self.set_detached());
+    }
+}
+
+/// Drops what a handle that let go of its task took out: a panic, which
+/// nobody awaits now, is logged, and so is a value whose drop panics.
+fn let_go<T>(output: Option<Result<T, Panic>>) {
+    if let Some(output) = output {
+        drop_unclaimed(output);
     }
 }
 
@@ -416,7 +452,8 @@ impl<T> FallibleTask<T> {
         self.task.detach()
     }
 
-    /// Cancels the task; see [`Task::cancel`].
+    /// Cancels the task; see [`Task::cancel`]. `None` means the task's future
+    /// and any output it made are gone.
     pub async fn cancel(self) -> Option<T> {
         self.task.cancel().await
     }
@@ -487,7 +524,9 @@ impl<T> fmt::Debug for Join<T> {
 }
 
 /// Why a task gave no output: it was cancelled (by its handle, an
-/// [`AbortHandle`], or its runtime shutting down), or its future panicked.
+/// [`AbortHandle`], or its runtime shutting down), or its code panicked: its
+/// future's poll, a task hook around it, or the future's drop, after it
+/// completed or as it was cancelled.
 pub struct JoinError {
     id: super::Id,
     panic: Option<Panic>,
@@ -537,11 +576,7 @@ impl fmt::Display for JoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.panic {
             None => write!(f, "task {} was cancelled", self.id),
-            Some(panic) => match panic
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            {
+            Some(panic) => match crate::rt::caught::message(panic) {
                 Some(message) => write!(f, "task {} panicked: {message}", self.id),
                 None => write!(f, "task {} panicked", self.id),
             },

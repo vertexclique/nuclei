@@ -40,6 +40,12 @@ impl Handle<TcpListener> {
 
     /// The next connection, with its peer's address.
     ///
+    /// A connection its peer reset or aborted while it waited in the
+    /// backlog is skipped, and the next one taken: the listener is fine, and
+    /// the error (`ECONNABORTED`, or on Windows `WSAECONNRESET` or
+    /// `ERROR_NETNAME_DELETED`) is that connection's. Linux hands such a
+    /// connection over as it is, and its first read reports the reset.
+    ///
     /// On macOS an accept that finds the process out of descriptors closes
     /// the connection it took off the backlog, as the system's own does; the
     /// next ones fail with the same error and take none until a descriptor
@@ -47,8 +53,8 @@ impl Handle<TcpListener> {
     ///
     /// # Errors
     ///
-    /// As `accept(2)`: a connection reset before it was taken, or the
-    /// process out of descriptors.
+    /// As `accept(2)` for the listener itself, such as the process out of
+    /// descriptors.
     pub async fn accept(&self) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
         poll_fn(|cx| self.poll_accept(cx)).await
     }
@@ -81,7 +87,9 @@ impl Handle<TcpListener> {
     }
 
     /// The connections as they come, without their addresses; the stream
-    /// never ends, and an error is one of its items.
+    /// never ends, and an error of the listener's is one of its items (a
+    /// connection reset before it was taken is skipped, as
+    /// [`accept`](Self::accept) skips it).
     pub fn incoming(
         &self,
     ) -> impl Stream<Item = io::Result<Handle<TcpStream>>> + Send + Unpin + '_ {
@@ -90,26 +98,32 @@ impl Handle<TcpListener> {
 
     /// The connections as they come, from a stream that owns its own copy of
     /// the listener, so it may outlive this handle. A connection reset before
-    /// it was taken is skipped, and so is the process having no descriptor
-    /// left to accept into: the stream waits, with a growing pause, until
-    /// there is one, and the connections wait in the listener's backlog (on
-    /// macOS but for the one the first accept to find none took, which the
-    /// system closes, as [`accept`](Self::accept) says).
-    /// Any other error ends the stream, and
+    /// it was taken is skipped, as [`accept`](Self::accept) skips it, and so
+    /// is the process having no descriptor left to accept into (on Windows,
+    /// no socket for want of descriptors or buffer space): the stream
+    /// waits, with a growing pause, until there is one, and the connections
+    /// wait in the listener's backlog (on macOS but for the one the first
+    /// accept to find none took, which the system closes, as
+    /// [`accept`](Self::accept) says). Any other error ends the stream, and
     /// [`TcpStreamGenerator::take_error`] says what it was.
     ///
-    /// On io_uring the stream keeps one accept armed for every connection
-    /// that comes, so it takes connections ahead of its polls; those it took
-    /// and never yielded close when it drops, as a listener's own backlog
-    /// does when the last copy of the listener closes.
+    /// The stream takes connections ahead of its polls: on io_uring it keeps
+    /// one accept armed for every connection that comes, elsewhere it has at
+    /// most one accept out or a few taken ahead for its waiting poll. Those
+    /// it took and never yielded close when it drops, though the listener's
+    /// other copies still listen: their peers see the connection closed.
     ///
     /// # Errors
     ///
     /// When the listener's descriptor cannot be copied.
     pub async fn accept_multi(&self) -> io::Result<TcpStreamGenerator> {
         let listener = self.get_ref().try_clone()?;
+        let listener = Handle::adopt(listener, Kind::TcpListener)?;
+        listener
+            .source()
+            .set_zero_linger(self.source().zero_linger());
         Ok(TcpStreamGenerator {
-            listener: Handle::adopt(listener, Kind::TcpListener)?,
+            listener,
             error: None,
             done: false,
             backoff: None,
@@ -121,12 +135,15 @@ impl Handle<TcpListener> {
 /// A connection `listener` accepted, set up already.
 fn stream(fd: crate::io::raw::Owned, listener: &crate::io::Source) -> Handle<TcpStream> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if listener.passes_inq() {
-        return Handle::from_nonblocking_counting(TcpStream::from(fd), Kind::Tcp);
-    }
+    let stream = if listener.passes_inq() {
+        Handle::from_nonblocking_counting(TcpStream::from(fd), Kind::Tcp)
+    } else {
+        Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp)
+    };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let _ = listener;
-    Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp)
+    let stream = Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp);
+    stream.source().set_zero_linger(listener.zero_linger());
+    stream
 }
 
 fn inet(addr: Addr) -> io::Result<SocketAddr> {
@@ -194,7 +211,6 @@ impl Stream for TcpStreamGenerator {
                     this.delay = OUT_OF_DESCRIPTORS_DELAY;
                     return Poll::Ready(Some(stream));
                 }
-                Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::ConnectionAborted => {}
                 Poll::Ready(Err(err)) if out_of_descriptors(&err) => {
                     this.backoff = Some(sleep(this.delay));
                     this.delay = (this.delay * 2).min(OUT_OF_DESCRIPTORS_DELAY_MAX);
@@ -281,15 +297,22 @@ impl Handle<TcpStream> {
 
     /// Sets `SO_LINGER`: with `Some(time)` a close waits up to `time` (whole
     /// seconds) for unsent data; with `None` it returns at once and the
-    /// system sends what is left.
+    /// system sends what is left. A time under a second is zero: as `set_zero_linger`.
     pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
-        super::opt::set_linger_time(self.raw_io(), linger)
+        super::opt::set_linger_time(self.raw_io(), linger)?;
+        self.source().set_zero_linger(super::opt::aborts(linger));
+        Ok(())
     }
 
-    /// Sets `SO_LINGER` to zero: the close drops unsent data and resets the
-    /// connection.
+    /// Sets `SO_LINGER` to zero: the close drops unsent data and resets the connection.
+    ///
+    /// A handle dropped with bytes still written behind writes them first (within the runtime's
+    /// `write_behind_linger`), then resets at once, its kernel dropping what it has not sent, as a
+    /// zero linger asks. On macOS, to a loopback peer, the reset first waits, within the same
+    /// `write_behind_linger`, for the peer to acknowledge what is on its way, since that loopback
+    /// can let a reset overtake data.
     pub fn set_zero_linger(&self) -> io::Result<()> {
-        super::opt::set_linger_time(self.raw_io(), Some(Duration::ZERO))
+        self.set_linger(Some(Duration::ZERO))
     }
 }
 

@@ -93,6 +93,15 @@ fn dispatch() {
     }
 }
 
+/// Wakes every listener alive, whatever its signal: a pump went, and each
+/// polls again to have one serve it.
+#[cfg(unix)]
+fn wake_every_listener() {
+    for (_, waiter) in waiters().iter() {
+        waiter.waker.wake();
+    }
+}
+
 /// Whether `signum` has a listener alive.
 #[cfg(windows)]
 fn listened(signum: usize) -> bool {

@@ -5,7 +5,10 @@
 //! kernel hands back with each event (epoll data, kevent udata): never a
 //! pointer. A slot's generation moves on when its registration goes, so an
 //! event still in flight for a registration that is gone, or for a slot
-//! reused since, finds nothing. Tokens fit a pointer-sized word, since that
+//! reused since, finds nothing; and the slots made after a drain start past
+//! every generation handed out before it, so a release that reaches a
+//! thread's own shard only at its next `block_on` finds nothing either
+//! (`proofs/tla/going/Pending.tla`). Tokens fit a pointer-sized word, since that
 //! is all kqueue carries. The word's top bit says which table a token is
 //! of: a source's has it clear, a child's set.
 
@@ -32,6 +35,8 @@ struct Slot<T> {
 pub(crate) struct Tokens<T, const TAG: u64> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
+    /// The generation a slot made after the last drain starts at: past every one handed out.
+    first_gen: u64,
 }
 
 /// The shard's IO sources.
@@ -42,6 +47,7 @@ impl<T, const TAG: u64> Default for Tokens<T, TAG> {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            first_gen: 0,
         }
     }
 }
@@ -79,10 +85,10 @@ impl<T, const TAG: u64> Tokens<T, TAG> {
             ));
         }
         self.slots.push(Slot {
-            generation: 0,
+            generation: self.first_gen,
             entry: Some(entry),
         });
-        Ok(Self::token(index as u32, 0))
+        Ok(Self::token(index as u32, self.first_gen))
     }
 
     /// The entry registered under `token`, if that registration is still
@@ -115,9 +121,13 @@ impl<T, const TAG: u64> Tokens<T, TAG> {
         self.drain_tokens().map(|(_, entry)| entry)
     }
 
-    /// Takes every registered entry out, each with its token.
+    /// Takes every registered entry out, each with its token; the slots made from now on start
+    /// past every generation a slot reached, so no token handed out names anything again.
     pub(crate) fn drain_tokens(&mut self) -> impl Iterator<Item = (u64, T)> + '_ {
         self.free.clear();
+        if let Some(reached) = self.slots.iter().map(|slot| slot.generation).max() {
+            self.first_gen = (reached + 1) & GEN_MASK;
+        }
         self.slots
             .drain(..)
             .enumerate()
@@ -197,5 +207,39 @@ mod tests {
         assert!(c.get(t).is_none());
         assert!(s.remove(u).is_none() && c.remove(t).is_none());
         assert_eq!((s.len(), c.len()), (1, 1));
+    }
+
+    /// A token handed out before a drain names nothing after it, however many drains and
+    /// registrations come between: a release that reaches a thread's own shard only at its next
+    /// `block_on` never removes the registration made there first
+    /// (`proofs/tla/going/Pending.tla`).
+    #[test]
+    fn a_token_from_before_a_drain_names_nothing_after_it() {
+        let mut s = Sources::default();
+        let mut old = Vec::new();
+        for _ in 0..3 {
+            let mut handed: Vec<u64> = (0..3).map(|_| s.insert(source()).unwrap()).collect();
+            s.remove(handed[1]);
+            handed.push(s.insert(source()).unwrap());
+            let drained: Vec<u64> = s.drain_tokens().map(|(token, _)| token).collect();
+            assert_eq!(drained.len(), 3);
+            assert!(s.is_untouched());
+            old.extend(handed);
+            let fresh: Vec<u64> = (0..4).map(|_| s.insert(source()).unwrap()).collect();
+            for stale in &old {
+                assert!(
+                    !fresh.contains(stale),
+                    "a drain handed out token {stale:#x} again"
+                );
+                assert!(s.get(*stale).is_none());
+                assert!(
+                    s.remove(*stale).is_none(),
+                    "a stale token removed a registration"
+                );
+            }
+            assert_eq!(s.len(), 4);
+            old.extend(fresh);
+            assert_eq!(s.drain_tokens().count(), 4);
+        }
     }
 }

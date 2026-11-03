@@ -6,7 +6,12 @@
 //! waits for this owner's read anyway; an owner that writes may also read.
 //! An owner that reads without writing and asks to write is refused with
 //! [`ReadHeldByOwner`]: the write would wait for its own read. So an owner
-//! never deadlocks on itself.
+//! never deadlocks on itself in a request it polls: every poll looks at the
+//! owner's write and reads first, queued or not, so a request that queued
+//! before its owner came to hold the lock through another one (two requests
+//! in one `join!`) completes at its next poll, and the entry that made the
+//! owner a holder wakes the owner's other queued requests on the lock, so
+//! none waits for a lock only its own owner can free.
 //!
 //! Each reading owner has a record (owner id, read depth) in a lock-free
 //! list that only grows: a record is reused once its owner stops reading,
@@ -24,6 +29,7 @@ use core::task::{Context, Poll};
 use super::internal::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, UnsafeCell};
 use super::owner::Owner;
 use super::raw_rwlock::{READ, RawRwLock, RwWait, WRITE};
+use super::siblings::{Ticket, wake_siblings};
 
 /// One reading owner: its id (zero when free) and how many reads it holds.
 struct Record {
@@ -166,9 +172,9 @@ impl<T: ?Sized> ReentrantRwLock<T> {
     /// Reads if `owner` already reads or writes, or if no writer holds the
     /// lock and no handoff is owed.
     pub fn try_read<'a>(&'a self, owner: &'a Owner) -> Option<ReentrantReadGuard<'a, T>> {
-        let record = match self.reenter_read(owner) {
+        let record = match self.reenter_read(owner, 0) {
             Some(record) => record,
-            None if self.raw.try_kind(READ) => self.enter_read(owner),
+            None if self.raw.try_kind(READ) => self.enter_read(owner, 0),
             None => return None,
         };
         Some(ReentrantReadGuard::new(self, owner, record))
@@ -181,7 +187,7 @@ impl<T: ?Sized> ReentrantRwLock<T> {
             return Some(ReentrantWriteGuard::new(self, owner));
         }
         (self.readers.find(owner.id()).is_none() && self.raw.try_kind(WRITE)).then(|| {
-            self.enter_write(owner);
+            self.enter_write(owner, 0);
             ReentrantWriteGuard::new(self, owner)
         })
     }
@@ -194,6 +200,7 @@ impl<T: ?Sized> ReentrantRwLock<T> {
             lock: self,
             owner,
             wait: RwWait::new(),
+            ticket: Ticket::new(),
         }
     }
 
@@ -206,6 +213,7 @@ impl<T: ?Sized> ReentrantRwLock<T> {
             lock: self,
             owner,
             wait: RwWait::new(),
+            ticket: Ticket::new(),
         }
     }
 
@@ -214,20 +222,28 @@ impl<T: ?Sized> ReentrantRwLock<T> {
         self.value.get_mut()
     }
 
-    fn reenter_read(&self, owner: &Owner) -> Option<&Record> {
+    fn reenter_read(&self, owner: &Owner, except: u64) -> Option<&Record> {
         let id = owner.id();
         if let Some(record) = self.readers.find(id) {
             record.reads.fetch_add(1, Ordering::Relaxed);
             return Some(record);
         }
-        (self.writer.load(Ordering::Relaxed) == id).then(|| self.enter_read(owner))
+        (self.writer.load(Ordering::Relaxed) == id).then(|| self.enter_read(owner, except))
     }
 
-    /// Records a first read by `owner`, which holds a share or the write.
-    fn enter_read(&self, owner: &Owner) -> &Record {
+    /// Records a first read by `owner`, which holds a share or the write,
+    /// and wakes its other queued requests on this lock (all but ticket
+    /// `except`).
+    fn enter_read(&self, owner: &Owner, except: u64) -> &Record {
         let record = self.readers.claim(owner.id());
         record.reads.store(1, Ordering::Relaxed);
+        wake_siblings(self.address(), owner.id(), except);
         record
+    }
+
+    /// The lock's identity in the registry of queued requests.
+    fn address(&self) -> usize {
+        core::ptr::from_ref(self).cast::<()>() as usize
     }
 
     fn read_unlock(&self, id: u64, record: &Record) {
@@ -257,10 +273,13 @@ impl<T: ?Sized> ReentrantRwLock<T> {
         true
     }
 
-    fn enter_write(&self, owner: &Owner) {
+    /// Records `owner` as the writer, and wakes its other queued requests on
+    /// this lock (all but ticket `except`).
+    fn enter_write(&self, owner: &Owner, except: u64) {
         // SAFETY: the write side makes this caller the only writer.
         self.write_depth.with_mut(|depth| unsafe { *depth = 1 });
         self.writer.store(owner.id(), Ordering::Relaxed);
+        wake_siblings(self.address(), owner.id(), except);
     }
 
     fn write_unlock(&self, id: u64) {
@@ -379,6 +398,8 @@ pub struct ReentrantRead<'a, T: ?Sized> {
     lock: &'a ReentrantRwLock<T>,
     owner: &'a Owner,
     wait: RwWait,
+    /// Its place among the owner's queued requests.
+    ticket: Ticket,
 }
 
 impl<'a, T: ?Sized> Future for ReentrantRead<'a, T> {
@@ -386,22 +407,39 @@ impl<'a, T: ?Sized> Future for ReentrantRead<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReentrantReadGuard<'a, T>> {
         let this = self.get_mut();
-        if !this.wait.is_queued()
-            && let Some(record) = this.lock.reenter_read(this.owner)
-        {
+        if let Some(record) = this.lock.reenter_read(this.owner, this.ticket.number()) {
+            // The owner came to read or write through another request since
+            // this one queued: this one leaves the queue, passing on a share
+            // it was granted meanwhile, so the owner keeps one record.
+            // The guard first: the cancel and the budget's refusal run user
+            // code, and a panic there gives the record back.
+            let guard = ReentrantReadGuard::new(this.lock, this.owner, record);
+            if this.wait.is_queued() {
+                this.wait.cancel(&this.lock.raw, READ);
+            }
+            this.ticket.unregister();
             // Completed at once: it spends one operation of the poll's
             // budget, or, the budget spent, the read goes and it yields.
-            let guard = ReentrantReadGuard::new(this.lock, this.owner, record);
             if crate::coop::spend(cx.waker()) {
                 return Poll::Ready(guard);
             }
             drop(guard);
             return Poll::Pending;
         }
-        this.wait.poll(&this.lock.raw, READ, cx.waker()).map(|()| {
-            let record = this.lock.enter_read(this.owner);
-            ReentrantReadGuard::new(this.lock, this.owner, record)
-        })
+        match this.wait.poll(&this.lock.raw, READ, cx.waker()) {
+            Poll::Ready(()) => {
+                let record = this.lock.enter_read(this.owner, this.ticket.number());
+                this.ticket.unregister();
+                Poll::Ready(ReentrantReadGuard::new(this.lock, this.owner, record))
+            }
+            Poll::Pending => {
+                if this.wait.is_queued() {
+                    this.ticket
+                        .register(this.lock.address(), this.owner.id(), cx.waker());
+                }
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -440,6 +478,8 @@ pub struct ReentrantWrite<'a, T: ?Sized> {
     lock: &'a ReentrantRwLock<T>,
     owner: &'a Owner,
     wait: RwWait,
+    /// Its place among the owner's queued requests.
+    ticket: Ticket,
 }
 
 impl<'a, T: ?Sized> Future for ReentrantWrite<'a, T> {
@@ -447,29 +487,47 @@ impl<'a, T: ?Sized> Future for ReentrantWrite<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if !this.wait.is_queued() {
-            // Either completes at once: it spends one operation of the poll's
-            // budget, or, the budget spent, the level goes and it yields.
-            if this.lock.reenter_write(this.owner) {
-                let guard = ReentrantWriteGuard::new(this.lock, this.owner);
-                if crate::coop::spend(cx.waker()) {
-                    return Poll::Ready(Ok(guard));
-                }
-                drop(guard);
-                return Poll::Pending;
+        // Either completes at once: it spends one operation of the poll's
+        // budget, or, the budget spent, the level goes and it yields. A request
+        // that queued before its owner came to write or read through another
+        // one leaves the queue first, which cannot have granted it the write.
+        if this.lock.reenter_write(this.owner) {
+            let guard = ReentrantWriteGuard::new(this.lock, this.owner);
+            if this.wait.is_queued() {
+                this.wait.cancel(&this.lock.raw, WRITE);
             }
-            if this.lock.readers.find(this.owner.id()).is_some() {
-                return if crate::coop::spend(cx.waker()) {
-                    Poll::Ready(Err(ReadHeldByOwner))
-                } else {
-                    Poll::Pending
-                };
+            this.ticket.unregister();
+            if crate::coop::spend(cx.waker()) {
+                return Poll::Ready(Ok(guard));
+            }
+            drop(guard);
+            return Poll::Pending;
+        }
+        if this.lock.readers.find(this.owner.id()).is_some() {
+            if this.wait.is_queued() {
+                this.wait.cancel(&this.lock.raw, WRITE);
+            }
+            this.ticket.unregister();
+            return if crate::coop::spend(cx.waker()) {
+                Poll::Ready(Err(ReadHeldByOwner))
+            } else {
+                Poll::Pending
+            };
+        }
+        match this.wait.poll(&this.lock.raw, WRITE, cx.waker()) {
+            Poll::Ready(()) => {
+                this.lock.enter_write(this.owner, this.ticket.number());
+                this.ticket.unregister();
+                Poll::Ready(Ok(ReentrantWriteGuard::new(this.lock, this.owner)))
+            }
+            Poll::Pending => {
+                if this.wait.is_queued() {
+                    this.ticket
+                        .register(this.lock.address(), this.owner.id(), cx.waker());
+                }
+                Poll::Pending
             }
         }
-        this.wait.poll(&this.lock.raw, WRITE, cx.waker()).map(|()| {
-            this.lock.enter_write(this.owner);
-            Ok(ReentrantWriteGuard::new(this.lock, this.owner))
-        })
     }
 }
 
@@ -547,6 +605,70 @@ mod tests {
         assert!(lock.try_write(&other).is_some());
     }
 
+    fn records_of(lock: &ReentrantRwLock<()>, owner: &Owner) -> usize {
+        lock.readers
+            .iter()
+            .filter(|record| record.owner.load(Ordering::Relaxed) == owner.id())
+            .count()
+    }
+
+    #[test]
+    fn a_queued_read_of_the_owner_that_took_the_write_meanwhile_reads_at_once() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_write(&other).expect("free");
+        let mut write = Polled::new(lock.write(&me));
+        let mut read = Polled::new(lock.read(&me));
+        write.pending();
+        read.pending();
+        drop(theirs);
+        let written = write.ready().expect("the owner held no read");
+        let reading = read.ready();
+        drop((written, reading));
+        assert!(
+            lock.try_write(&other).is_some(),
+            "the write and the read went"
+        );
+    }
+
+    #[test]
+    fn a_queued_write_of_an_owner_that_reads_meanwhile_is_refused() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_read(&other).expect("free");
+        let mut write = Polled::new(lock.write(&me));
+        write.pending();
+        let mine = lock.try_read(&me).expect("a queued writer is not owed yet");
+        drop(theirs);
+        assert_eq!(write.ready().err(), Some(ReadHeldByOwner));
+        drop((write, mine));
+        assert!(
+            lock.try_write(&other).is_some(),
+            "the refused write left no trace"
+        );
+    }
+
+    #[test]
+    fn two_queued_reads_of_one_owner_share_one_record() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_write(&other).expect("free");
+        let mut first = Polled::new(lock.read(&me));
+        let mut second = Polled::new(lock.read(&me));
+        first.pending();
+        second.pending();
+        drop(theirs);
+        let a = first.ready();
+        let b = second.ready();
+        assert_eq!(
+            records_of(&lock, &me),
+            1,
+            "one record for the owner's two reads"
+        );
+        drop((a, b));
+        assert!(lock.try_write(&other).is_some(), "both reads went");
+    }
+
     #[test]
     fn a_reader_asking_to_write_is_refused_rather_than_deadlocked() {
         let lock = ReentrantRwLock::new(());
@@ -559,5 +681,65 @@ mod tests {
         );
         drop(read);
         assert!(Polled::new(lock.write(&me)).ready().is_ok());
+    }
+
+    #[test]
+    fn a_write_entry_wakes_the_read_request_of_its_owner_queued_behind_it() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_write(&other).expect("free");
+        let mut write = Polled::new(lock.write(&me));
+        let mut read = Polled::new(lock.read(&me));
+        write.pending();
+        read.pending();
+        drop(theirs);
+        read.pending();
+        assert_eq!(read.wakes(), 0);
+        let writing = write.ready().expect("the owner reads nothing");
+        assert_eq!(read.wakes(), 1, "the owner's entry woke its other request");
+        let reading = read.ready();
+        drop((writing, reading));
+        assert!(lock.try_write(&other).is_some());
+    }
+
+    #[test]
+    fn a_read_entry_wakes_the_read_request_of_its_owner_queued_behind_a_writer() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other, third) = (Owner::new(), Owner::new(), Owner::new());
+        let theirs = lock.try_write(&other).expect("free");
+        let mut elder = Polled::new(lock.read(&me));
+        let mut writer = Polled::new(lock.write(&third));
+        let mut younger = Polled::new(lock.read(&me));
+        elder.pending();
+        writer.pending();
+        younger.pending();
+        drop(theirs);
+        younger.pending();
+        let first = elder.ready();
+        assert_eq!(
+            younger.wakes(),
+            1,
+            "the owner's entry woke its other request"
+        );
+        let second = younger.ready();
+        drop((first, second));
+        assert!(writer.poll().is_ready(), "the writer gets its turn");
+    }
+
+    #[test]
+    fn a_read_entry_wakes_the_write_request_of_its_owner_to_fail() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_write(&other).expect("free");
+        let mut read = Polled::new(lock.read(&me));
+        let mut write = Polled::new(lock.write(&me));
+        read.pending();
+        write.pending();
+        drop(theirs);
+        write.pending();
+        let reading = read.ready();
+        assert_eq!(write.wakes(), 1);
+        assert!(matches!(write.ready(), Err(ReadHeldByOwner)));
+        drop(reading);
     }
 }

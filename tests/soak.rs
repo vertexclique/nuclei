@@ -15,6 +15,8 @@
 //! `NUCLEI_SOAK_SECS=3600 cargo test --release --test soak -- --ignored --nocapture`
 //! (the length defaults to an hour; `NUCLEI_BACKEND` picks the backend).
 
+mod handles_support;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nuclei::io::{AsyncReadExt, AsyncWriteExt};
-use nuclei::net::{TcpListener, TcpStream, UdpSocket};
+use nuclei::net::{TcpListener, TcpStream, UdpSocket, UdpSocketBuilder};
 
 struct Live;
 
@@ -72,6 +74,16 @@ static ALLOCATOR: Live = Live;
 
 /// How long one step of any workload may take before the soak fails as hung.
 const DEADLINE: Duration = Duration::from_secs(120);
+/// On Windows, the pause before each short connection, which paces them; it waits for nothing.
+/// The short connections all go to one server, and Windows keeps a closed connection's port pair
+/// in TIME_WAIT for two minutes on both of its sides: a server's TIME_WAIT pins the pair too, so
+/// no connect toward the server gets that client port meanwhile. Its dynamic range holds 16384
+/// ports: an unpaced run had 13455 pairs in TIME_WAIT when its connect failed (`WSAEADDRINUSE`,
+/// after 168 seconds), and with the clients reading to the server's close, 7567 on the server's
+/// side and 6004 on the clients' (after 382 seconds). Eight churn tasks at four connections a
+/// second and the fault thread at under ten keep about 5000 (3594 at the end of a 20-minute run).
+#[cfg(windows)]
+const WINDOWS_CONNECT_PAUSE: Duration = Duration::from_millis(250);
 /// How often what the process holds is sampled.
 const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 
@@ -183,6 +195,8 @@ async fn serve(listener: TcpListener, totals: Arc<Totals>) {
 /// some reset part way, some give up part way, some read through timeouts.
 async fn churn(addr: std::net::SocketAddr, mut dice: Dice, totals: Arc<Totals>) {
     while totals.going() {
+        #[cfg(windows)]
+        nuclei::time::sleep(WINDOWS_CONNECT_PAUSE).await;
         let seed = dice.next();
         let len = 1 + dice.below(256 * 1024) as usize;
         let mut conn = within("a connect", TcpStream::connect(addr)).await.unwrap();
@@ -240,6 +254,14 @@ async fn churn(addr: std::net::SocketAddr, mut dice: Dice, totals: Arc<Totals>) 
                 }
                 Ok(Err(err)) => panic!("soak: an answer failed: {err}"),
             }
+        }
+        // The server's close comes first, so its side holds the connection's TIME_WAIT, not this
+        // client's port (see `WINDOWS_CONNECT_PAUSE`).
+        let mut end = [0u8; 1];
+        match within("the answer's end", conn.read(&mut end)).await {
+            Ok(0) => {}
+            Ok(_) => panic!("soak: bytes came past the answer"),
+            Err(err) => panic!("soak: the answer's end failed: {err}"),
         }
         totals.checked(len * 2);
         totals.connections.fetch_add(1, Ordering::Relaxed);
@@ -305,20 +327,49 @@ async fn stream(mut dice: Dice, totals: Arc<Totals>) {
     assert_eq!(read, at, "soak: a stream's reader read another count");
 }
 
+/// The socket buffers the soak's datagram sockets ask for, as an application that sends large
+/// datagrams sets them: macOS and FreeBSD refuse a datagram larger than the sender's buffer
+/// (`EMSGSIZE`; 9216 bytes for UDP by default, `net.inet.udp.maxdgram`, and 2048 for a Unix
+/// socket on macOS, `net.local.dgram.maxdgram`), and FreeBSD drops one its receiver's 42 080
+/// bytes have no room for, with its sender's address; std's sockets take the system's sizes
+/// as nuclei's do.
+const DATAGRAM_BUFFERS: u32 = 256 * 1024;
+
+/// A UDP socket on loopback whose buffers hold the largest datagram the soak sends.
+fn udp_socket() -> UdpSocket {
+    let socket = UdpSocketBuilder::new_v4().unwrap();
+    socket.set_send_buffer_size(DATAGRAM_BUFFERS).unwrap();
+    socket.set_recv_buffer_size(DATAGRAM_BUFFERS).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap()
+}
+
+/// The largest datagram the soak sends: what fits one loopback frame where the loopback's MTU is
+/// 16384 (FreeBSD, macOS), and 60 016 bytes elsewhere. A larger one is cut into IP fragments
+/// there, and the kernel's reassembly can join fragments of two datagrams that share an IP
+/// identifier (FreeBSD numbers them per CPU), with no checksum checked on loopback: a datagram
+/// with another's tail, or an old one's head (byte 16352 of a datagram is the first fragment's
+/// last payload byte plus one: 16384 - 20 - 8 rounded down to 8 bytes). That is the kernel's,
+/// not nuclei's, which hands each datagram to one receive.
+const MAX_DATAGRAM: usize = if cfg!(any(target_os = "freebsd", target_os = "macos")) {
+    16_384 - 20 - 8
+} else {
+    16 + 60_000
+};
+
 /// Datagrams over UDP, each checked whole by the number and length it
 /// carries. A receive given up on loses nothing: the datagram it would have
 /// taken comes to the next one, so a receive may get an earlier datagram,
 /// never one twice and never out of order on loopback.
 async fn datagrams(mut dice: Dice, totals: Arc<Totals>) {
-    let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a = udp_socket();
+    let b = udp_socket();
     let to = b.local_addr().unwrap();
     let mut next = 0u64;
     let mut last: Option<u64> = None;
     while totals.going() {
         let seq = next;
         next += 1;
-        let len = 16 + dice.below(60_000) as usize;
+        let len = 16 + dice.below((MAX_DATAGRAM - 16) as u64) as usize;
         let mut bytes = vec![0u8; len];
         bytes[..8].copy_from_slice(&seq.to_le_bytes());
         bytes[8..16].copy_from_slice(&(len as u64).to_le_bytes());
@@ -357,7 +408,24 @@ async fn datagrams(mut dice: Dice, totals: Arc<Totals>) {
 /// Datagrams over a Unix socket, which loses none: each arrives, in order.
 #[cfg(unix)]
 async fn unix_datagrams(mut dice: Dice, totals: Arc<Totals>) {
+    use std::os::fd::AsRawFd;
     let (a, b) = nuclei::net::UnixDatagram::pair().unwrap();
+    for fd in [a.get_ref().as_raw_fd(), b.get_ref().as_raw_fd()] {
+        for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            let size = DATAGRAM_BUFFERS as libc::c_int;
+            // SAFETY: a plain option set on our own socket, with a value of its size.
+            let set = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&raw const size).cast(),
+                    size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(set, 0, "{}", io::Error::last_os_error());
+        }
+    }
     let mut seq = 0u64;
     while totals.going() {
         let len = 1 + dice.below(4000) as usize;
@@ -483,31 +551,12 @@ fn count(dir: &str) -> Option<usize> {
     std::fs::read_dir(dir).ok().map(|d| d.count())
 }
 
-/// The descriptors open: from `/proc` on Linux, `/dev/fd` on macOS and the
-/// BSDs; on Windows the process's handles.
-#[cfg(unix)]
-fn fds() -> Option<usize> {
-    count("/proc/self/fd").or_else(|| count("/dev/fd"))
-}
-
-#[cfg(windows)]
-fn fds() -> Option<usize> {
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
-    }
-    let mut n = 0u32;
-    // SAFETY: the pseudo handle of this process, and a place for the count.
-    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
-    (ok != 0).then_some(n as usize)
-}
-
 fn sample(start: Instant, totals: &Totals) -> Sample {
     Sample {
         secs: start.elapsed().as_secs(),
         rss: rss(),
         heap: LIVE.load(Ordering::Relaxed),
-        fds: fds(),
+        fds: Some(handles_support::open_handles()),
         threads: count("/proc/self/task"),
         bytes: totals.bytes.load(Ordering::Relaxed),
     }
@@ -589,6 +638,8 @@ fn everything_at_once_for_a_long_time_holds_steady_and_checks_every_byte() {
                     _ => drop(conn),
                 }
                 std::thread::sleep(Duration::from_millis(dice.below(20)));
+                #[cfg(windows)]
+                std::thread::sleep(WINDOWS_CONNECT_PAUSE / 2);
             }
         })
     };

@@ -1,0 +1,37 @@
+TLC run of every configuration in proofs/tla/close, 2026-11-03 06:03 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+C_reads                           1200        546      1  pass                                  pass                                  yes
+C_stalls                           106         57      2  pass                                  pass                                  yes
+M_shut_first                        30         22      1  violated:FinMeansWhole                violated:FinMeansWhole                yes
+M_both_first                        30         22      1  violated:FinMeansWhole                violated:FinMeansWhole                yes
+M_abort_lingers                     11          9      1  violated:AbortDoesNotDrain            violated:AbortDoesNotDrain            yes
+M_abort_fin                         26         21      1  violated:FinMeansWhole                violated:FinMeansWhole                yes
+M_expiry_fin                        97         60      1  violated:FinMeansWhole                violated:FinMeansWhole                yes
+W_reset                             15         12      1  violated:NoReset                      violated:NoReset                      yes
+W_expiry                            24         17      2  violated:NoExpiry                     violated:NoExpiry                     yes
+W_shut_waits                         9          8      1  violated:NoShutWait                   violated:NoShutWait                   yes
+W_unix_cut                          97         60      1  violated:FinMeansWhole                violated:FinMeansWhole                yes
+R_linux                             21         15      1  pass                                  pass                                  yes
+R_other                             21         16      1  pass                                  pass                                  yes
+M_keep_ahead                        11         10      1  violated:AsStd                        violated:AsStd                        yes
+M_drop_on_linux                     10          8      1  violated:AsStd                        violated:AsStd                        yes
+M_drop_first                        19         18      1  violated:AsStd                        violated:AsStd                        yes
+W_dropped                            7          6      1  violated:NothingDropped               violated:NothingDropped               yes
+R_windows                           21         16      0  pass                                  pass                                  yes
+R_port_filled                       28         21      2  pass                                  pass                                  yes
+M_late_kept                         23         19      1  violated:AsStd                        violated:AsStd                        yes
+M_kernel_answers                     9          8      1  violated:AnswersEnd                   violated:AnswersEnd                   yes
+A_close_now                        408        230      1  pass                                  pass                                  yes
+A_close_now_deaf                   103         58      1  pass                                  pass                                  yes
+A_capped                           746        366      1  pass                                  pass                                  yes
+A_capped_deaf                      181         91      1  pass                                  pass                                  yes
+A_capped_on_wire                   481        214      1  pass                                  pass                                  yes
+M_uncapped_wait                     78         45      1  violated:Closes                       violated:Closes                       yes
+M_close_at_drain                   430        214      1  violated:ResetOrBound                 violated:ResetOrBound                 yes
+M_close_at_once                    321        152      1  violated:ResetOrBound                 violated:ResetOrBound                 yes
+W_cap_loss                         207        112      1  violated:NoCapLoss                    violated:NoCapLoss                    yes
+
+results matching EXPECTED.txt: 30 of 30

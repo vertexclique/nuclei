@@ -76,8 +76,10 @@ impl Handle<UdpSocket> {
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Connected)).await
     }
 
-    /// Receives a datagram from the connected peer; what does not fit `buf`
-    /// is cut.
+    /// Receives a datagram from the connected peer.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
     ///
     /// # Errors
     ///
@@ -122,7 +124,10 @@ impl Handle<UdpSocket> {
     /// Receives a datagram from the connected peer into the spare capacity
     /// of `buf`, after the bytes it holds, and gives `buf` back with the
     /// datagram's length. The driver receives into `buf` itself, so the bytes
-    /// are never copied; what does not fit is cut.
+    /// are never copied.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
     ///
     /// If the future is dropped before it completes, a datagram the driver
     /// received into `buf` stays with the socket for its next receive, so
@@ -137,6 +142,9 @@ impl Handle<UdpSocket> {
 
     /// Receives a datagram with its sender's address into the spare capacity
     /// of `buf`, as [`recv_owned`](Self::recv_owned).
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
     pub async fn recv_from_owned<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
     where
         B: IoBufMut,
@@ -147,6 +155,10 @@ impl Handle<UdpSocket> {
     }
 
     /// Looks at the next datagram without taking it.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit
+    /// and the datagram left queued.
     ///
     /// # Errors
     ///
@@ -168,6 +180,9 @@ impl Handle<UdpSocket> {
 
     /// Receives a datagram with its sender's address.
     ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
+    ///
     /// # Errors
     ///
     /// As `recvfrom(2)`.
@@ -177,6 +192,10 @@ impl Handle<UdpSocket> {
 
     /// Looks at the next datagram and its sender without taking it.
     ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit
+    /// and the datagram left queued.
+    ///
     /// # Errors
     ///
     /// As `recvfrom(2)` with `MSG_PEEK`.
@@ -185,8 +204,11 @@ impl Handle<UdpSocket> {
     }
 
     /// Polls for a datagram and its sender, received into the unfilled part
-    /// of `buf`, which advances by its length; what does not fit is cut.
+    /// of `buf`, which advances by its length.
     /// `Pending` with `cx`'s waker kept until one comes.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
     ///
     /// # Errors
     ///
@@ -279,8 +301,10 @@ impl Handle<UdpSocket> {
         super::at_once(|cx| self.source().poll_send(cx, buf, Dest::Connected))
     }
 
-    /// Receives a datagram from the connected peer without waiting; what
-    /// does not fit `buf` is cut.
+    /// Receives a datagram from the connected peer without waiting.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
     ///
     /// # Errors
     ///
@@ -290,6 +314,10 @@ impl Handle<UdpSocket> {
     }
 
     /// Looks at the next datagram without taking it or waiting.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit
+    /// and the datagram left queued.
     ///
     /// # Errors
     ///
@@ -309,6 +337,9 @@ impl Handle<UdpSocket> {
 
     /// Receives a datagram and its sender's address without waiting.
     ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
+    ///
     /// # Errors
     ///
     /// `WouldBlock` when none came yet, and as `recvfrom(2)`.
@@ -318,6 +349,10 @@ impl Handle<UdpSocket> {
 
     /// Looks at the next datagram and its sender without taking it or
     /// waiting.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit
+    /// and the datagram left queued.
     ///
     /// # Errors
     ///
@@ -343,8 +378,8 @@ impl Handle<UdpSocket> {
     /// As `recvfrom(2)` with `MSG_PEEK`.
     pub fn poll_peek_sender(&self, cx: &mut Context<'_>) -> Poll<io::Result<SocketAddr>> {
         // macOS names no sender for a receive into an empty buffer: a peek of one byte gets
-        // it named, and leaves the datagram whole on the socket. Windows names it for an
-        // empty one, and answers a peek cut short with an error.
+        // it named, and leaves the datagram whole on the socket. On Windows a peek into an
+        // empty buffer is the sender look, which a datagram of any length answers.
         #[cfg(unix)]
         let mut room = [0u8; 1];
         #[cfg(windows)]
@@ -354,7 +389,10 @@ impl Handle<UdpSocket> {
     }
 
     /// Receives a datagram from the connected peer into the unfilled part of
-    /// `buf`, which advances by its length; what does not fit is cut.
+    /// `buf`, which advances by its length.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
     ///
     /// # Errors
     ///
@@ -364,7 +402,10 @@ impl Handle<UdpSocket> {
     }
 
     /// Receives a datagram and its sender's address into the unfilled part
-    /// of `buf`, which advances by its length; what does not fit is cut.
+    /// of `buf`, which advances by its length.
+    ///
+    /// The caller sizes the buffer: on unix a longer datagram is cut to it, as std's receive cuts
+    /// it; on Windows the call answers `WSAEMSGSIZE`, as std's does, `buf` holding the bytes that fit.
     ///
     /// # Errors
     ///

@@ -60,6 +60,9 @@ pub(crate) struct Port {
     handle: HANDLE,
     /// Operations issued to this port whose packets were not dequeued yet.
     out: AtomicUsize,
+    /// Sources registered with another shard whose handles could not move off this port with
+    /// operations out: their operations still come here, so the port keeps a drainer for them.
+    waiting: AtomicUsize,
     /// Where the latencies of the operations go, when the runtime records
     /// them.
     #[cfg(feature = "io-stats")]
@@ -93,6 +96,25 @@ impl Port {
     /// port or on another the handle was moved to.
     pub(crate) fn completed(&self) {
         self.out.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// A source whose handle stays bound here waits to move to another shard's port.
+    pub(crate) fn wait_for_move(&self) {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A source that waited to move off this port moved, or went: a keeper waiting on the port
+    /// looks again, and leaves once none is out or waits.
+    pub(crate) fn moved(&self) {
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        // SAFETY: a packet with no operation, on this port's own handle.
+        unsafe { PostQueuedCompletionStatus(self.handle, 0, WAKE, core::ptr::null_mut()) };
+    }
+
+    /// Whether the port needs a drainer while its shard does not run: operations out on it, or
+    /// a source waiting to move off it (proofs/tla/port/PortKeep.tla, `Duplex`).
+    pub(crate) fn kept(&self) -> bool {
+        self.out() > 0 || self.waiting.load(Ordering::Acquire) > 0
     }
 
     /// Starts timing the operations issued from now on into `times`.
@@ -129,7 +151,7 @@ impl Port {
         mut deliver: impl FnMut(&OVERLAPPED_ENTRY),
     ) {
         let mut entries = [OVERLAPPED_ENTRY::zeroed(); 64];
-        while self.out() > 0 && !stopped() {
+        while self.kept() && !stopped() {
             let mut removed: ULONG = 0;
             // SAFETY: the entries buffer has room for its length in packets;
             // the kernel says how many it wrote.
@@ -312,6 +334,7 @@ impl Poller {
             port: Arc::new(Port {
                 handle,
                 out: AtomicUsize::new(0),
+                waiting: AtomicUsize::new(0),
                 #[cfg(feature = "io-stats")]
                 times: OnceLock::new(),
             }),
@@ -479,10 +502,20 @@ impl Timer {
 
 impl Notifier {
     pub(crate) fn notify(&self) {
-        // SAFETY: a packet with no operation, on a port that lives as long
-        // as this notifier. A full queue only drops a wake while another
-        // is pending, which wakes the shard all the same.
-        unsafe { PostQueuedCompletionStatus(self.port.handle, 0, WAKE, core::ptr::null_mut()) };
+        // A full queue only drops a wake while another is pending, which
+        // wakes the shard all the same.
+        super::notify_until_taken(|| {
+            // SAFETY: a packet with no operation, on a port that lives as
+            // long as this notifier.
+            let posted = unsafe {
+                PostQueuedCompletionStatus(self.port.handle, 0, WAKE, core::ptr::null_mut())
+            };
+            if posted == 0 {
+                Err(last_error())
+            } else {
+                Ok(())
+            }
+        });
     }
 }
 

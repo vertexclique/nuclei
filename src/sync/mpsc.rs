@@ -97,8 +97,9 @@
 //! On a nuclei shard, every receive that completes (`recv`, `recv_many` and
 //! the two `poll_` forms) spends one operation of its task's cooperative
 //! budget, as IO does, and so does a send or a reservation that completes
-//! at its first attempt; one whose slots were granted after it waited in
-//! line spends nothing, as giving them back would cost it its place. When
+//! in the poll that began it; one whose slots were granted in a later poll,
+//! after it waited in line, spends nothing, as giving them back would cost
+//! it its place. When
 //! the budget is spent the call takes nothing, wakes its task and returns
 //! `Pending`, so a loop on a channel that is always ready yields to the
 //! shard's other tasks within [`BUDGET`](crate::task::coop::BUDGET)

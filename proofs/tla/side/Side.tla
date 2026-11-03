@@ -24,25 +24,47 @@
 (* again if it waited); WAITING, it wakes the contended reader. Then it    *)
 (* tries again.                                                            *)
 (*                                                                          *)
+(* With `Defers` set, another thread leaves side-local work (a buffer that *)
+(* came back, a ring's completion: `Side::defer`): it writes its bits into  *)
+(* the side's deferred word first, then raises DEFER with its fetch_or of   *)
+(* BUSY. Free, it holds the side and does the work; held, the holder's     *)
+(* release fails on DEFER, takes it with its swap and does the work it     *)
+(* finds in the deferred word (`Held::run_deferred`). Bits written after   *)
+(* the flag could land after the holder looked, and nobody would do them. *)
+(*                                                                          *)
+(* With `Panics` set, the reader's step panics once as it registers its    *)
+(* waker (a user's waker clone, under the guard). The guard's drop         *)
+(* (`Held::drop`) lets the side go and wakes the contended polls, and      *)
+(* leaves the work others left in the word (READY, DEFER): the next holder *)
+(* does it, here the reader's task polling again.                          *)
+(*                                                                          *)
 (* What is modelled step by step: every access to the word (the fetch_or  *)
 (* takes, the release's compare-and-swap and swap), the read system call  *)
 (* apart from what the holder does with its answer, the arrival of bytes, *)
 (* the registration in the contended set, the wakes and the sleeps.        *)
 (*                                                                          *)
 (* What is abstract: bytes are a count; one reader (several tasks waiting *)
-(* on one side share its waker list, which the driver wakes whole).       *)
+(* on one side share its waker list, which the driver wakes whole); the    *)
+(* deferred work is one bit, and a deferrer that finds the side free takes *)
+(* it, does the work and lets go in one step (the order of the bits and   *)
+(* the flag matters only to a holder that is not the deferrer).           *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 
 CONSTANTS
     Total,     \* the bytes that arrive, one at a time
+    Defers,    \* TRUE: another thread leaves side-local work once
+    Panics,    \* TRUE: the reader's step panics once under the guard
     Mutation   \* "none", or the name of the one rule this run takes away
 
 (* --algorithm Side
 variables
     busy = FALSE,       \* the side's word: BUSY ...
     ready = FALSE,      \* ... READY ...
-    waiting = FALSE,    \* ... and WAITING
+    waiting = FALSE,    \* ... WAITING ...
+    defer = FALSE,      \* ... and DEFER: side-local work waits in the deferred word
+    bits = FALSE,       \* the deferred word holds work
+    deferRun = FALSE,   \* the deferred work was done
     kernel = 0,         \* bytes the kernel holds
     edges = 0,          \* edges not yet handed to the driver
     arrived = 0,        \* bytes that arrived
@@ -58,7 +80,8 @@ variables
     driverRead = FALSE, \* (record) the driver read for the reader
     submitRead = FALSE, \* (record) a reader's submit ran the driver's read
     wokenByHolder = FALSE, \* (record) the holder woke a contended reader
-    retook = FALSE;     \* (record) a contended reader found the side free and took it
+    retook = FALSE,     \* (record) a contended reader found the side free and took it
+    panicked = FALSE;   \* the reader's step panicked
 
 define
     AllDone == pc["reader"] = "Done" /\ pc["kernel"] = "Done"
@@ -126,12 +149,21 @@ D_check:
 D_serve:
         Serve("driver");
 D_cas:
-        \* Let go: one compare-and-swap from BUSY (its own READY masked) to zero.
-        if ~waiting then
+        \* Let go: one compare-and-swap from BUSY (its own READY masked) to zero; flags make it fail,
+        \* and are taken with one swap: DEFER, the deferred word's work is done; WAITING, the wakes.
+        if ~waiting /\ ~defer then
             busy := FALSE;
             goto D_deliver;
         else
-            waiting := FALSE;
+            if defer then                                                    \* `run_deferred`:
+                defer := FALSE;
+                if bits then bits := FALSE; deferRun := TRUE; end if;        \* the work the word holds
+            end if;
+            if waiting then
+                waiting := FALSE;
+            else
+                goto D_cas;                                                  \* nothing to wake: let go again
+            end if;
         end if;
 D_wake:
         \* The contended wakers are taken now, and woken once the side is let go.
@@ -184,7 +216,10 @@ R_park:
         contendWoken := FALSE;
         goto R_try;
 R_step:
-        if ahead > 0 then
+        if Panics /\ ~panicked /\ ahead = 0 then                              \* its waker's clone panics:
+            panicked := TRUE;
+            goto R_unwind;
+        elsif ahead > 0 then
             got := got + ahead; ahead := 0; out := "ready";
             goto R_cas;
         elsif blocked then
@@ -207,12 +242,17 @@ R_take:
         got := got + ahead; ahead := 0; out := "ready";
 R_cas:
         \* Let go: one compare-and-swap from BUSY to zero; flags make it fail.
-        if ~ready /\ ~waiting then
+        if ~ready /\ ~waiting /\ ~defer then
             busy := FALSE;
             goto R_after;
         end if;
 R_ready:
-        \* The flags, taken with one swap back to BUSY: READY is the driver's part, done here.
+        \* The flags, taken with one swap back to BUSY: DEFER first, the deferred word's work.
+        if defer then
+            defer := FALSE;
+            if bits then bits := FALSE; deferRun := TRUE; end if;
+        end if;
+        \* READY is the driver's part, done here.
         \* MUTATION release_ignores_ready: READY is taken and nothing done for it.
         if ready then
             ready := FALSE;
@@ -236,6 +276,41 @@ R_sleep:
             readerWoken := FALSE;
         end if;
     end while;
+    goto Done;
+R_unwind:
+    \* `Held::drop` as the panic unwinds: the side goes free and the contended polls are woken; the
+    \* work others left stays in the word for the next holder.
+    \* MUTATION unwind_clears: the drop swaps the whole word to zero, as it did, and the work is lost.
+    busy := FALSE;
+    if waiting then
+        waiting := FALSE;
+        if contended then contendWoken := TRUE; contended := FALSE; end if;
+    end if;
+    if Mutation = "unwind_clears" then
+        ready := FALSE;
+        defer := FALSE;
+    end if;
+    goto R_loop;                                                             \* the task polls again
+end process;
+
+\* Another thread leaves side-local work once (`Side::defer`): its bits, then the flag.
+fair process deferrer = "deferrer"
+begin
+F_bits:
+    \* MUTATION flag_before_bits: the flag goes up before the bits are in the deferred word.
+    if Defers /\ Mutation # "flag_before_bits" then bits := TRUE; end if;
+F_flag:
+    \* One fetch_or of BUSY | DEFER. Free: the deferrer holds the side, does the work it finds and lets go.
+    \* Held: DEFER is the holder's.
+    if Defers then
+        if ~busy then
+            if bits then bits := FALSE; deferRun := TRUE; end if;
+        else
+            defer := TRUE;
+        end if;
+    end if;
+F_late:
+    if Defers /\ Mutation = "flag_before_bits" then bits := TRUE; end if;   \* (mutated) the bits come last
 end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
@@ -253,8 +328,11 @@ Conservation == got + ahead + kernel = arrived
 
 \* One holder at a time, and the word says so.
 DriverHolds == pc["driver"] \in {"D_serve", "D_cas", "D_wake"}
-ReaderHolds == pc["reader"] \in {"R_step", "R_read", "R_mark", "R_take", "R_cas", "R_ready", "R_wake"}
+ReaderHolds == pc["reader"] \in {"R_step", "R_read", "R_mark", "R_take", "R_cas", "R_ready", "R_wake", "R_unwind"}
 Exclusive == ~(DriverHolds /\ ReaderHolds) /\ ((DriverHolds \/ ReaderHolds) => busy)
+
+\* Work left in the deferred word is done in the end.
+DeferDone == Defers => <>deferRun
 
 \* `Termination` (every thread finishes, so every byte reached the reader and no wake was lost) is
 \* the one the translator writes for the fair processes.

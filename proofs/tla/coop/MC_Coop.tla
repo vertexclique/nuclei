@@ -12,4 +12,10 @@ Recvs == <<"recv", "recv", "recv">>
 Acqs == <<"acq", "acq", "acq">>
 \* Both kinds in one poll.
 Mixed == <<"recv", "acq", "recv">>
+\* Two receives, a `block_on` nested in the poll whose future receives too, and two more.
+Nested == <<"recv", "recv", "nest", "recv", "recv">>
+\* An IO operation that answers Pending, then two receives.
+Pended == <<"pend", "recv", "recv">>
+\* Three awaits of handles whose tasks already finished.
+Joins == <<"join", "join", "join">>
 =============================================================================

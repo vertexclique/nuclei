@@ -1,0 +1,7 @@
+# configuration                spec                 expected
+T_race                         MC_Timeout           pass
+T_elapses                      MC_Timeout           pass
+T_far                          MC_Timeout           pass
+M_sleep_first                  MC_Timeout           violated:ReadyWins
+M_timeout_unchecked            MC_Timeout           violated:InRange
+M_no_sleep_poll                MC_Timeout           violated:Ends

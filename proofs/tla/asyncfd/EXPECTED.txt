@@ -4,6 +4,11 @@ AF_edges_safe                  MC_AsyncFd           pass
 AF_ring                        MC_AsyncFd           pass
 MAF_no_tick                    MC_AsyncFd           violated:AllTaken
 WAF_kept                       MC_AsyncFd           violated:NoKept
+AF_two                         MC_AsyncFd           pass
+AF_two_ring                    MC_AsyncFd           pass
+AF_three                       MC_AsyncFd           pass
+MAF_drop_held_clear            MC_AsyncFd           violated:NoSpuriousReady
+MAF_clear_last_wins            MC_AsyncFd           violated:NoSpuriousReady
 CM_edges_safe                  MC_CallerMode        pass
 CM_edges                       MC_CallerMode        pass
 CM_ring_safe                   MC_CallerMode        pass
@@ -12,6 +17,10 @@ MCM_no_held_check              MC_CallerMode        violated:InOrder
 MCM_no_wake                    MC_CallerMode        violated:AllTaken
 WCM_busy                       MC_CallerMode        violated:NoBusy
 WCM_stopped_empty              MC_CallerMode        violated:NoStoppedEmpty
+CM_ring_poll                   MC_CallerMode        pass
+MCM_poll_not_stopped           MC_CallerMode        violated:AllTaken
 CW_safe                        MC_CallerWrite       pass
 CW_live                        MC_CallerWrite       pass
 MCW_no_flush_wait              MC_CallerWrite       violated:OutOrder
+CW_tight                       MC_CallerWrite       pass
+MCW_no_write_tick              MC_CallerWrite       violated:AllOut

@@ -5,8 +5,9 @@
 //! [`pause`](crate::time::pause) stops it (or a runtime built with
 //! [`start_paused`](crate::Builder::start_paused) starts stopped); a paused
 //! clock moves only by [`advance`](crate::time::advance), or by itself when every shard of its
-//! runtime is idle with a timer armed: it then jumps to the earliest timer, so
-//! code that sleeps runs at once in tests. Timers fire on the wheel's
+//! runtime is idle with a timer armed, no blocking job runs and no poll the
+//! handoff took from its worker still runs: it then jumps to the earliest
+//! timer, so code that sleeps runs at once in tests. Timers fire on the wheel's
 //! millisecond: a timer waits at least its duration, rounded up to the next
 //! millisecond, and a shard busy with a task fires it once that task yields.
 //! [`sleep_precise`](crate::time::sleep_precise) waits to the microsecond
@@ -42,8 +43,19 @@ use core::time::Duration;
 /// Stops the clock of the runtime this code runs in (or of the default
 /// runtime): [`Instant::now`] stands still, and timers fire only as the clock
 /// is moved, by [`advance`] or by itself whenever every shard of the runtime is
-/// idle with a timer armed (it jumps to the earliest one). A paused clock stays
-/// paused.
+/// idle with a timer armed, no blocking job runs and no poll the handoff took
+/// from its worker still runs (it jumps to the earliest timer). A paused clock
+/// stays paused, and never reads earlier than a time it gave before the pause.
+/// A nested `block_on` of another runtime on the same thread keeps its own
+/// clock and timers, and its paused clock does not count that shard.
+///
+/// The shards counted are the runtime's workers and the shards of the threads
+/// that entered its `block_on` while the clock was already paused. A thread
+/// inside `block_on` from before a pause made elsewhere (in a spawned task on a
+/// worker, say) is not counted: a sleep it waits on is no jump target, and
+/// waits until something else wakes the thread, which may be never. Pause in
+/// the `block_on` future itself, before it, or with
+/// [`start_paused`](crate::Builder::start_paused).
 ///
 /// ```
 /// use std::time::Duration;
@@ -87,5 +99,5 @@ pub async fn advance(duration: Duration) {
     crate::task::yield_now().await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests;

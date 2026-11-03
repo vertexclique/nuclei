@@ -18,7 +18,7 @@ use crate::syscore::linux::iouring::ring::RingConfig;
 
 /// A shard on a ring whose table holds `files` fixed files, or `None` where
 /// the kernel gives no ring.
-fn ring_shard(files: u32) -> Option<Shard> {
+pub(super) fn ring_shard(files: u32) -> Option<Shard> {
     TABLE_FOR_TEST.with(|t| t.set(Some(files)));
     let shard = Shard::new(Limits {
         max_nesting: 8,
@@ -187,6 +187,211 @@ fn a_retire_returns_only_once_the_rings_read_is_cancelled() {
     assert_eq!(shard.ring().unwrap().files_in_use(), (0, 0));
 }
 
+/// A read the kernel still holds as its shard's bounded wait for the cancel ran out: the shard
+/// gives up on it (`ShardRing::shut_down`'s last step), and it ends for its task with an error and
+/// counts out, so a retire of its source returns. Before, it was forgotten with no end, and the
+/// task and any later retire waited for good (`proofs/tla/keeper/Forgot.tla`).
+#[test]
+fn a_read_its_shard_gives_up_on_ends_with_an_error_and_a_retire_returns() {
+    let Some(shard) = ring_shard(4) else { return };
+    let (_mine, src, _peer) = source_pair();
+    let reader = Arc::clone(&src);
+    let mut buf = [0u8; 8];
+    let mut read = Box::pin(poll_fn(move |cx| reader.poll_read(cx, &mut buf, false)));
+    {
+        let _current = context::enter(&shard);
+        shard.block_on(async {
+            let polled = poll_fn(|cx| core::task::Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(polled.is_pending(), "the peer wrote nothing yet");
+            // A write that completes through the ring takes the queued read to the kernel with it.
+            poll_fn(|cx| src.poll_write(cx, b"!")).await.unwrap();
+            poll_fn(|cx| src.poll_flush(cx)).await.unwrap();
+        });
+        let ring = shard.ring().unwrap();
+        assert!(ring.in_flight() > 0, "the read is not in the kernel");
+        let before = super::leaked();
+        ring.forget_stuck();
+        assert!(super::leaked() > before, "nothing was given up on");
+        let end = shard.block_on(poll_fn(|cx| {
+            core::task::Poll::Ready(read.as_mut().poll(cx))
+        }));
+        assert!(
+            matches!(end, core::task::Poll::Ready(Err(_))),
+            "the read given up on did not end with an error: {end:?}"
+        );
+    }
+    // The shard goes, as `shut_down` lets go of the ring right after it gives up.
+    drop(shard);
+    let (done, retired) = std::sync::mpsc::channel();
+    let retiring = {
+        let src = Arc::clone(&src);
+        std::thread::spawn(move || {
+            src.retire();
+            let _ = done.send(());
+        })
+    };
+    assert!(
+        retired.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the retire waits for a read its shard gave up on: {}",
+        src.write_report()
+    );
+    retiring.join().unwrap();
+}
+
+/// A file's call the kernel still holds as its shard's bounded wait for the cancel ran out: its
+/// slot gets an error, so its task does not wait for good, and its buffer stays with the kernel,
+/// which may still write it (`proofs/tla/keeper/Forgot.tla`).
+#[test]
+fn a_file_call_its_shard_gives_up_on_ends_with_an_error() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let Some(shard) = ring_shard(4) else { return };
+    let _current = context::enter(&shard);
+    let mut fds = [0; 2];
+    // SAFETY: the kernel fills the two descriptors of our array, owned at once below.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: just made, owned once each.
+    let (read_end, _write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let file = Source::new(read_end.as_raw_fd(), Kind::File);
+    let lease = file.lease().unwrap();
+    let mut held = Some(crate::buf::owned::OwnedBuf::Vec(Vec::with_capacity(8)));
+    let waker = std::task::Waker::noop();
+    let mut job = crate::fs::ring::read_lent(&lease, u64::MAX, &mut held, waker)
+        .expect("the call goes on the ring");
+    // The shard's next look hands the read to the kernel, where it waits for the pipe's bytes.
+    shard.block_on(async {});
+    let ring = shard.ring().unwrap();
+    assert!(ring.in_flight() > 0, "the read is not in the kernel");
+    ring.forget_stuck();
+    assert!(
+        matches!(job.poll(waker), core::task::Poll::Ready((Err(_), _))),
+        "the call given up on left its slot empty"
+    );
+}
+
+/// A file's read on a pipe, out on the ring of `shard` and left in the kernel when the shard
+/// goes (the cancel is skipped, as for a call that ignores it). The pipe's write end comes
+/// back with the job and the source, to keep them alive.
+pub(super) fn pipe_read_out(shard: &Shard) -> PipeRead {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let _current = context::enter(shard);
+    let mut fds = [0; 2];
+    // SAFETY: the kernel fills the two descriptors of our array, owned at once below.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: just made, owned once each.
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let file = Source::new(read_end.as_raw_fd(), Kind::File);
+    let lease = file.lease().unwrap();
+    let mut held = Some(crate::buf::owned::OwnedBuf::Vec(Vec::with_capacity(4096)));
+    let job = crate::fs::ring::read_lent(&lease, u64::MAX, &mut held, std::task::Waker::noop())
+        .expect("the call goes on the ring");
+    // The shard's next look hands the read to the kernel, where it waits for the pipe's bytes.
+    shard.block_on(async {});
+    assert!(
+        shard.ring().unwrap().in_flight() > 0,
+        "the read is not in the kernel"
+    );
+    PipeRead {
+        job,
+        write_end,
+        _read_end: read_end,
+        _file: file,
+        _lease: lease,
+    }
+}
+
+pub(super) struct PipeRead {
+    pub(super) job: crate::fs::call::SlotJob<crate::fs::call::LentReadEnd>,
+    pub(super) write_end: std::os::fd::OwnedFd,
+    _read_end: std::os::fd::OwnedFd,
+    _file: Arc<Source>,
+    _lease: super::Lease,
+}
+
+/// A file's call out when the short wait ends is not given up on: the shard keeps reaping it up
+/// to the linger time, so a read the kernel ends after 1.5 s is applied, with every byte, and
+/// nothing is given up or counted (`proofs/tla/keeper/Forgot.tla`).
+#[test]
+fn a_file_call_that_outlasts_the_short_wait_is_reaped_before_its_shard_goes() {
+    if !crate::alone::alone(
+        "rt::shard::ring::tests::a_file_call_that_outlasts_the_short_wait_is_reaped_before_its_shard_goes",
+    ) {
+        return;
+    }
+    let Some(shard) = ring_shard(4) else { return };
+    if !shard.ring().is_some_and(|ring| !ring.reapable()) {
+        eprintln!("skipping: a keeper can take this ring");
+        return;
+    }
+    let mut pipe = pipe_read_out(&shard);
+    let pattern: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+    let writer = {
+        let pattern = pattern.clone();
+        let write_end = pipe.write_end.try_clone().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            std::fs::File::from(write_end).write_all(&pattern).unwrap();
+        })
+    };
+    let leaked = super::leaked();
+    let given_up = crate::stats().operations_given_up;
+    super::keeper::SKIP_CANCEL_FOR_TEST.with(|skip| skip.set(true));
+    drop(shard);
+    super::keeper::SKIP_CANCEL_FOR_TEST.with(|skip| skip.set(false));
+    writer.join().unwrap();
+    let end = pipe.job.poll(std::task::Waker::noop());
+    let core::task::Poll::Ready((Ok(n), crate::buf::owned::OwnedBuf::Vec(got))) = end else {
+        panic!(
+            "the read did not end with its bytes: {:?}",
+            end.map(|(r, _)| r)
+        );
+    };
+    assert_eq!(n, pattern.len());
+    assert_eq!(got, pattern, "the bytes read differ");
+    assert_eq!(super::leaked(), leaked, "a file call was given up on");
+    assert_eq!(crate::stats().operations_given_up, given_up);
+}
+
+/// A file's call the kernel still holds when the linger time ran out is given up on: its slot
+/// gets an error, it is counted, and the drop returns by the linger time, not later.
+#[test]
+fn a_file_call_past_the_linger_time_is_given_up_said_and_counted() {
+    if !crate::alone::alone(
+        "rt::shard::ring::tests::a_file_call_past_the_linger_time_is_given_up_said_and_counted",
+    ) {
+        return;
+    }
+    let Some(shard) = ring_shard(4) else { return };
+    if !shard.ring().is_some_and(|ring| !ring.reapable()) {
+        eprintln!("skipping: a keeper can take this ring");
+        return;
+    }
+    let mut pipe = pipe_read_out(&shard);
+    let leaked = super::leaked();
+    let given_up = crate::stats().operations_given_up;
+    super::keeper::SKIP_CANCEL_FOR_TEST.with(|skip| skip.set(true));
+    super::keeper::FILE_WAIT_FOR_TEST.with(|wait| wait.set(Some(Duration::from_millis(200))));
+    let started = std::time::Instant::now();
+    drop(shard);
+    let took = started.elapsed();
+    super::keeper::SKIP_CANCEL_FOR_TEST.with(|skip| skip.set(false));
+    super::keeper::FILE_WAIT_FOR_TEST.with(|wait| wait.set(None));
+    assert!(
+        took < Duration::from_secs(5),
+        "the drop ignored the linger time: {took:?}"
+    );
+    assert!(
+        matches!(
+            pipe.job.poll(std::task::Waker::noop()),
+            core::task::Poll::Ready((Err(_), _))
+        ),
+        "the call given up on left its slot without an error"
+    );
+    assert_eq!(super::leaked(), leaked + 1);
+    assert!(crate::stats().operations_given_up > given_up);
+}
+
 /// A shard that goes with a read out on its ring cancels it and waits for
 /// its completion: no operation is left with memory the kernel may write.
 #[test]
@@ -280,4 +485,70 @@ fn a_shard_short_of_memory_for_a_ring_runs_the_poller_under_auto() {
         panic!("a runtime that asked for io_uring by name started without memory for a ring");
     };
     assert_eq!(err.raw_os_error(), Some(libc::ENOMEM), "{err}");
+}
+
+/// A source whose fixed file the kernel refuses to take out of the table as it retires (no
+/// memory for the update): the slot stays held with the file in it, and the ring's next wait,
+/// which a timer brings though nothing else is out, takes the file out, so the peer sees the end
+/// once the object closed. Before, the refusal was ignored and the slot released: the table kept
+/// the file open and the peer never saw the end (proofs/tla/ring/RingClose.tla,
+/// `MC_update_ignored`). Gated on a kernel that lets go of a file out of the table at once (Linux
+/// 6.13): before, the ring's armed wake read alone keeps it open.
+#[test]
+fn a_refused_take_out_is_tried_again_until_the_file_leaves_the_table() {
+    use std::time::Instant;
+
+    use super::REFUSE_TAKE_OUT_FOR_TEST;
+
+    if !crate::syscore::linux::iouring::files::release_at_once() {
+        eprintln!("skipping: this kernel lets go of a file out of the table only late");
+        return;
+    }
+    let Some(shard) = ring_shard(1) else { return };
+    let _current = context::enter(&shard);
+    let (mine, src, peer) = source_pair();
+    shard.block_on(write_through(&src, &peer, b"fixed"));
+    let ring = shard.ring().expect("a ring shard");
+    assert_eq!(ring.files_in_use(), (1, 0), "the source took no fixed file");
+    REFUSE_TAKE_OUT_FOR_TEST.with(|n| n.set(1));
+    src.retire();
+    REFUSE_TAKE_OUT_FOR_TEST.with(|n| n.set(0));
+    assert_eq!(
+        ring.files_in_use(),
+        (1, 0),
+        "the slot was released with its file still in the table"
+    );
+    drop(mine);
+    peer.set_nonblocking(true).unwrap();
+    let (saw, seen) = crate::sync::oneshot::channel();
+    let looker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pause = Duration::from_micros(50);
+        let ended = loop {
+            match (&peer).read(&mut [0u8; 8]) {
+                Ok(0) => break true,
+                Ok(n) => panic!("the peer read {n} bytes after the retire"),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("the peer's read failed: {err}"),
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(5));
+        };
+        let _ = saw.send(ended);
+    });
+    // The shard waits for nothing but the looker's answer: only the retry's timer wakes its ring.
+    let ended = shard.block_on(seen).unwrap();
+    looker.join().unwrap();
+    assert!(
+        ended,
+        "the peer never saw the end: the ring's table kept the file"
+    );
+    assert_eq!(
+        ring.files_in_use(),
+        (0, 0),
+        "the retried slot was never freed"
+    );
 }

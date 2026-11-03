@@ -33,7 +33,7 @@
 
 use core::task::{Poll, Waker};
 
-use super::internal::Ordering;
+use super::internal::{OnUnwind, Ordering};
 use super::queue::{HANDOFF, Policy, stops_spin};
 use super::spin::Gaps;
 use super::waiter::{Cancel, Park, Wait};
@@ -96,7 +96,11 @@ pub(super) trait Lock: Policy {
     /// takes `need` as [`try_take`](Self::try_take) would, or in the same
     /// compare-and-swap is owed a handoff (see `Policy::owe_or_take`).
     fn take_or_owe(&self, wait: &Wait, need: usize) -> Result<(), usize> {
-        self.owe_or_take(wait, |state| self.admit(state, need))
+        self.owe_or_take(
+            wait,
+            |state| self.admit(state, need),
+            || self.give_back(need),
+        )
     }
 }
 
@@ -183,17 +187,23 @@ fn spin_take<L: Lock>(lock: &L, need: usize, mut seen: usize) -> bool {
     false
 }
 
-/// A first poll took `need` without waiting: it spends one operation of the
-/// poll's budget (see `coop`), or, with the budget spent, gives `need` back
-/// and yields. A grant to a queued waiter spends nothing: that wait yielded,
-/// and giving the grant back would cost it its place.
+/// A first poll took `need` without waiting, by its own attempt or by a grant
+/// or retry in the poll that queued it: it spends one operation of the poll's
+/// budget (see `coop`), or, with the budget spent, gives `need` back and
+/// yields. A grant to a waiter that queued in an earlier poll spends nothing:
+/// that wait yielded, and giving the grant back would cost it its place.
 #[inline]
 pub(super) fn taken_at_once<L: Lock + ?Sized>(
     lock: &L,
     need: usize,
     waker: &Waker,
 ) -> Poll<Result<(), Closed>> {
-    admitted(lock, need, crate::coop::spend(waker))
+    let admit = crate::coop::try_spend();
+    let polled = admitted(lock, need, admit);
+    if !admit {
+        crate::coop::refused(waker);
+    }
+    polled
 }
 
 /// What a first attempt that took `need` comes to once the budget answered:
@@ -273,6 +283,10 @@ impl Contend {
         seen: Option<usize>,
     ) -> Poll<Result<(), Closed>> {
         let queue = lock.queue();
+        // Whether the wait queued in this poll: what it gets before the poll
+        // ends it did not yield for, so it spends from the budget as a take
+        // at once does.
+        let mut queued_now = false;
         let mut park = if self.wait.is_queued() {
             self.wait.park(queue, Some(waker))
         } else {
@@ -299,6 +313,7 @@ impl Contend {
                 }
             }
             lock.enqueue(&mut self.wait, need, waker);
+            queued_now = true;
             self.wait.park(queue, None)
         };
         loop {
@@ -306,11 +321,17 @@ impl Contend {
                 Park::Granted(payload) => {
                     // A nudge may have been pending when the grant came.
                     queue.consume_nudge();
-                    return Poll::Ready(if payload == CLOSED_GRANT {
-                        Err(Closed)
-                    } else {
-                        Ok(())
-                    });
+                    if payload == CLOSED_GRANT {
+                        return if !queued_now || crate::coop::spend(waker) {
+                            Poll::Ready(Err(Closed))
+                        } else {
+                            Poll::Pending
+                        };
+                    }
+                    if queued_now {
+                        return taken_at_once(lock, need, waker);
+                    }
+                    return Poll::Ready(Ok(()));
                 }
                 Park::Pending => return Poll::Pending,
                 // A nudge means something was freed after this waiter
@@ -333,7 +354,14 @@ impl Contend {
                             if L::SPINS && queue.spin.rounds() == 0 {
                                 queue.spin.won(0);
                             }
+                            // The cancel runs other tasks' wakes and drops a
+                            // waker: a panic there must not lose the take.
+                            let undo = OnUnwind::new(|| lock.give_back(need));
                             self.cancel(lock, need);
+                            undo.disarm();
+                            if queued_now {
+                                return taken_at_once(lock, need, waker);
+                            }
                             return Poll::Ready(Ok(()));
                         }
                         // Never past the bound: a waiter that is owed, was
@@ -363,7 +391,7 @@ impl Contend {
     pub(super) fn cancel<L: Lock>(&mut self, lock: &L, need: usize) {
         match self.wait.cancel(lock.queue()) {
             Cancel::Idle => {}
-            Cancel::Withdrawn(woken) => lock.withdrawn(woken),
+            Cancel::Withdrawn(woken, _shelved) => lock.withdrawn(woken),
             Cancel::Granted(payload) => {
                 lock.queue().consume_nudge();
                 // A grant made because the primitive closed took nothing.

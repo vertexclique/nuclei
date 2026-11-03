@@ -157,6 +157,19 @@ fn a_full_buffer_is_reached_and_never_passed_under_try_send() {
         .collect();
     drop(tx);
 
+    // Nobody drains until a sender has found the buffer full: the bound is then
+    // exercised on every run, not only when the receiver happens to fall behind.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut pause = std::time::Duration::from_micros(50);
+    while full.load(Ordering::Relaxed) == 0 && !cfg!(miri) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no sender found the buffer of {buffer} full while nobody drained it"
+        );
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(5));
+    }
+
     let mut ledger = Ledger::new(senders, per_sender);
     while let Some(msg) = block_on(rx.recv()) {
         ledger.take(&msg);

@@ -47,24 +47,72 @@
 (* finite completions take more than the queue's C slots: the room the cap *)
 (* keeps is for them.                                                      *)
 (*                                                                         *)
+(* A side that reads by readiness (a stream read straight into the task's  *)
+(* buffer, a datagram socket whose task receives itself) keeps a multishot *)
+(* poll armed (`ReadyMulti`, `ReadyStream` in src/io/source/read/ops.rs),  *)
+(* and each of its edges is an entry of the queue; the ring's own cancels  *)
+(* (`ShardRing::cancel`) each complete with one too. Neither has room kept: *)
+(* their number follows the sides and their peers, not the cap, so the     *)
+(* queue may need more than its C slots for them, and the kernel holds the *)
+(* rest past it as it holds an accept's connections. A multishot poll's    *)
+(* edge that finds the queue full ends the poll instead (Linux posts the   *)
+(* edges of a multishot operation only into room, and ends it otherwise:   *)
+(* `Kernel = "ends"`; kernels before that held them past the queue too:    *)
+(* `"overflows"`). Its end wakes the side's tasks, and the next one that   *)
+(* waits arms another (`ReadyMultiEnd` in `ReadState::op_done`), whose     *)
+(* first look at the socket reports bytes already there, so no edge is     *)
+(* lost. What must happen: a poll the kernel ended is armed again          *)
+(* (`EndedRearmed`).                                                       *)
+(*                                                                         *)
 (* What is modelled: the queue size, the group size, the cap, multishot    *)
 (* long-lived operations that never end by themselves, one-shot ones of    *)
 (* each side that end when their peer acts, finite operations that come    *)
 (* and complete, the line of room, data arriving in the group and being    *)
-(* taken. What is abstract: what the operations do, time, and the entries  *)
+(* taken, the multishot polls' edges, their end on a full queue and their  *)
+(* arming again, the ring's cancels, and the entries the kernel holds past *)
+(* the queue. What is abstract: what the operations do, time, and the entries  *)
 (* no room is kept for: an accept's connections and the end of each        *)
 (* long-lived operation. Past the queue the kernel holds those             *)
 (* (IORING_FEAT_NODROP, which the poller requires) until the shard takes   *)
 (* them: none is lost, and none holds up a finite operation                *)
 (* (tests/cq_overflow.rs ends many times the queue's entries at once).     *)
+(*                                                                         *)
+(* With `AllocFails` set, the kernel's memory for an entry it holds past   *)
+(* the queue may not be had (its allocation is `GFP_NOWAIT` or charged to  *)
+(* a memory cgroup at its limit): the kernel drops the entry, counts it    *)
+(* (the rings' `cq.overflow`), and its next wait for completions answers   *)
+(* `EBADR` once, after which the ring works again. The shard takes that    *)
+(* answer as news, not as its end: it counts what the kernel dropped since *)
+(* it last looked (src/rt/park/ring.rs, the poller's wait), says it at     *)
+(* error, and goes on (`ShardLives`, `DropsCounted`). Before, the shard    *)
+(* panicked (`panic_on_dropped`). It also recovers (src/rt/shard/ring/     *)
+(* recover.rs): it cancels every operation it still has out, and each      *)
+(* still in the kernel ends with that cancel, its side arming another;     *)
+(* then it sweeps every operation whose end never came, ending it for its  *)
+(* side with an error that says the kernel dropped it, so a poll whose end *)
+(* was dropped is armed again too (`DroppedRecovered`). The cancel comes   *)
+(* first so that the sweep finds only what the kernel no longer holds      *)
+(* (`NoFalseSweep`). In the code the sweep comes a bounded time after the  *)
+(* cancel (a socket's operation and a child's exit watch 1 s, a file's     *)
+(* call, which ignores a cancel once the kernel runs it, the runtime's     *)
+(* linger time); one that outlasts it is ended with the error and keeps    *)
+(* its memory until its own end, if that ever comes, so a late end never   *)
+(* touches freed memory. A zero-copy send that only holds its buffer until *)
+(* its peer acknowledges the bytes is not swept: no cancel ends that wait, *)
+(* which may last for good.                                                *)
 (***************************************************************************)
-EXTENDS Integers
+EXTENDS Integers, FiniteSets
 
 CONSTANTS
     C,         \* completion queue slots of the ring
     G,         \* receive buffers the configuration asks for (a power of two)
     MaxLong,   \* long-lived operations of each kind the environment may start
     MaxFin,    \* finite operations the environment may start
+    Polls,     \* multishot polls of sides that read by readiness, armed from the start
+    MaxEdges,  \* edges the polls bring over the run
+    MaxCancel, \* cancels the ring makes of its own
+    Kernel,    \* "ends": a multishot edge that finds the queue full ends its poll; "overflows": it is held past the queue
+    AllocFails, \* TRUE: an entry the kernel would hold past the queue may be dropped instead, for want of memory
     Mode       \* "ok", or the name of the one rule this run takes away
 
 Min(a, b) == IF a < b THEN a ELSE b
@@ -90,7 +138,22 @@ variables
     fin = 0,       \* finite operations in the kernel
     room = 0,      \* finite operations waiting for room
     made = 0,      \* finite operations started so far
-    arr = 0;       \* arrivals in the queue, one per group buffer in use
+    arr = 0,       \* arrivals in the queue, one per group buffer in use
+    ps = [i \in 1..Polls |-> "armed"], \* each poll: "armed" (in the kernel), "ended" (its end reached its side,
+                                     \* which arms another), "lost" (its end dropped: still in the ring's table)
+    pedges = 0,    \* poll edges in the queue
+    brought = 0,   \* edges the polls brought so far
+    cancels = 0,   \* the ring's cancels' completions in the queue
+    cancelled = 0, \* cancels the ring made so far
+    over = 0,      \* entries the kernel holds past the queue (`IORING_FEAT_NODROP`)
+    dropped = 0,   \* entries the kernel dropped for want of memory (its `cq.overflow` count)
+    unsaid = FALSE, \* the kernel dropped one and its waits have not answered `EBADR` for it yet
+    counted = 0,   \* entries the shard counted as dropped
+    alive = TRUE,  \* the shard runs
+    recovering = FALSE, \* a drop was said: the shard cancels what is out and then sweeps
+    snap = [i \in 1..Polls |-> FALSE], \* the poll is one of those out when the drop was said (the sweep's)
+    recCancel = FALSE,  \* the recovery's cancel went in: every poll then in the kernel ended
+    falseSweep = FALSE; \* (record) the sweep ended a poll the kernel still held
 
 define
     \* Operations the ring counts against the cap.
@@ -99,6 +162,8 @@ define
     Counted == fin + (IF Mode = "no_long_exemption" THEN long ELSE 0)
                    + (IF Mode = "once_counted" THEN once ELSE 0)
                    + (IF Mode = "sends_counted" THEN sends ELSE 0)
+    \* Entries in the queue now, the finite operations counted as if they all completed.
+    Used == arr + fin + pedges + cancels
     \* No finite operation waits while none is in the kernel to free room.
     NoRoomDeadlock == ~(room > 0 /\ fin = 0)
     \* The queue holds no more waiting entries than it has slots.
@@ -108,12 +173,22 @@ define
     LongWithinCap == long <= Cap
     OnceWithinCap == once <= Cap
     SendsWithinCap == sends <= Cap
+    \* Witness: the queue never needs more than its slots, so the kernel holds nothing past it.
+    NoOverflow == over = 0
+    \* The shard never ends for a completion the kernel dropped.
+    ShardLives == alive
+    \* The sweep never ends an operation the kernel still holds.
+    NoFalseSweep == ~falseSweep
+    \* Polls in the kernel, ended and waiting for their side to arm another, and lost.
+    Armed == {i \in 1..Polls : ps[i] = "armed"}
+    Ended == Cardinality({i \in 1..Polls : ps[i] = "ended"})
+    Lost == Cardinality({i \in 1..Polls : ps[i] = "lost"})
 end define;
 
 fair process ring = 1
 begin
 Step:
-    while TRUE do
+    while alive do
         either
             \* A long-lived operation is armed. With the exemption it goes in at
             \* once; without it, it counts and goes in only while the cap has room.
@@ -164,10 +239,155 @@ Step:
             \* A reader takes an arrival and the buffer goes back to the group.
             await arr > 0;
             arr := arr - 1;
+        or
+            \* An armed poll's socket became ready: its edge goes into the queue if there is room. A full
+            \* queue ends the poll (its end, which the kernel holds past the queue, wakes the side), or on
+            \* an older kernel holds the edge past the queue.
+            await Armed # {} /\ brought < MaxEdges;
+            brought := brought + 1;
+            if Used < C then
+                pedges := pedges + 1;
+            elsif Kernel = "ends" then
+                \* The poll's end is held past the queue, or with `AllocFails` dropped: then it is lost,
+                \* still in the ring's table.
+                with i \in Armed do
+                    either
+                        ps[i] := "ended";
+                        snap[i] := FALSE;
+                    or
+                        await AllocFails;
+                        ps[i] := "lost";
+                        dropped := dropped + 1;
+                        unsaid := TRUE;
+                    end either;
+                end with;
+            else
+                \* The edge is held past the queue, or with `AllocFails` dropped.
+                either
+                    over := over + 1;
+                or
+                    await AllocFails;
+                    dropped := dropped + 1;
+                    unsaid := TRUE;
+                end either;
+            end if;
+        or
+            \* The shard takes a poll edge: the side reads.
+            await pedges > 0;
+            pedges := pedges - 1;
+        or
+            \* The ring cancels one of its operations: the cancel's completion goes into the queue, or past it.
+            await cancelled < MaxCancel;
+            cancelled := cancelled + 1;
+            if Used < C then
+                cancels := cancels + 1;
+            else
+                \* Held past the queue, or with `AllocFails` dropped.
+                either
+                    over := over + 1;
+                or
+                    await AllocFails;
+                    dropped := dropped + 1;
+                    unsaid := TRUE;
+                end either;
+            end if;
+        or
+            \* The shard takes a cancel's completion, which it ignores.
+            await cancels > 0;
+            cancels := cancels - 1;
+        or
+            \* The queue has room again: the shard takes an entry the kernel held past it.
+            await over > 0 /\ Used < C;
+            over := over - 1;
         end either;
+    end while;
+end process;
+
+\* The shard's wait for completions: it gets `EBADR`, once, for what the kernel dropped, counts what
+\* the kernel's count says was dropped since it last looked, says it, and goes on.
+fair process wait = 3
+begin
+W_report:
+    while alive do
+        await unsaid \/ ~alive;
+        if alive then
+            unsaid := FALSE;
+            \* MUTATION panic_on_dropped: the shard ends on the error (the code before).
+            \* MUTATION drop_uncounted: the error is passed over and nothing counted.
+            \* MUTATION no_recovery: it counts and goes on, and recovers nothing (the code before).
+            if Mode = "panic_on_dropped" then
+                alive := FALSE;
+            elsif Mode # "drop_uncounted" then
+                counted := dropped;
+                if Mode # "no_recovery" then
+                    \* The operations out now are the sweep's: those in the kernel, and those whose end
+                    \* was dropped.
+                    recovering := TRUE;
+                    recCancel := FALSE;
+                    snap := [i \in 1..Polls |-> snap[i] \/ ps[i] \in {"armed", "lost"}];
+                end if;
+            end if;
+        end if;
+    end while;
+end process;
+
+\* The shard's recovery: it cancels every operation it still has out, then sweeps what is left.
+fair process recover = 4
+begin
+V_loop:
+    while alive do
+        await recovering \/ ~alive;
+        if alive then
+            either
+                \* The cancel: every poll still in the kernel ends with it, and its side arms another.
+                \* MUTATION no_cancel: the shard sweeps without cancelling first.
+                await ~recCancel /\ Mode # "no_cancel";
+                with keep = [i \in 1..Polls |-> snap[i] /\ ps[i] = "lost"] do
+                    ps := [i \in 1..Polls |-> IF snap[i] /\ ps[i] = "armed" THEN "ended" ELSE ps[i]];
+                    snap := keep;
+                end with;
+                recCancel := TRUE;
+            or
+                \* The sweep, once the cancel's ends were taken: every operation whose end never came
+                \* ends for its side with an error saying the kernel dropped it, and its side arms
+                \* another; a poll the kernel still held would be ended in its place by mistake.
+                \* MUTATION skip_sweep: the shard cancels and sweeps nothing.
+                await recCancel \/ Mode = "no_cancel";
+                if \E i \in 1..Polls : snap[i] /\ ps[i] = "armed" then
+                    falseSweep := TRUE;
+                end if;
+                if Mode # "skip_sweep" then
+                    ps := [i \in 1..Polls |-> IF snap[i] THEN "ended" ELSE ps[i]];
+                end if;
+                snap := [i \in 1..Polls |-> FALSE];
+                recovering := FALSE;
+            end either;
+        end if;
+    end while;
+end process;
+
+\* The sides whose poll the kernel ended: the end wakes their tasks, and the next to wait arms another.
+fair process sides = 2
+begin
+S_rearm:
+    while alive do
+        \* MUTATION no_rearm_after_full: an end that came for want of room is taken as the side's last word.
+        await Ended > 0 /\ Mode /= "no_rearm_after_full";
+        with i \in {j \in 1..Polls : ps[j] = "ended"} do
+            ps[i] := "armed";
+        end with;
     end while;
 end process;
 end algorithm; *)
 \* BEGIN TRANSLATION
-\* END TRANSLATION 
+\* END TRANSLATION
+
+\* Every poll the kernel ended for want of room is armed again.
+EndedRearmed == (Ended > 0) ~> (Ended = 0)
+
+\* Every entry the kernel dropped is counted by the shard in the end.
+DropsCounted == (dropped > counted) ~> (dropped = counted)
+
+\* Every poll whose end the kernel dropped is ended for its side in the end, which arms another.
+DroppedRecovered == (Lost > 0) ~> (Lost = 0)
 =============================================================================

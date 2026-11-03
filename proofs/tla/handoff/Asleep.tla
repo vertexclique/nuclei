@@ -21,7 +21,11 @@
 (* runs: a blocked poll is then never rescued. So a worker that backs out  *)
 (* of its park, as one whose park ends, rings a monitor that sleeps. The   *)
 (* accesses are sequentially consistent, as in the code; the store-load    *)
-(* pairs on both sides are what makes one side see the other.              *)
+(* pairs on both sides are what makes one side see the other: the monitor  *)
+(* stores `asleep`, fences, then looks at the parks; the worker stores its *)
+(* flag, fences (`worker_woke`), then looks at `asleep`. Two mutations let *)
+(* one side's look pass its own store, as a store buffer lets it without   *)
+(* the fence: the look is answered first, the store reaches memory after.  *)
 (*                                                                          *)
 (* What is abstract. One worker, one piece of work that comes once, a poll *)
 (* that blocks for good once it runs; the bell keeps one ring until it is  *)
@@ -40,7 +44,9 @@ variables                                                                    \* 
     asleep = FALSE,      \* the monitor says it sleeps
     rung = FALSE,        \* a ring the monitor's bell keeps
     running = FALSE,     \* the worker runs the work: a poll that blocks for good
-    backedOut = FALSE;   \* (record) the worker backed out of a park while the monitor slept
+    backedOut = FALSE,   \* (record) the worker backed out of a park while the monitor slept
+    mLook = FALSE,       \* (asleep_look_first) the monitor's second look, answered before its store
+    wLook = FALSE;       \* (backout_look_first) the worker's look at `asleep`, answered before its store
 
 define                                                                       \* names the properties use:
     \* While the worker runs its blocked poll, the monitor is awake in the end.
@@ -70,13 +76,25 @@ begin                                                                        \* 
 W_say:                                                                       \* `begin_park`: it says it parks
     parked := TRUE;                                                          \* (a sequentially consistent store)
 W_look:                                                                      \* the look for work after the fence
-    if work then                                                             \* work came: it backs out
+    \* MUTATION backout_look_first: the back-out's look at `asleep` is answered before its store of the
+    \* flag reaches memory (no fence in `worker_woke`, a store buffer between the two).
+    if work /\ Mutation = "backout_look_first" then                          \* work came, the look first:
+        wLook := asleep;                                                     \* the ring's look, answered now
+        goto W_store;                                                        \* the store comes after
+    elsif work then                                                          \* work came, in order: it backs out
         parked := FALSE;                                                     \* (a sequentially consistent store)
         backedOut := backedOut \/ asleep;                                    \* (record) the monitor slept meanwhile
         \* MUTATION no_backout_ring: the back-out rings nobody, as before the fix.
         if Mutation # "no_backout_ring" then ring(); end if;                 \* a monitor that sleeps is rung
         goto W_run;                                                          \* and the work runs
-    end if;                                                                  \* else it parks
+    else                                                                     \* no work:
+        goto W_park;                                                         \* it parks
+    end if;                                                                  \* one of the three
+W_store:                                                                     \* (backout_look_first) the store, late
+    parked := FALSE;                                                         \* reaches memory now
+    backedOut := backedOut \/ asleep;                                        \* (record) the monitor slept meanwhile
+    if wLook then rung := TRUE; end if;                                      \* rings on the look it made before
+    goto W_run;                                                              \* and the work runs
 W_park:                                                                      \* parked until woken
     await ~parked;                                                           \* the pusher cleared its flag
 W_woke:                                                                      \* `end_park`, `parked_ended`
@@ -94,10 +112,20 @@ M_look:                                                                      \* 
     while TRUE do                                                            \* for as long as the runtime runs
         if parked then                                                       \* every worker parked:
 M_say:                                                                       \* it says it sleeps
-            asleep := TRUE;                                                  \* (a sequentially consistent store)
+            \* MUTATION asleep_look_first: the second look is answered before the store of `asleep`
+            \* reaches memory (no fence after it, a store buffer between the two).
+            if Mutation = "asleep_look_first" then                           \* the look first:
+                mLook := parked;                                             \* the second look, answered now
+            else                                                             \* in order:
+                asleep := TRUE;                                              \* (a sequentially consistent store)
+            end if;                                                          \* one of the two
 M_again:                                                                     \* and looks again after the fence
+            if Mutation = "asleep_look_first" then                           \* (the mutation) the store, late,
+                asleep := TRUE;                                              \* reaches memory now
+            end if;                                                          \* then the decision:
             \* MUTATION no_second_look: the monitor sleeps on its first look.
-            if parked \/ Mutation = "no_second_look" then                    \* still parked:
+            if (IF Mutation = "asleep_look_first" THEN mLook ELSE parked)    \* still parked (as it looked):
+               \/ Mutation = "no_second_look" then                           \* or the mutation
 M_sleep:                                                                     \* it sleeps
                 await rung;                                                  \* until a worker rings
                 rung := FALSE;                                               \* the ring is spent

@@ -46,6 +46,12 @@
 (* Side.tla checks it), a send cancelled as its source moves (RingLent.tla *)
 (* checks it), the copied writes and their order (LentWrite.tla), and the  *)
 (* size below which a write is copied, which is a cost choice, not a rule. *)
+(*                                                                          *)
+(* What is assumed: the peer reads, in the end (its reads are weakly fair). *)
+(* The keeper waits for the notifications with no bound of its own, so a   *)
+(* peer that never reads, and a network that never acknowledges, keep it   *)
+(* waiting for good, with its pool thread and the ring's memory: the       *)
+(* witness WZ_keeper_forever shows that (`SpecIdlePeer`).                  *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -494,6 +500,24 @@ Fairness ==
 
 Spec == Init /\ [][Next]_vars /\ Fairness             \* the behaviours checked
 
+\* The fairness of every step but the peer's reads: a peer that may never read.
+FairnessIdlePeer ==
+    /\ WF_vars(Lend("A", "lendA", "waitA"))           \* the task lends A
+    /\ WF_vars(Take("A", "waitA", "lendB"))           \* takes A's end
+    /\ WF_vars(Lend("B", "lendB", "waitB"))           \* lends B
+    /\ WF_vars(Take("B", "waitB", AfterB))            \* takes B's end
+    /\ WF_vars(Read)                                  \* reads
+    /\ WF_vars(GetBack("A", "relA", "relB"))          \* gets A back
+    /\ WF_vars(GetBack("B", "relB", "done"))          \* gets B back
+    /\ WF_vars(Submit)                                \* the side sends
+    /\ \A i \in 1..MaxOps : WF_vars(First(i)) /\ WF_vars(Notif(i))      \* the ring applies
+    /\ \A i \in 1..MaxOps : WF_vars(Take1(i)) /\ WF_vars(Complete(i)) /\ WF_vars(Notify(i))
+                                                      \* the kernel takes, completes, notifies
+    /\ \A i \in 1..MaxOps : WF_vars(broken /\ Fail(i))   \* on a broken socket every send fails
+    /\ WF_vars(PeerWrite)                             \* the peer writes, but may never read
+
+SpecIdlePeer == Init /\ [][Next]_vars /\ FairnessIdlePeer  \* the behaviours with such a peer
+
 (***************************************************************************)
 (* The properties.                                                         *)
 (***************************************************************************)
@@ -514,6 +538,9 @@ NoScribble == \A b \in Bufs : bufst[b] \in {"handed", "freed"} => ~KernelReads(b
 \* Everything ends: both writes end without the peer reading first, the task reads, and each
 \* buffer comes back (or is freed) after its last notification.
 Finishes == <>Settled
+
+\* A keeper that took the ring lets go of it: every send it holds gets its notification.
+KeeperLetsGo == kept ~> (\A i \in DOMAIN ops : ~ops[i].held)
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)

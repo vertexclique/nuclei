@@ -4,10 +4,13 @@
 <p>Every wait in <code>nuclei::sync</code> is a future built from futures and wakers alone, so it works under any executor, not only Nuclei's. A contended wait queues and returns <code>Pending</code>; it never blocks a thread.</p>
 <ul>
 <li><strong>Familiar names.</strong> <code>Mutex</code>, <code>RwLock</code>, <code>Semaphore</code>, <code>Notify</code>, <code>Barrier</code>, <code>OnceCell</code> and <code>SetOnce</code> keep the names, signatures and errors of the established async sync API: code written against it compiles after a change of import.</li>
-<li><strong>Every wait has a <code>try_</code> form</strong> that never waits, and a <code>blocking_</code> form for threads that may block. On a Nuclei shard a <code>blocking_</code> call nests a <code>block_on</code>, so the shard keeps running its other tasks.</li>
+<li><strong>Every wait has a <code>try_</code> form</strong> that never waits, and a <code>blocking_</code> form for threads that may block. On a Nuclei shard a <code>blocking_</code> call nests a <code>block_on</code>, so the shard keeps running its other tasks. A wait whose frame runs a task that opens another blocking frame gives up its place in line and asks again, at the back, once its frame is on top again, so nested blocking waits never wait on each other with the lock free.</li>
 <li><strong>Dropping a wait loses nothing.</strong> A dropped future withdraws its place in line and passes on what was handed to it, so no wakeup is lost. A <code>Barrier</code> wait is the one exception: an arrival that was counted stays counted.</li>
 <li><strong>Fair to the shard.</strong> On a Nuclei shard, a lock, an acquire or a receive that completes spends the task's <a href="#budget">budget</a>, so a loop on one that is always ready still lets other tasks run. Under another executor there is no budget.</li>
 </ul>
+
+<h2 id="panics">Wakers that panic</h2>
+<p>A waker is user code, and its wake, clone or drop may panic. No message, permit or wake is lost to it: what a wait took is back in the primitive before the waker runs, the other waiters of the pass are still woken, and the panic reaches the caller. A timer's waker that panics as a worker's own loop fires it is logged at error, and the worker goes on.</p>
 
 <h2 id="mutex">Mutex</h2>
 <!--example sync_mutex-->
@@ -20,6 +23,7 @@
 
 <h2 id="reentrant">Reentrant locks</h2>
 <p><code>ReentrantMutex</code> and <code>ReentrantRwLock</code> may be taken again by the holder that has them. The holder is an <a href="api:nuclei::sync::Owner"><code>Owner</code></a> token, not a thread: a task can move between threads, and many tasks can share one.</p>
+<p>An owner may have two requests out at once, as in a <code>join!</code>. Each poll of a request looks for its owner first, so one that queued before its owner took the lock through the other enters when it is next polled. The entry that makes an owner the holder also wakes the owner's other queued requests, so a <code>join!</code> in either order, or two tasks of one owner, never waits on itself.</p>
 <!--example sync_reentrant-->
 
 <h2 id="semaphore">Semaphore</h2>
@@ -45,12 +49,13 @@
 
 <h2 id="fairness">Fast, and fair by count</h2>
 <p>The locks and the semaphore let a caller take what is free even while others wait, so a release never waits for a sleeping task to run. A waiter that loses <a href="api:nuclei::sync::MAX_BYPASS"><code>MAX_BYPASS</code></a> times is owed a handoff: nobody gets in ahead of it, and the next release goes to it directly. Fairness is counted, never timed.</p>
+<p>A waiting future that nobody polls again, such as one kept but never polled or one passed to <code>std::mem::forget</code>, keeps its place in line. What is freed is handed to the waiter at the front and to nobody else until that waiter acts, so everyone behind it waits until it is polled again or dropped.</p>
 
 <h2 id="budget">The task's budget</h2>
-<p>On a Nuclei shard, a lock or a semaphore acquire that completes spends one operation of the task's <a href="tasks.html#yield">budget</a>, as IO does, and so do a channel receive that completes and a bounded send that completes at its first try. Once the budget is spent the call completes nothing: it wakes its task and answers <code>Pending</code>, so the task goes behind the shard's other tasks.</p>
+<p>On a Nuclei shard, a lock or a semaphore acquire that completes spends one operation of the task's <a href="tasks.html#yield">budget</a>, as IO does, and so do a channel receive that completes and a bounded send that completes in the poll that began it. Once the budget is spent the call completes nothing: it wakes its task and answers <code>Pending</code>, so the task goes behind the shard's other tasks.</p>
 <!--example sync_budget-->
 <ul>
-<li>A wait that queued and was then granted spends nothing, so it keeps what it waited for.</li>
+<li>A wait that queued in an earlier poll and was then granted spends nothing, so it keeps what it waited for. One granted in the poll that queued it spends, as a first try does.</li>
 <li>The <code>try_</code> forms never spend. <code>Notify</code>, <code>Event</code>, <code>Latch</code>, <code>Barrier</code> and the once-cells keep no budget.</li>
 <li>Off a Nuclei shard, under another executor, there is no budget, and these calls never yield for it.</li>
 <li><a href="api:nuclei::task::coop::unconstrained"><code>coop::unconstrained</code></a> runs a future with no budget, and <a href="api:nuclei::stats::ShardStats::budget_yields"><code>budget_yields</code></a> counts how often a shard's tasks yielded for it.</li>

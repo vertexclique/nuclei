@@ -133,6 +133,59 @@ mod unix {
         }
     }
 
+    /// A waker that raises a flag.
+    struct Flag(AtomicBool);
+
+    impl std::task::Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A listener polled where no shard runs is served by a pump on a
+    /// runtime worker. That runtime goes, and its pump with it: a listener
+    /// polled where no shard runs still gets a pump, which wakes it. Alone
+    /// in its process, so no other pump serves it.
+    #[test]
+    fn a_listener_gets_a_pump_after_the_runtime_with_the_last_one_went() {
+        if !crate::alone::alone(
+            "signal::tests::unix::a_listener_gets_a_pump_after_the_runtime_with_the_last_one_went",
+        ) {
+            return;
+        }
+        let rt = crate::runtime::Runtime::builder()
+            .worker_threads(1)
+            .pin_workers(false)
+            .build()
+            .unwrap();
+        {
+            let _inside = rt.enter();
+            let mut first = signal(SignalKind::from_raw(libc::SIGPROF)).unwrap();
+            assert!(poll_once(|cx| first.poll_recv(cx)).is_pending());
+        }
+        drop(rt);
+        let mut second = signal(SignalKind::from_raw(libc::SIGPROF)).unwrap();
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        assert!(
+            second
+                .poll_recv(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        kill_self(libc::SIGPROF);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut backoff = Duration::from_millis(1);
+        while !flag.0.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "no pump dispatched the delivery: the listener was never woken"
+            );
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(50));
+        }
+        assert_eq!(poll_once(|cx| second.poll_recv(cx)), Poll::Ready(Some(())));
+    }
+
     static BEFORE_RAN: AtomicBool = AtomicBool::new(false);
 
     extern "C" fn before(_: libc::c_int) {

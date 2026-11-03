@@ -14,7 +14,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use super::waiters::{Key, State, Waiters};
+use super::waiters::{Key, State, Waiters, wake_closed};
 use crate::sync::{AcquireError, TryAcquireError};
 
 /// A counting semaphore whose waits are futures, for the tasks of one shard.
@@ -39,7 +39,10 @@ use crate::sync::{AcquireError, TryAcquireError};
 /// assert_eq!(budget.available_permits(), 4);
 /// ```
 pub struct Semaphore {
-    permits: Cell<usize>,
+    /// Signed: a channel receiver that unwinds takes back an admission it
+    /// handed on (`debit`), which can leave the count below zero until the
+    /// next release pays it.
+    permits: Cell<isize>,
     closed: Cell<bool>,
     waiters: Waiters,
 }
@@ -59,7 +62,7 @@ impl Semaphore {
             "a semaphore cannot hold more than Semaphore::MAX_PERMITS"
         );
         Self {
-            permits: Cell::new(permits),
+            permits: Cell::new(permits as isize),
             closed: Cell::new(false),
             waiters: Waiters::new(),
         }
@@ -68,7 +71,7 @@ impl Semaphore {
     /// The permits free right now, including the ones kept for the front
     /// waiter until its request fits.
     pub fn available_permits(&self) -> usize {
-        self.permits.get()
+        self.permits.get().max(0) as usize
     }
 
     /// Adds `n` new permits, handing them to waiters first. Permits added to
@@ -80,9 +83,12 @@ impl Semaphore {
     /// [`MAX_PERMITS`](Self::MAX_PERMITS).
     #[track_caller]
     pub fn add_permits(&self, n: usize) {
-        let total = self.permits.get().saturating_add(n);
+        let total = self
+            .permits
+            .get()
+            .saturating_add(n.min(Self::MAX_PERMITS + 1) as isize);
         assert!(
-            total <= Self::MAX_PERMITS,
+            total <= Self::MAX_PERMITS as isize,
             "a semaphore cannot hold more than Semaphore::MAX_PERMITS"
         );
         self.permits.set(total);
@@ -93,8 +99,8 @@ impl Semaphore {
     /// removed, which is fewer than `n` when fewer are free. Permits held by
     /// outstanding [`SemaphorePermit`]s are not touched.
     pub fn forget_permits(&self, n: usize) -> usize {
-        let removed = n.min(self.permits.get());
-        self.permits.set(self.permits.get() - removed);
+        let removed = n.min(self.available_permits());
+        self.permits.set(self.permits.get() - removed as isize);
         removed
     }
 
@@ -142,10 +148,10 @@ impl Semaphore {
         if self.closed.get() {
             return Err(TryAcquireError::Closed);
         }
-        if !self.waiters.is_empty() || self.permits.get() < permits {
+        if !self.waiters.is_empty() || self.permits.get() < permits as isize {
             return Err(TryAcquireError::NoPermits);
         }
-        self.permits.set(self.permits.get() - permits);
+        self.permits.set(self.permits.get() - permits as isize);
         Ok(SemaphorePermit { sem: self, permits })
     }
 
@@ -160,11 +166,7 @@ impl Semaphore {
         if self.closed.replace(true) {
             return;
         }
-        while let Some(waker) = self.waiters.close_front() {
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
+        wake_closed(&self.waiters);
     }
 
     /// Whether [`close`](Self::close) was called.
@@ -174,22 +176,62 @@ impl Semaphore {
 
     /// Takes `permits` back and serves the line.
     pub(crate) fn release(&self, permits: usize) {
-        self.permits.set(self.permits.get().saturating_add(permits));
+        self.permits
+            .set(self.permits.get().saturating_add(permits as isize));
         self.serve();
     }
 
-    /// Grants the front waiters while their requests fit. Each waker is woken
-    /// outside any borrow, and the state is read again after the wake.
+    /// Takes back `n` permits that were handed on, as a debt: the count goes
+    /// below zero if need be, and the releases that follow pay it.
+    pub(crate) fn debit(&self, n: usize) {
+        self.permits.set(self.permits.get() - n as isize);
+    }
+
+    /// Whether exactly `n` permits are free and none is owed.
+    #[inline]
+    pub(crate) fn holds(&self, n: usize) -> bool {
+        self.permits.get() == n as isize
+    }
+
+    /// Grants the front waiters while their requests fit: the look is
+    /// inline, the loop out of line since most releases meet no waiter.
+    #[inline]
     fn serve(&self) {
         if self.closed.get() {
             return;
         }
-        while let Some((need, waker)) = self.waiters.grant_front_if(self.permits.get()) {
-            self.permits.set(self.permits.get() - need);
+        if let Ok(available) = usize::try_from(self.permits.get())
+            && self.waiters.front_fits(available)
+        {
+            self.serve_waiters();
+        }
+    }
+
+    /// Grants the front waiters while their requests fit. Each waker is woken
+    /// outside any borrow, and the state is read again after the wake. A
+    /// waker that panics does not leave the next waiters unserved: the guard
+    /// serves them and the panic goes on.
+    #[inline(never)]
+    fn serve_waiters(&self) {
+        let rest = ServeRest(self);
+        while let Ok(available) = usize::try_from(self.permits.get())
+            && let Some((need, waker)) = self.waiters.grant_front_if(available)
+        {
+            self.permits.set(self.permits.get() - need as isize);
             if let Some(waker) = waker {
                 waker.wake();
             }
         }
+        core::mem::forget(rest);
+    }
+}
+
+/// While alive, an unwind serves the waiters the panicking wake left.
+struct ServeRest<'a>(&'a Semaphore);
+
+impl Drop for ServeRest<'_> {
+    fn drop(&mut self) {
+        crate::sync::internal::during_unwind(|| self.0.serve());
     }
 }
 
@@ -309,6 +351,34 @@ impl Acquire<'_> {
     }
 }
 
+impl<'a> Acquire<'a> {
+    /// Joins the line, out of line since most acquires are served at once.
+    #[cold]
+    #[inline(never)]
+    fn queue(&mut self, cx: &mut Context<'_>) -> Poll<<Self as Future>::Output> {
+        let this = self;
+        let sem = this.sem;
+        // The clone is user code that may release permits or close: look
+        // again after it.
+        let waker = cx.waker().clone();
+        if sem.closed.get() {
+            crate::coop::spent_one();
+            drop(waker);
+            return Poll::Ready(Err(AcquireError::closed()));
+        }
+        if sem.waiters.is_empty() && sem.permits.get() >= this.n as isize {
+            sem.permits.set(sem.permits.get() - this.n as isize);
+            crate::coop::spent_one();
+            // Built before the drop: a panicking drop still returns them.
+            let permit = SemaphorePermit::new(sem, this.n);
+            drop(waker);
+            return Poll::Ready(Ok(permit));
+        }
+        this.key = Some(sem.waiters.push(this.n, waker));
+        Poll::Pending
+    }
+}
+
 impl<'a> Future for Acquire<'a> {
     type Output = Result<SemaphorePermit<'a>, AcquireError>;
 
@@ -338,13 +408,12 @@ impl<'a> Future for Acquire<'a> {
             crate::coop::spent_one();
             return Poll::Ready(Err(AcquireError::closed()));
         }
-        if sem.waiters.is_empty() && sem.permits.get() >= this.n {
-            sem.permits.set(sem.permits.get() - this.n);
+        if sem.waiters.is_empty() && sem.permits.get() >= this.n as isize {
+            sem.permits.set(sem.permits.get() - this.n as isize);
             crate::coop::spent_one();
             return Poll::Ready(Ok(SemaphorePermit::new(sem, this.n)));
         }
-        this.key = Some(sem.waiters.push(this.n, cx.waker().clone()));
-        Poll::Pending
+        this.queue(cx)
     }
 }
 
@@ -360,5 +429,156 @@ impl fmt::Debug for Acquire<'_> {
             .field("permits", &self.n)
             .field("waiting", &self.key.is_some())
             .finish()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use core::cell::RefCell;
+    use core::task::Waker;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::sync::test_support::{Polled, hooked};
+
+    /// A semaphore the hooks may borrow for good, freed as the test ends: everything that
+    /// borrows it is declared after it, so it goes first.
+    struct Leaked(core::ptr::NonNull<Semaphore>);
+
+    impl Leaked {
+        fn sem(&self) -> &'static Semaphore {
+            // SAFETY: the semaphore lives until this guard drops, after every borrow of it.
+            unsafe { self.0.as_ref() }
+        }
+    }
+
+    impl Drop for Leaked {
+        fn drop(&mut self) {
+            // SAFETY: from `Box::into_raw` in `leaked`; every borrow of it went before this drop.
+            drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+        }
+    }
+
+    fn leaked(permits: usize) -> Leaked {
+        let sem = Box::into_raw(Box::new(Semaphore::new(permits)));
+        // SAFETY: `Box::into_raw` gives a pointer that is not null.
+        Leaked(unsafe { core::ptr::NonNull::new_unchecked(sem) })
+    }
+
+    fn boom() -> Waker {
+        hooked(
+            None,
+            Some(Box::new(|| panic!("a waker panicked as it was woken"))),
+        )
+    }
+
+    /// A hook that drops the permit in `held`.
+    fn release(held: &Rc<RefCell<Option<SemaphorePermit<'static>>>>) -> Waker {
+        let held = Rc::clone(held);
+        hooked(Some(Box::new(move || drop(held.borrow_mut().take()))), None)
+    }
+
+    fn held(sem: &'static Semaphore) -> Rc<RefCell<Option<SemaphorePermit<'static>>>> {
+        Rc::new(RefCell::new(Some(sem.try_acquire().unwrap())))
+    }
+
+    #[test]
+    fn an_acquire_whose_clone_releases_a_permit_takes_it() {
+        let owner = leaked(1);
+        let sem = owner.sem();
+        let held = held(sem);
+        let mut acquire = Box::pin(sem.acquire());
+        let polled = acquire
+            .as_mut()
+            .poll(&mut Context::from_waker(&release(&held)));
+        let Poll::Ready(Ok(permit)) = polled else {
+            panic!("the acquire slept beside a free permit");
+        };
+        assert_eq!(permit.num_permits(), 1);
+        assert_eq!(sem.available_permits(), 0);
+    }
+
+    #[test]
+    fn an_acquire_whose_clone_closes_the_semaphore_fails() {
+        let owner = leaked(0);
+        let sem = owner.sem();
+        let closer = hooked(Some(Box::new(move || sem.close())), None);
+        let mut acquire = Box::pin(sem.acquire());
+        let polled = acquire.as_mut().poll(&mut Context::from_waker(&closer));
+        assert!(matches!(polled, Poll::Ready(Err(_))));
+    }
+
+    #[test]
+    fn a_refresh_whose_clone_causes_the_grant_reports_it() {
+        let owner = leaked(1);
+        let sem = owner.sem();
+        let held = held(sem);
+        let first = Polled::new(async {});
+        let mut acquire = Box::pin(sem.acquire());
+        let queued = acquire
+            .as_mut()
+            .poll(&mut Context::from_waker(&first.waker()));
+        assert!(queued.is_pending());
+        let polled = acquire
+            .as_mut()
+            .poll(&mut Context::from_waker(&release(&held)));
+        assert!(matches!(polled, Poll::Ready(Ok(_))), "the grant was missed");
+    }
+
+    #[test]
+    fn a_close_whose_first_waker_panics_still_ends_every_other_wait() {
+        let owner = leaked(0);
+        let sem = owner.sem();
+        let mut first = Box::pin(sem.acquire());
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&boom()))
+                .is_pending()
+        );
+        let mut second = Polled::new(sem.acquire());
+        second.pending();
+        assert!(catch_unwind(AssertUnwindSafe(|| sem.close())).is_err());
+        assert!(sem.is_closed());
+        assert!(second.ready().is_err());
+        let polled = first.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(polled, Poll::Ready(Err(_))));
+    }
+
+    #[test]
+    fn a_serve_whose_first_waker_panics_still_serves_the_next_waiter() {
+        let owner = leaked(0);
+        let sem = owner.sem();
+        let mut first = Box::pin(sem.acquire());
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&boom()))
+                .is_pending()
+        );
+        let mut second = Polled::new(sem.acquire());
+        second.pending();
+        assert!(catch_unwind(AssertUnwindSafe(|| sem.add_permits(2))).is_err());
+        assert_eq!(second.wakes(), 1);
+        let permit = second.ready().unwrap();
+        assert_eq!(permit.num_permits(), 1);
+        let polled = first.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(polled, Poll::Ready(Ok(_))));
+    }
+
+    #[test]
+    fn a_debt_never_shows_as_negative_permits() {
+        let sem = Semaphore::new(2);
+        sem.debit(5);
+        assert_eq!(sem.available_permits(), 0);
+        assert_eq!(sem.try_acquire().unwrap_err(), TryAcquireError::NoPermits);
+        sem.add_permits(3);
+        assert_eq!(sem.available_permits(), 0);
+        assert!(sem.try_acquire().is_err());
+        sem.add_permits(1);
+        assert_eq!(sem.available_permits(), 1);
+        assert_eq!(sem.forget_permits(5), 1);
+        assert_eq!(sem.available_permits(), 0);
     }
 }

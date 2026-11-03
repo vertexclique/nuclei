@@ -15,6 +15,14 @@ Send == Res(1, 1)
 Try(n, u) == [op |-> "try", n |-> n, use |-> u]
 \* `reserve_many(n)` polled once and then dropped (its slots, if any, given straight back).
 Cancel(n) == [op |-> "cancel", n |-> n, use |-> 0]
+\* `send(v)` whose first attempt takes its slot and is refused for the budget: the slot goes
+\* back, and the future may never be polled again.
+Refused == [op |-> "refused", n |-> 1, use |-> 1]
+\* Keep the sender's handle until the receiver's program is over.
+Hold == [op |-> "hold", n |-> 0, use |-> 0]
+\* A request for `n` slots that parks with its waker armed, may be polled once with no
+\* wake, and is dropped while it waits.
+LateCancel(n) == [op |-> "late_cancel", n |-> n, use |-> 0]
 
 \* ---- sender programs: [sender |-> its operations, in order] ----
 \* (P_many, P_cancel_many, P_cancel_one and P_large_small, four operations each, are run
@@ -59,6 +67,16 @@ P_solo_sends == [s \in {1} |-> <<Send, Send, Send>>]
 P_solo_cancel == [s \in {1} |-> <<Send, Cancel(1), Send>>]
 \* A send, then a request for both slots that waits for the slot the value holds.
 P_solo_many == [s \in {1} |-> <<Send, Res(2, 1)>>]
+\* A send refused for the budget after it took the one slot.
+P_solo_refused == [s \in {1} |-> <<Refused>>]
+\* One sender reserves a slot and gives it back unused, then holds its handle.
+P_give_hold == [s \in {1} |-> <<Res(1, 0), Hold>>]
+\* A late-cancelled request for one slot against two sends, on a full channel.
+P_late_cancel == [s \in {1, 2} |-> IF s = 1 THEN <<LateCancel(1)>> ELSE <<Send, Send>>]
+\* The same against one send, for the liveness run.
+P_late_cancel_one == [s \in {1, 2} |-> IF s = 1 THEN <<LateCancel(1)>> ELSE <<Send>>]
+\* A try for no slot, and a reserve of none, against two sends on one slot.
+P_try_zero == [s \in {1, 2} |-> IF s = 1 THEN <<Send, Send>> ELSE <<Try(0, 0), Res(0, 0)>>]
 
 \* ---- receiver programs ----
 
@@ -70,4 +88,4 @@ R_close == <<"recv", "close", "drain">>
 R_close_first == <<"close", "drain">>
 \* Receive once, then drop the receiver.
 R_drop == <<"recv", "drop">>
-=============================================================================
+======================================================================

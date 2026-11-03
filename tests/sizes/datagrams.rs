@@ -313,8 +313,17 @@ pub(crate) fn datagram_row<D, S, R>(
                 (want, got) => panic!("{what}: std gives {want:?}, nuclei {got:?}"),
             }
             let (got, buf) = recv(&b, vec![0; room]).await;
-            let (came, from) = got.unwrap_or_else(|err| panic!("{what}: {err}"));
             let cut = n.min(room);
+            // Windows answers a longer datagram `WSAEMSGSIZE`, as std's receive does, the buffer
+            // holding the bytes that fit.
+            #[cfg(windows)]
+            if n > room {
+                let err = got.expect_err(&what);
+                assert_eq!(err.raw_os_error(), Some(10040), "{what}: {err}");
+                assert!(buf[..cut] == data[..cut], "{what}: not the bytes sent");
+                return;
+            }
+            let (came, from) = got.unwrap_or_else(|err| panic!("{what}: {err}"));
             assert_eq!(came, cut, "{what}: the length into {room} bytes");
             assert!(buf[..cut] == data[..cut], "{what}: not the bytes sent");
             if let Some(from) = from {

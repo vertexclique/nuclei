@@ -42,6 +42,14 @@ impl<T> Counted<T> {
         self.count.load(Ordering::Relaxed) == 0
     }
 
+    /// [`is_empty`](Self::is_empty) with the count read sequentially consistent: for the last
+    /// look of a shard that parks, which follows its sequentially consistent store of the parked
+    /// flag and must not pass it (proofs/tla/handshake/ParkLook.tla).
+    #[inline(always)]
+    pub(crate) fn is_empty_seqcst(&self) -> bool {
+        self.count.load(Ordering::SeqCst) == 0
+    }
+
     /// Whether the queue holds an item or a push under way, with a look at its words: for a look
     /// that must not miss a push whose count is not in yet.
     pub(crate) fn holds_any(&self) -> bool {

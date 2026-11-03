@@ -78,9 +78,12 @@ impl Builder {
     /// How long the bytes a dropped handle wrote behind may take to reach the kernel (default
     /// one minute): a task delivers them after the drop, as the kernel delivers what a closed
     /// socket holds. Past it the rest is given up, and a TCP stream's connection is reset, so its
-    /// peer reads an error rather than the end of a stream cut short. [`get_mut`] and
+    /// peer reads an error rather than the end of a stream cut short; a Unix stream has no
+    /// reset, and its peer reads the end after the bytes that reached it. [`get_mut`] and
     /// [`into_inner`] wait for the bytes as long at most, and the runtime's drop waits for the
-    /// tasks. More than zero; [`build`](Self::build) fails with `InvalidInput` at zero.
+    /// tasks. A stream set to zero linger resets once they are written, at once; on macOS, to a
+    /// loopback peer, it first waits for the peer's acknowledgements, within the same time. More
+    /// than zero; [`build`](Self::build) fails with `InvalidInput` at zero.
     ///
     /// [`get_mut`]: crate::io::Handle::get_mut
     /// [`into_inner`]: crate::io::Handle::into_inner

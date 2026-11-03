@@ -112,6 +112,22 @@ impl Poller {
         self.wait_at_most(usize::MAX, timeout, &mut on_event)
     }
 
+    /// The time left to the deadline the timerfd is armed for, if it is.
+    #[cfg(test)]
+    pub(crate) fn precise_armed_in(&self) -> Option<Duration> {
+        let Timer::Made { fd, .. } = &self.timer else {
+            return None;
+        };
+        // SAFETY: itimerspec is plain data; all zeroes is a valid value.
+        let mut spec: libc::itimerspec = unsafe { core::mem::zeroed() };
+        // SAFETY: a plain syscall on our own descriptor, filling `spec`.
+        if unsafe { libc::timerfd_gettime(fd.as_raw_fd(), &mut spec) } != 0 {
+            return None;
+        }
+        let left = Duration::new(spec.it_value.tv_sec as u64, spec.it_value.tv_nsec as u32);
+        (!left.is_zero()).then_some(left)
+    }
+
     /// Makes the next wait end at the precise deadline `at`, `after` from
     /// now, through the timerfd: the wait's own timeout rounds it up to the
     /// millisecond. One system call when the deadline is new; none for the

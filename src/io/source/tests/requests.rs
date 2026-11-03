@@ -409,9 +409,9 @@ fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
         })
     };
     let (home, token) = token_rx.recv().unwrap();
-    // Past the ring's wait for its operations as a shard goes (one second),
-    // which a shard that did not wait for the eviction would end by.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Long enough for a shard that did not wait for the eviction to have
+    // stopped, short of the bound of its wait (one second).
+    let deadline = Instant::now() + Duration::from_millis(500);
     while !left.load(Ordering::SeqCst) && Instant::now() < deadline {
         std::thread::yield_now();
     }
@@ -544,6 +544,104 @@ fn a_shard_that_leaves_applies_the_detach_of_a_holders_eviction() {
         "the registration read as gone before its detach reached the shard"
     );
     exit.send(()).unwrap();
+    shard.join().unwrap();
+}
+
+/// A thread's own shard leaves while the attach of a source it registered is still a request,
+/// left to this thread, which holds a side: letting go performs the attach and the eviction, which
+/// post the file's install (with a lease that keeps the handle's object open) and the slot's
+/// release to the shard. The shard waits for both before it leaves and applies them, so no lease is
+/// left with it while it is away, and the release never reaches the registration its next
+/// `block_on` makes under the same slot. Before, the shard left at once: the lease kept the
+/// descriptor open until its next `block_on`, whose first registration the stale release then took
+/// out of its table, so that source was never evicted (`proofs/tla/going/Pending.tla`).
+#[cfg(ring)]
+#[test]
+fn a_shard_that_leaves_waits_for_an_attach_left_to_a_holder() {
+    use std::sync::mpsc::channel;
+    let (mine, _peer) = stream_pair();
+    let handle = Handle::new(mine).unwrap();
+    let src = Arc::clone(handle.source());
+    let (second, _second_peer) = stream_pair();
+    let second = Handle::new(second).unwrap();
+    let src2 = Arc::clone(second.source());
+    let held = src.write.try_hold().expect("the write side is free");
+    let (polled, has_polled) = channel::<bool>();
+    let (again, go_again) = channel::<()>();
+    let (ended, has_ended) = channel();
+    let left = Arc::new(AtomicBool::new(false));
+    let waits = super::super::ATTACH_WAITS.load(Ordering::SeqCst);
+    let shard = {
+        let left = Arc::clone(&left);
+        std::thread::spawn(move || {
+            crate::block_on(async {
+                let on_ring = crate::proactor::Proactor::backend() == crate::IoBackend::IoUring;
+                if on_ring {
+                    // The read registers the source here; its attach is left to the holder.
+                    let mut buf = [0u8; 1];
+                    let mut read = Box::pin(handle.recv(&mut buf));
+                    assert!(
+                        poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx)))
+                            .await
+                            .is_pending()
+                    );
+                }
+                polled.send(on_ring).unwrap();
+            });
+            left.store(true, Ordering::SeqCst);
+            if go_again.recv().is_ok() {
+                crate::block_on(async {
+                    // The next block_on's first registration takes the slot again.
+                    let mut buf = [0u8; 1];
+                    let mut read = Box::pin(second.recv(&mut buf));
+                    assert!(
+                        poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx)))
+                            .await
+                            .is_pending()
+                    );
+                    drop(read);
+                    // A turn with nothing to run applies what the mailbox holds.
+                    crate::time::sleep(Duration::from_millis(1)).await;
+                });
+            }
+            ended.send((handle, second)).unwrap();
+        })
+    };
+    let on_ring = has_polled.recv().unwrap();
+    let mut after = After::default();
+    if !on_ring {
+        eprintln!("skipping: this thread's shard runs no ring here");
+        held.release(&mut after, &src.hooks());
+        after.run();
+        drop(again);
+        drop(has_ended.recv().unwrap());
+        shard.join().unwrap();
+        return;
+    }
+    // The shard left, or waits in its leave for the attach still asked of it.
+    until_some("the shard neither left nor waited", || {
+        (left.load(Ordering::SeqCst) || super::super::ATTACH_WAITS.load(Ordering::SeqCst) > waits)
+            .then_some(())
+    });
+    held.release(&mut after, &src.hooks());
+    after.run();
+    until_some("the shard never left", || {
+        left.load(Ordering::SeqCst).then_some(())
+    });
+    assert!(
+        !src.is_leased(),
+        "the shard left with the install's lease still in its mailbox"
+    );
+    again.send(()).unwrap();
+    let (handle, second) = has_ended
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the shard's next block_on never ended");
+    assert_eq!(
+        src2.registration().0,
+        0,
+        "a stale release took the next registration out of the shard's table: it was never evicted"
+    );
+    drop((handle, second));
     shard.join().unwrap();
 }
 
@@ -754,4 +852,396 @@ fn a_runtime_dropped_under_a_waiting_stream_closes_it_as_its_owner() {
         (false, false),
         "the teardown took a side as a foreign thread"
     );
+}
+
+/// The source's request word once it differs from `before`: a request was raised meanwhile.
+fn until_requested(src: &Source, before: u8, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pause = Duration::from_micros(50);
+    while src.requests.load(Ordering::Acquire) == before {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(5));
+    }
+}
+
+/// The first read after a retire, on the same descriptor, reads the peer's bytes.
+fn reads_after_the_retire(rt: &Runtime, a: &Owned<Stream>, b: &Owned<Stream>) {
+    a.src.revive(a.io().raw());
+    send(b.io(), b"after");
+    rt.block_on(async {
+        let mut buf = [0u8; 16];
+        let n = within(read(&a.src, &mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"after");
+    });
+}
+
+/// An attach left to a holder of the read side, then a retire (`get_mut`) left to the same holder:
+/// the holder performs both at once, the retire first, so the attach finds the descriptor out of
+/// the source. That refusal fails nothing, as one for a shard that stopped: the source is
+/// unregistered, and the first read after the retire registers it again and reads. Before, the
+/// refusal failed both sides as a failed registration does, and that read answered NotConnected
+/// on a valid handle (`proofs/tla/attach/Merged.tla`, `M_holder_fails`).
+#[test]
+fn an_attach_performed_with_a_retire_fails_no_read_after_it() {
+    let rt = runtime(None);
+    let (a, b) = pair();
+    let held = a.src.read.try_hold().expect("the side is free");
+    let src = Arc::clone(&a.src);
+    rt.block_on(rt.spawn(async move { src.register() }))
+        .unwrap();
+    assert_eq!(
+        a.src.reg.state.load(Ordering::Acquire),
+        super::super::REGISTERING,
+        "the attach did not wait for the holder"
+    );
+    let attach = a.src.requests.load(Ordering::Acquire);
+    let src = Arc::clone(&a.src);
+    let retirer = std::thread::spawn(move || src.retire());
+    until_requested(&a.src, attach, "the retire was never asked");
+    let mut after = After::default();
+    held.release(&mut after, &a.src.hooks());
+    after.run();
+    retirer.join().unwrap();
+    assert_eq!(
+        a.src.reg.state.load(Ordering::Acquire),
+        super::super::UNREGISTERED,
+        "the refused attach left the source registering"
+    );
+    reads_after_the_retire(&rt, &a, &b);
+}
+
+/// A registration posted to a shard by a thread that runs none, which the shard makes only after
+/// a retire: the shard performs the attach itself and hears it refused for the missing
+/// descriptor, which is no registration failure: the first read after the retire registers the
+/// source again and reads. Before, the shard left the refusal for the sides as a failure, and
+/// that read answered it (`proofs/tla/attach/Merged.tla`, `M_requester_fails`).
+#[test]
+fn a_registration_made_after_a_retire_fails_no_read_after_it() {
+    use crate::rt::shard::{IoOp, Limits, Shard};
+    let (a, b) = pair();
+    a.src
+        .reg
+        .state
+        .store(super::super::REGISTERING, Ordering::Release);
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    shard.shared.post_io(IoOp::Register(Arc::clone(&a.src)));
+    a.src.retire();
+    shard.block_on(crate::task::yield_now());
+    assert_eq!(
+        a.src.reg.state.load(Ordering::Acquire),
+        super::super::UNREGISTERED,
+        "the shard never made the registration"
+    );
+    drop(shard);
+    reads_after_the_retire(&runtime(None), &a, &b);
+}
+
+/// A connected TCP pair over the loopback.
+fn tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (b, _) = listener.accept().unwrap();
+    (a, b)
+}
+
+#[cfg(unix)]
+#[test]
+fn unacked_counts_what_the_peer_has_not_taken() {
+    let (mut writer, mut peer) = tcp_pair();
+    let fd = writer.as_raw_fd();
+    writer.write_all(&[7u8; 1000]).unwrap();
+    let mut got = [0u8; 1000];
+    peer.read_exact(&mut got).unwrap();
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )) {
+        assert!(sys::unacked(fd).is_some(), "the system has a count");
+    }
+    until_some(
+        "the peer never acknowledged the bytes",
+        || match sys::unacked(fd) {
+            Some(0) | None => Some(()),
+            Some(_) => None,
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_wait_for_acks_ends_once_the_peer_acknowledged() {
+    use crate::io::handle::wait_for_acks;
+    let rt = runtime(None);
+    let (mut writer, mut peer) = tcp_pair();
+    let fd = writer.as_raw_fd();
+    let reader = std::thread::spawn(move || {
+        let mut buf = vec![0u8; 100_000];
+        peer.read_exact(&mut buf).unwrap();
+    });
+    writer.write_all(&vec![1u8; 100_000]).unwrap();
+    let start = Instant::now();
+    rt.block_on(wait_for_acks(fd, Duration::from_secs(10)));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the wait outlasted the acknowledgements"
+    );
+    reader.join().unwrap();
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )) {
+        assert_eq!(sys::unacked(fd), Some(0), "every byte acknowledged");
+    }
+}
+
+/// A loopback pair whose peer's window is closed from the handshake on, the writer's kernel left
+/// holding bytes the peer has not taken.
+#[cfg(unix)]
+fn tcp_pair_with_a_closed_window() -> (std::net::TcpStream, std::net::TcpStream, usize) {
+    let set_buf = |fd: libc::c_int, opt: libc::c_int, size: libc::c_int| {
+        // SAFETY: `fd` is open for the call and `size` is a `c_int` of the length given.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (&raw const size).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    set_buf(listener.as_raw_fd(), libc::SO_RCVBUF, 4096);
+    let mut writer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    set_buf(writer.as_raw_fd(), libc::SO_SNDBUF, 256 * 1024);
+    writer.set_nonblocking(true).unwrap();
+    let mut written = 0;
+    loop {
+        match writer.write(&[0u8; 4096]) {
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    (writer, peer, written)
+}
+
+#[cfg(unix)]
+#[test]
+fn the_wait_for_acks_ends_at_its_deadline() {
+    use crate::io::handle::wait_for_acks;
+    let rt = runtime(None);
+    let (writer, peer, _) = tcp_pair_with_a_closed_window();
+    let fd = writer.as_raw_fd();
+    let counts = cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    ));
+    assert_eq!(sys::unacked(fd).is_some(), counts, "the system's count");
+    if !counts {
+        return;
+    }
+    assert!(
+        sys::unacked(fd).is_some_and(|n| n > 0),
+        "bytes the peer has not taken"
+    );
+    let start = Instant::now();
+    rt.block_on(wait_for_acks(fd, Duration::from_millis(200)));
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(200),
+        "returned early: {took:?}"
+    );
+    assert!(took < Duration::from_secs(5), "returned late: {took:?}");
+    assert!(
+        sys::unacked(fd).is_some_and(|n| n > 0),
+        "the deadline, not the acknowledgements, ended the wait"
+    );
+    drop(peer);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_zero_linger_mark_follows_the_linger_set() {
+    let rt = runtime(None);
+    rt.block_on(async {
+        let (a, _b) = tcp_pair();
+        let handle = Handle::new(a).unwrap();
+        assert!(!handle.source().zero_linger());
+        handle.set_zero_linger().unwrap();
+        assert!(handle.source().zero_linger());
+        handle.set_linger(None).unwrap();
+        assert!(!handle.source().zero_linger());
+        handle.set_linger(Some(Duration::from_millis(500))).unwrap();
+        assert!(handle.source().zero_linger());
+        handle.set_linger(Some(Duration::from_secs(1))).unwrap();
+        assert!(!handle.source().zero_linger());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_socket_set_to_zero_linger_passes_it_to_its_streams() {
+    use crate::net::TcpSocket;
+    use futures_core::Stream;
+    let rt = runtime(None);
+    rt.block_on(async {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_zero_linger().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let listener = socket.listen(16).unwrap();
+        assert!(listener.source().zero_linger());
+
+        let marked = TcpSocket::new_v4().unwrap();
+        marked.set_zero_linger().unwrap();
+        let client = marked.connect(addr).await.unwrap();
+        assert!(client.source().zero_linger());
+        let (accepted, _) = listener.accept().await.unwrap();
+        assert!(accepted.source().zero_linger());
+
+        let plain = TcpSocket::new_v4().unwrap().connect(addr).await.unwrap();
+        assert!(!plain.source().zero_linger());
+        let (accepted, _) = listener.accept().await.unwrap();
+        assert!(accepted.source().zero_linger());
+
+        let mut multi = core::pin::pin!(listener.accept_multi().await.unwrap());
+        let _third = TcpSocket::new_v4().unwrap().connect(addr).await.unwrap();
+        let taken = core::future::poll_fn(|cx| multi.as_mut().poll_next(cx))
+            .await
+            .unwrap();
+        assert!(taken.source().zero_linger());
+    });
+}
+
+#[test]
+fn only_a_tcp_stream_set_to_zero_linger_resets_at_close() {
+    let rt = runtime(None);
+    let (writer, peer) = tcp_pair();
+    rt.block_on(async {
+        let handle = Handle::new(writer).unwrap();
+        assert!(!handle.source().resets_at_close());
+        handle.set_zero_linger().unwrap();
+        assert!(handle.source().resets_at_close());
+        handle.set_linger(None).unwrap();
+        assert!(!handle.source().resets_at_close());
+    });
+    drop(peer);
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_zero_linger_stream_dropped_with_nothing_behind_delivers_what_its_kernel_holds_then_resets() {
+    let rt = runtime(None);
+    let (writer, mut peer, written) = tcp_pair_with_a_closed_window();
+    rt.block_on(async {
+        let handle = Handle::new(writer).unwrap();
+        handle.set_zero_linger().unwrap();
+        drop(handle);
+    });
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut sum = 0;
+    loop {
+        match peer.read(&mut buf) {
+            Ok(0) => panic!("an end, not a reset"),
+            Ok(n) => sum += n,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(sum, written, "every byte the kernel held, then the reset");
+    drop(rt);
+}
+
+/// A zero-linger stream dropped with bytes its peer has not acknowledged resets at once: it does
+/// not wait for the acknowledgements, though the runtime would let it wait 30 s. The premise holds
+/// by construction: the peer's receive buffer is 16 KiB, set on the listener so the accepted
+/// socket inherits it, the writer's send buffer 128 KiB, and 96 KiB is written, more than the
+/// peer's window and less than the writer's send queue, so after the flush the kernel holds
+/// bytes the peer has not acknowledged (asserted before the drop).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_zero_linger_stream_dropped_with_bytes_unacknowledged_resets_at_once() {
+    use crate::net::opt::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, set_size};
+    let rt = Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .write_behind_linger(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    set_size(listener.as_raw_fd(), SOL_SOCKET, SO_RCVBUF, 16 * 1024).unwrap();
+    // The kernel accepts the backlog only once listening has begun; `bind` listens already, and
+    // the buffer is set before the connection is made.
+    let writer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    set_size(writer.as_raw_fd(), SOL_SOCKET, SO_SNDBUF, 128 * 1024).unwrap();
+    let fd = writer.as_raw_fd();
+    let bytes = (0..96 * 1024).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+    let sent = bytes.clone();
+    // On a worker, whose linger task outlives the call: a drop on the `block_on` thread would be
+    // given up as that call ends.
+    rt.block_on(rt.spawn(async move {
+        let handle = Handle::new(writer).unwrap();
+        handle.set_zero_linger().unwrap();
+        within(write_all(handle.source(), &sent)).await.unwrap();
+        within(flush(handle.source())).await.unwrap();
+        assert!(!handle.source().has_unsent(), "bytes still behind");
+        assert!(
+            sys::unacked(fd).is_some_and(|n| n > 0),
+            "the premise: bytes the peer has not acknowledged"
+        );
+        drop(handle);
+    }));
+    // The peer reads nothing until the reset is seen through `SO_ERROR`, so nothing is
+    // acknowledged meanwhile: a drop that waited for acknowledgements would not reset by the
+    // deadline.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pause = Duration::from_micros(200);
+    let err = loop {
+        match peer.take_error().unwrap() {
+            Some(err) => break err,
+            None if Instant::now() >= deadline => panic!("the reset never came"),
+            None => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
+        }
+    };
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err:?}");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match (&peer).read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::ConnectionReset, "{e:?}");
+                break;
+            }
+        }
+    }
+    assert!(
+        got[..] == bytes[..got.len()],
+        "the bytes that arrived are a prefix of the stream"
+    );
+    drop(rt);
 }

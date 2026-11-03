@@ -1,19 +1,36 @@
-TLC run of every configuration in proofs/tla/notify, 2026-10-25 20:45 UTC.
+TLC run of every configuration in proofs/tla/notify, 2026-11-02 19:42 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-L_broadcast                     101619      40048      3  pass                                  pass                                  yes
-L_mixed                         218360      84363      6  pass                                  pass                                  yes
-L_ones                           82222      32061      4  pass                                  pass                                  yes
-L_ones_any                      186255      71036      2  pass                                  pass                                  yes
-L_last                           92943      36385      3  pass                                  pass                                  yes
-L_drop                           96897      37895      4  pass                                  pass                                  yes
-M_waiters_no_pass                15346       6160      3  violated:AwaitersMadeBeforeAWaitersCallEnd violated:AwaitersMadeBeforeAWaitersCallEnd yes
-M_generation_first               17918       7695      1  violated:NoSpuriousWake               violated:NoSpuriousWake               yes
-M_drop_keeps_grant               40327      16408      4  violated:EveryAwaiterEnds             violated:EveryAwaiterEnds             yes
-M_exit_ignores_dirty             18938       8059      2  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
-W_permit_stored                      8          7      1  violated:NoPermitStored               violated:NoPermitStored               yes
-W_pass_on                         9093       3933      1  violated:NoPassOn                     violated:NoPassOn                     yes
+L_broadcast                     957610     268131     86  pass                                  pass                                  yes
+L_mixed                        2597634     715734    237  pass                                  pass                                  yes
+L_ones                          813580     243449     82  pass                                  pass                                  yes
+L_ones_any                     2245102     610080     27  pass                                  pass                                  yes
+L_last                          855245     255944     84  pass                                  pass                                  yes
+L_drop                          822012     247471     82  pass                                  pass                                  yes
+L_owed_permit                    52822      17182      6  pass                                  pass                                  yes
+M_waiters_no_pass               140881      43127     15  violated:AwaitersMadeBeforeAWaitersCallEnd violated:AwaitersMadeBeforeAWaitersCallEnd yes
+M_generation_first              155727      47527      3  violated:NoSpuriousWake               violated:NoSpuriousWake               yes
+M_drop_keeps_grant              664452     200597     65  violated:EveryAwaiterEnds             violated:EveryAwaiterEnds             yes
+M_exit_ignores_dirty            152687      46362      4  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
+M_no_recheck                       519        226      1  violated:NoPermitEatenByOwed          violated:NoPermitEatenByOwed          yes
+W_permit_stored                     14         11      1  violated:NoPermitStored               violated:NoPermitStored               yes
+W_pass_on                        71506      22752      2  violated:NoPassOn                     violated:NoPassOn                     yes
+L_two_broadcasts                 51491      18856      6  pass                                  pass                                  yes
+L_one_and_broadcast              86440      32148      8  pass                                  pass                                  yes
+L_drop_alone                     10962       4415      2  pass                                  pass                                  yes
+M_arrivals_unchecked            180346      54257      3  violated:QueuedOneGeneration          violated:QueuedOneGeneration          yes
+M_permit_not_converted            5838       2052      2  violated:EveryAwaiterEnds             violated:EveryAwaiterEnds             yes
+M_leftover_lost                   8388       3406      1  violated:OneIsKept                    violated:OneIsKept                    yes
+M_count_withdrawn_grant         672044     206192     65  violated:EveryAwaiterEnds             violated:EveryAwaiterEnds             yes
+S_two_broadcasts              10924489    3110886    124  pass                                  pass                                  yes
+L_two_broadcasts_then_one        76561      24976      8  pass                                  pass                                  yes
+S_one_then_broadcast_queued       32880      12017      2  pass                                  pass                                  yes
+ML_split_word                    58123      18922      6  violated:LateAwaiterEnds              violated:LateAwaiterEnds              yes
+ML_newer_as_old                  90048      29350      9  violated:LateAwaiterEnds              violated:LateAwaiterEnds              yes
+M_owed_before_generation         26476       9996      2  violated:NoSparePermit                violated:NoSparePermit                yes
+M_old_to_permit                   8987       3526      1  violated:NoSparePermit                violated:NoSparePermit                yes
+ML_no_recheck                    29155       9923      4  violated:LateAwaiterEnds              violated:LateAwaiterEnds              yes
 
-results matching EXPECTED.txt: 12 of 12
+results matching EXPECTED.txt: 29 of 29

@@ -22,9 +22,17 @@
 (*                                                                          *)
 (* kovan, abstractly: a push holds a guard for its whole push, and a node  *)
 (* it loads while not yet retired is protected until the push ends; a      *)
-(* retired node no guard protects may be freed at any moment (the step     *)
-(* `Free`). Following a pointer reads the node it names, and that must     *)
-(* never meet a freed node.                                                *)
+(* retired node no guard protects may be freed at any moment. Following a  *)
+(* pointer reads the node it names, and that must never meet a freed node. *)
+(* The model's kovan frees, at any moment, every node it may then, in one *)
+(* step (`K_free`): a node it may free stays one it may free until it is  *)
+(* freed (retired is for good, and a retired node is never protected       *)
+(* again), so freeing all of them is the most a free can do at that        *)
+(* moment, and a read meets a freed node in some run of single frees if    *)
+(* and only if it does in some run of these. Each such step is the single  *)
+(* frees of its nodes one after the other with nothing between, so every   *)
+(* run here is a run of the code's kovan; only the order among frees that  *)
+(* nothing reads in between is not walked again and again.                 *)
 (*                                                                          *)
 (* What is abstract: a leaf holds one position, so the head leaves a leaf   *)
 (* with every value it passes; a node is its level and its index at that    *)
@@ -240,15 +248,15 @@ R_retire:
     end while;
 end process;
 
-\* kovan frees a retired node once no guard protects it, until everyone is done.
+\* kovan frees the retired nodes no guard protects, every one it may at once, until everyone is
+\* done.
 process kovan = KovanT
 begin
 K_free:
     while TRUE do
         either
-            with k \in Freeable do
-                freed := freed \cup {k};
-            end with;
+            await Freeable # {};
+            freed := freed \cup Freeable;
         or
             await Done /\ \A p \in Producers : pc[p] = "Done";
             goto K_done;

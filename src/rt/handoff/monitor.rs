@@ -34,7 +34,7 @@ use super::life::Life;
 use super::slot::{self, Slot};
 use crate::rt::runtime::Inner;
 use crate::rt::shard::{Shard, Shared};
-use crate::sync::internal::{AtomicBool, AtomicPtr, Ordering, fence};
+use crate::sync::internal::{AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
 
 /// Reads of one word in a row that make a blocked poll.
 const STREAK: u32 = 4;
@@ -106,7 +106,9 @@ impl Spare {
 
 impl Drop for Spare {
     /// A gift handed to a spare that had seen the close and gone: its shard
-    /// goes with the spare, never kept for good.
+    /// goes with the spare, never kept for good, inside its runtime (the
+    /// spare's thread runs inside it, and the monitor lets go of the one it
+    /// pops through `let_go`).
     fn drop(&mut self) {
         drop(self.take_gift());
     }
@@ -130,6 +132,10 @@ pub(crate) struct Monitor {
     cores: Vec<usize>,
     /// Told of each poll seen past the threshold.
     long_poll: Option<crate::rt::tuning::TaskHook>,
+    /// Polls taken from their thread that still run there on no shard a
+    /// paused clock looks at: work in flight it waits for, as for a blocking
+    /// job (proofs/tla/clock, `M_detached_uncounted`).
+    detached: AtomicUsize,
 }
 
 impl Monitor {
@@ -152,7 +158,26 @@ impl Monitor {
             closing: crate::sync::Notify::new(),
             cores,
             long_poll,
+            detached: AtomicUsize::new(0),
         }
+    }
+
+    /// Polls taken from their thread that run there still, on no counted
+    /// shard.
+    pub(crate) fn detached(&self) -> usize {
+        self.detached.load(Ordering::SeqCst)
+    }
+
+    /// A taken poll is over on its thread, or its thread runs it on a shard
+    /// a paused clock counts (its own, a guest): in flight no more.
+    pub(crate) fn count_out(&self) {
+        self.detached.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// A poll is taken from its thread, or its thread's guest shard leaves
+    /// with the poll still running: in flight.
+    pub(crate) fn count_in(&self) {
+        self.detached.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Tells the long-poll hook of the poll of task `task` (0: a poll that
@@ -208,6 +233,23 @@ impl Monitor {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Ready once the runtime shuts down, for a waiter that enables it before it looks at
+    /// [`is_closed`](Self::is_closed).
+    pub(crate) fn closing(&self) -> crate::sync::Notified<'_> {
+        self.closing.notified()
+    }
+
+    /// The time between the monitor's reads of a word.
+    pub(crate) fn tick(&self) -> Duration {
+        (self.after / STREAK).max(Duration::from_micros(100))
+    }
+
+    /// The life of the first runner of place `index`.
+    #[cfg(test)]
+    pub(crate) fn first_life(&self, index: usize) -> Option<Arc<Life>> {
+        Some(Arc::clone(&self.places.get(index)?.get()?.first.life))
+    }
+
     /// Waits, as spare `me`, for a shard to run: `None` once the runtime
     /// shuts down.
     pub(crate) fn wait_for_shard(&self, me: &Arc<Spare>) -> Option<Gift> {
@@ -234,7 +276,8 @@ impl Monitor {
             return;
         }
         core::future::poll_fn(|cx| {
-            if home.poll_drained(cx).is_ready() {
+            // SAFETY: this runs on the home's thread, in `finish_home`'s `block_on`.
+            if unsafe { home.poll_drained(cx) }.is_ready() {
                 return core::task::Poll::Ready(());
             }
             closing.as_mut().poll(cx)
@@ -265,7 +308,7 @@ struct Watch {
 /// until it shuts down.
 pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
     monitor.bell.bind();
-    let tick = (monitor.after / STREAK).max(Duration::from_micros(100));
+    let tick = monitor.tick();
     let mut watches: Vec<Option<Watch>> = (0..monitor.places.len()).map(|_| None).collect();
     let mut waiting: Option<Gift> = None;
     // Hands a gift on, the place's watch following its new runner.
@@ -392,8 +435,10 @@ fn take(
         fence(Ordering::SeqCst);
     } else if !super::fence::heavy() {
         // The heavy fence failed, which `available` said it would not: no
-        // take may rely on it.
+        // take may rely on it. Counted, so a watch that cannot rescue a
+        // blocked poll shows (proofs/tla/handoff, `F_fail`).
         old.slot.cancel();
+        place.shared.counters.handoff_failed();
         let_go(runtime, shard);
         return None;
     }
@@ -410,6 +455,11 @@ fn take(
         return None;
     }
     // The shard is the monitor's, its reference held since before the claim.
+    // The rest of the poll runs on its thread on no shard: in flight, before
+    // the shard's next runner can park it idle.
+    monitor.count_in();
+    // The runner may be back from its poll already: its life's back and this
+    // detach add up whichever comes first (proofs/tla/handoff/TakeRef.tla).
     old.life.detach();
     old.life.unpin(&monitor.cores);
     shard.hand_over_queues();
@@ -440,6 +490,11 @@ fn give(monitor: &Monitor, runtime: &Weak<Inner>, gift: Gift) -> Result<(usize, 
             .gift
             .store(Box::into_raw(Box::new(gift)), Ordering::Release);
         spare.thread.unpark();
+        // A spare that saw the close and left before this pop holds no
+        // reference of its own: this one is the last, and the gift goes with
+        // it, inside the shard's runtime (proofs/tla/teardown,
+        // `LastDropInRuntime`).
+        let_go(runtime, spare);
         return Ok((place, life));
     }
     let Some(inner) = runtime.upgrade() else {
@@ -631,6 +686,220 @@ mod tests {
         assert_eq!(polled, crate::rt::context::Polled::Detached);
     }
 
+    /// An IO owner's step marks its call with no guard (`mark_call`), the mark kept with what the
+    /// step leaves until its settle ends it (`unmark_call`): a take meanwhile lets the shard be,
+    /// and a call inside the step marks nothing more. Once the step ended the poll is outside
+    /// again and taken, and a step's mark after that finds the shard taken.
+    #[test]
+    fn an_owner_step_mark_holds_off_a_take_until_its_settle() {
+        use crate::rt::context::{self, Marked};
+        let shard = worker_shard();
+        let monitor = Monitor::new(Duration::from_millis(10), 1, Vec::new(), None);
+        let slot = monitor.slot();
+        let first = Runner {
+            slot: Arc::clone(&slot),
+            life: Arc::new(Life::new()),
+        };
+        monitor.started(0, &shard, first.clone());
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let (_, polled) = context::poll(&shard.shared, || {
+            let word = slot.word();
+            assert!(matches!(context::mark_call(), Marked::In));
+            assert!(
+                !slot::is_outside(slot.word()),
+                "the step's call is not marked"
+            );
+            assert!(
+                matches!(context::mark_call(), Marked::Not),
+                "a call in the step marked"
+            );
+            let mut watch = Watch {
+                runner: first.clone(),
+                last: word,
+                streak: STREAK,
+                longest: 0,
+                reported: slot::inside(0),
+            };
+            let place = monitor.places[0].get().unwrap();
+            assert!(
+                take(&monitor, &Weak::new(), place, 0, &mut watch, word).is_none(),
+                "the shard was taken while a step was marked"
+            );
+            context::unmark_call();
+            assert_eq!(slot.word(), word, "the step's end left the poll inside");
+            let gift = take(&monitor, &Weak::new(), place, 0, &mut watch, word)
+                .expect("the poll, outside again, was not taken");
+            assert!(matches!(context::mark_call(), Marked::Taken));
+            drop(gift);
+        });
+        assert_eq!(polled, context::Polled::Detached);
+    }
+
+    /// An owner's straight send finds the socket full, and the shard is taken before the rest of
+    /// the same poll; the peer reads meanwhile, and the shard's driver, on whatever thread runs it
+    /// now, passes over the write edge that room brings, since the side still says it was only ever
+    /// held by its owner and idle. The rest of the poll then goes the way of any other thread, and
+    /// must ask the kernel again: told the socket was full, it would block the side on an edge
+    /// that already passed, and the byte would wait for good (proofs/tla/sendsnow/TakenFull.tla).
+    /// A readiness driver's with biased sides: on a ring a side never blocks on an edge, and with
+    /// no heavy fence every side starts shared, whose edges are never passed over.
+    #[cfg(unix)]
+    #[test]
+    fn an_owners_full_send_whose_shard_is_taken_before_the_rest_of_its_poll_asks_again() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::task::{Context, Poll};
+
+        use crate::rt::context;
+        if !super::super::fence::available() {
+            eprintln!("skipping: no heavy fence here, so every side starts shared");
+            return;
+        }
+        let shard = worker_shard();
+        #[cfg(ring)]
+        if shard.shared.is_ring() {
+            eprintln!("skipping: a ring's side never waits for a write edge");
+            return;
+        }
+        let monitor = Arc::new(Monitor::new(Duration::from_millis(10), 1, Vec::new(), None));
+        let slot = monitor.slot();
+        let first = Runner {
+            slot: Arc::clone(&slot),
+            life: Arc::new(Life::new()),
+        };
+        monitor.started(0, &shard, first.clone());
+        let (a, mut b) = UnixStream::pair().unwrap();
+        b.set_nonblocking(true).unwrap();
+        let handle = crate::io::Handle::new(a).unwrap();
+        let src = Arc::clone(handle.source());
+        let fd = handle.get_ref().as_raw_fd();
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // A read that waits homes the source here; the owner then writes straight once, and its
+        // release says the write side holds nothing and waits for nothing.
+        let mut nothing = [0u8; 1];
+        let (read, _) = context::poll(&shard.shared, || {
+            src.poll_read(&mut cx, &mut nothing, false)
+        });
+        assert!(read.is_pending(), "{read:?}");
+        let (first_write, _) = context::poll(&shard.shared, || src.poll_write(&mut cx, b"x"));
+        assert!(matches!(first_write, Poll::Ready(Ok(1))), "{first_write:?}");
+        let mut one = [0u8; 1];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while b.read(&mut one).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first byte never came"
+            );
+            std::thread::yield_now();
+        }
+        // The socket fills, behind the side's back.
+        let chunk = [0u8; 4096];
+        // SAFETY: a plain send of our own buffer on our own socket.
+        while unsafe { libc::send(fd, chunk.as_ptr().cast(), chunk.len(), libc::MSG_DONTWAIT) } > 0
+        {
+        }
+        let gift = std::rc::Rc::new(core::cell::Cell::new(None));
+        let (keep, peer, turn_on, taker, old) = (
+            std::rc::Rc::clone(&gift),
+            b.try_clone().unwrap(),
+            Arc::clone(&shard),
+            Arc::clone(&monitor),
+            Arc::clone(&slot),
+        );
+        crate::io::source::write::AFTER_FULL_SEND.set(Some(Box::new(move || {
+            // The take, between the straight send and the rest of the poll.
+            let word = old.word();
+            let mut watch = Watch {
+                runner: first.clone(),
+                last: word,
+                streak: STREAK,
+                longest: 0,
+                reported: slot::inside(0),
+            };
+            let place = taker.places[0].get().unwrap();
+            keep.set(take(&taker, &Weak::new(), place, 0, &mut watch, word));
+            // The peer reads all: room comes, and the edge it brings is passed over.
+            let mut sink = [0u8; 4096];
+            while (&peer).read(&mut sink).is_ok_and(|n| n > 0) {}
+            let _ = turn_on.turn(64, Some(Duration::ZERO));
+        })));
+        let (second, polled) = context::poll(&shard.shared, || src.poll_write(&mut cx, b"y"));
+        assert!(gift.take().is_some(), "the shard was not taken in the poll");
+        assert_eq!(polled, context::Polled::Detached);
+        assert!(matches!(second, Poll::Ready(Ok(1))), "{second:?}");
+        assert!(
+            matches!(b.read(&mut one), Ok(1)) && one == *b"y",
+            "the byte waits behind a side blocked on an edge its driver passed over"
+        );
+    }
+
+    /// A spare that came after the close looked, saw it and left, its
+    /// reference still on the queue: the last pass's hand-off pops it, and the
+    /// popped reference is the last, so the gift, and the shard, go with it.
+    /// That drop was the monitor's plain one, outside any runtime, and what
+    /// the shard's going handed on went elsewhere; it goes through `let_go`,
+    /// inside the shard's runtime (proofs/tla/teardown).
+    #[test]
+    fn a_gift_to_a_spare_that_left_goes_inside_its_runtime() {
+        use std::sync::atomic::AtomicU64;
+        static DROPPED_IN: AtomicU64 = AtomicU64::new(0);
+        struct Marks;
+        impl Drop for Marks {
+            fn drop(&mut self) {
+                let id = crate::rt::context::runtime().map_or(u64::MAX, |inner| inner.id());
+                DROPPED_IN.store(id, Ordering::SeqCst);
+            }
+        }
+        static LOCAL: crate::runtime::ShardLocal<Marks> =
+            crate::runtime::ShardLocal::__new(|| Marks);
+        let rt = crate::runtime::Builder::new()
+            .worker_threads(0)
+            .build()
+            .unwrap();
+        let inner = Arc::clone(rt.inner());
+        let monitor = Arc::new(Monitor::new(Duration::from_millis(10), 1, Vec::new(), None));
+        let shard = Shard::worker(
+            Limits {
+                max_nesting: 8,
+                buffer_cap: crate::buf::DEFAULT_CAP,
+                backend: crate::rt::backend::chosen().unwrap(),
+            },
+            crate::rt::tuning::Tuning::default(),
+            inner.id(),
+            0,
+            Some(Arc::clone(&monitor)),
+        )
+        .unwrap();
+        {
+            let _in = crate::rt::context::enter(&shard);
+            LOCAL.with(|_| ());
+        }
+        monitor.close();
+        let waits = Arc::clone(&monitor);
+        std::thread::spawn(move || {
+            assert!(
+                waits
+                    .wait_for_shard(&Spare::here(Arc::new(Life::new())))
+                    .is_none()
+            );
+        })
+        .join()
+        .unwrap();
+        let gift = Gift {
+            place: 0,
+            shard: Owned(shard),
+            slot: monitor.slot(),
+        };
+        assert!(give(&monitor, &Arc::downgrade(&inner), gift).is_ok());
+        assert_eq!(
+            DROPPED_IN.load(Ordering::SeqCst),
+            inner.id(),
+            "the shard went outside its runtime"
+        );
+    }
+
     /// A take that succeeds holds the shard in its gift, so the runner's
     /// letting go of its own reference as it finds the shard taken leaves
     /// the shard to its next runner.
@@ -642,5 +911,29 @@ mod tests {
         assert_eq!(slot.come_back(1), slot::Back::Taken);
         drop(shard);
         assert_eq!(Arc::strong_count(&gift.shard.0), 1);
+    }
+
+    /// A take whose heavy fence fails relies on nothing the fence was to order: it cancels its
+    /// claim, takes nothing, and counts the failure on the shard, so a watch that can no longer
+    /// rescue a blocked poll is seen in the stats (proofs/tla/handoff, `F_fail`).
+    #[test]
+    fn a_take_whose_heavy_fence_fails_cancels_its_claim_and_is_counted() {
+        let shard = worker_shard();
+        let (mut monitor, slot, mut watch) = watched(&shard);
+        // The heavy fence's path on every platform: one that has none takes a full fence instead.
+        monitor.full_fence = false;
+        super::super::fence::inject_failure(true);
+        let gift = take_outside(&monitor, &mut watch);
+        super::super::fence::inject_failure(false);
+        assert!(gift.is_none(), "a take relied on a failed fence");
+        assert_eq!(slot.come_back(1), slot::Back::In, "the claim was left up");
+        let stats = shard.shared.counters.read(0);
+        assert_eq!(stats.handoffs_failed, 1, "the failed take was not counted");
+        assert_eq!(stats.handoffs, 0);
+        slot.go_out(1);
+        let gift = take_outside(&monitor, &mut watch).expect("the poll was not taken");
+        let stats = shard.shared.counters.read(0);
+        assert_eq!((stats.handoffs, stats.handoffs_failed), (1, 1));
+        drop(gift);
     }
 }

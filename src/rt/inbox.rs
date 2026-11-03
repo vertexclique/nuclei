@@ -79,6 +79,29 @@ impl Link {
     }
 }
 
+/// The queue's own node: allocated once and held by a raw pointer, as the queue's ends point
+/// at it (a `Box` moved with the inbox would claim it alone). Freed with the inbox, after its
+/// drain, and also when an item's drop panics in that drain.
+struct Stub(NonNull<Link>);
+
+impl Stub {
+    fn new() -> Self {
+        Self(NonNull::from(Box::leak(Box::new(Link::new()))))
+    }
+
+    fn as_ptr(&self) -> *mut Link {
+        self.0.as_ptr()
+    }
+}
+
+impl Drop for Stub {
+    fn drop(&mut self) {
+        // SAFETY: the node came from `Box::leak` in `new` and is freed once, here, as the
+        // inbox that points at it goes.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
 /// What a take found.
 pub(crate) enum Pop<T = Runnable> {
     Item(T),
@@ -94,8 +117,8 @@ pub(crate) struct Inbox<T: Linked = Runnable> {
     head: AtomicPtr<Link>,
     /// The taker's end; only the role's holder reaches it.
     tail: UnsafeCell<*mut Link>,
-    /// The queue's own node, boxed so it stays put as the inbox moves.
-    stub: Box<Link>,
+    /// The queue's own node.
+    stub: Stub,
     /// The taker's role is held.
     taken: AtomicBool,
     items: PhantomData<T>,
@@ -110,8 +133,8 @@ unsafe impl<T: Linked> Sync for Inbox<T> {}
 impl<T: Linked> Inbox<T> {
     /// An empty inbox, its taker's role held by its maker.
     pub(crate) fn new() -> Self {
-        let stub = Box::new(Link::new());
-        let at = ptr::from_ref::<Link>(&stub).cast_mut();
+        let stub = Stub::new();
+        let at = stub.as_ptr();
         Self {
             head: AtomicPtr::new(at),
             tail: UnsafeCell::new(at),
@@ -122,7 +145,7 @@ impl<T: Linked> Inbox<T> {
     }
 
     fn stub(&self) -> *mut Link {
-        ptr::from_ref::<Link>(&self.stub).cast_mut()
+        self.stub.as_ptr()
     }
 
     /// Hands `item` to the queue.
@@ -406,10 +429,47 @@ mod tests {
         );
     }
 
+    /// An item whose drop panics, linked through its own node.
+    #[repr(C)]
+    struct Panics {
+        link: Link,
+    }
+
+    impl Drop for Panics {
+        fn drop(&mut self) {
+            panic!("the item's drop panics");
+        }
+    }
+
+    // SAFETY: the item is a leaked `Box` whose first field is its link, taken back once.
+    unsafe impl Linked for Box<Panics> {
+        fn into_link(self) -> NonNull<Link> {
+            NonNull::from(Box::leak(self)).cast()
+        }
+
+        unsafe fn from_link(link: NonNull<Link>) -> Self {
+            // SAFETY: the caller's contract: `link` came from `into_link`.
+            unsafe { Box::from_raw(link.cast::<Panics>().as_ptr()) }
+        }
+    }
+
+    /// A panic in an item's drop as the inbox drains goes out of the inbox's drop, and the stub
+    /// is freed all the same (the CI's leak checker sees a stub left behind).
+    #[test]
+    fn a_panic_dropping_an_item_still_frees_the_stub() {
+        let inbox: Inbox<Box<Panics>> = Inbox::new();
+        inbox.push(Box::new(Panics { link: Link::new() }));
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(inbox)));
+        assert!(
+            dropped.is_err(),
+            "the item's panic went out of the inbox's drop"
+        );
+    }
+
     #[test]
     fn pushes_from_threads_all_come_out_in_each_threads_order() {
         const THREADS: u32 = 4;
-        const EACH: u32 = 2_000;
+        const EACH: u32 = if cfg!(miri) { 40 } else { 2_000 };
         let log = Log::default();
         let inbox: Arc<Inbox> = Arc::new(Inbox::new());
         let pushers: Vec<_> = (0..THREADS)

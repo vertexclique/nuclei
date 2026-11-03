@@ -16,6 +16,8 @@ impl Limit for Unbounded {
     }
 
     fn close(&self) {}
+
+    fn debit(&self, _n: usize) {}
 }
 
 /// Creates an unbounded channel and answers its two halves.

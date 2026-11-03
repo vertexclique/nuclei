@@ -115,16 +115,22 @@ impl Slot {
     }
 
     /// The runner polls the task `id` (0: none) from now on; answers the one
-    /// it polled before, which encloses this poll.
+    /// it polled before, which encloses this poll. The load is relaxed, only
+    /// the runner writes the word. Release: the monitor reads the word, then
+    /// the task, then the word again, and a later poll's task must not be seen
+    /// before the word that ended the earlier poll, so the hook is never told
+    /// the next poll's task under the word of the one before
+    /// (proofs/tla/longpoll).
     pub(crate) fn note_task(&self, id: u64) -> u64 {
         let previous = self.task.load(Ordering::Relaxed);
-        self.task.store(id, Ordering::Relaxed);
+        self.task.store(id, Ordering::Release);
         previous
     }
 
-    /// The task polled innermost, as the monitor reads it.
+    /// The task polled innermost, as the monitor reads it. Acquire: it keeps
+    /// the monitor's second read of the word after this read.
     pub(crate) fn task(&self) -> u64 {
-        self.task.load(Ordering::Relaxed)
+        self.task.load(Ordering::Acquire)
     }
 
     /// The runner leaves the shard for a task's code, in the poll of
@@ -152,6 +158,26 @@ impl Slot {
         // poll's outside word.
         let word = self.word.load(Ordering::Relaxed);
         (word, self.enter(word & !1))
+    }
+
+    /// [`mark`](Self::mark) for a call that backs out rather than contest a claim: the word it
+    /// left, the call marked, while no claim is up; with one up, `None` and the word put back
+    /// as it was, for the caller to take the full mark instead. Never waits.
+    #[inline(always)]
+    pub(crate) fn mark_unless_claimed(&self) -> Option<u64> {
+        let word = self.word.load(Ordering::Relaxed);
+        self.word.store(word & !1, Ordering::Relaxed);
+        if self.full_fence {
+            fence(Ordering::SeqCst);
+        } else {
+            // As in `enter`.
+            compiler_fence(Ordering::SeqCst);
+        }
+        if self.claim.load(Ordering::Relaxed) == NONE {
+            return Some(word);
+        }
+        self.unmark(word);
+        None
     }
 
     /// The runner's call into its shard ends: the word it left the call

@@ -18,11 +18,18 @@ pub(in crate::sync) enum Cancel {
     Idle,
     /// It withdrew before anyone granted it; its owner tells the queue,
     /// passing on the nudge it carries unused, if it does.
-    Withdrawn(bool),
+    Withdrawn(bool, Shelved),
     /// It had been granted, so its owner passes the grant on. Carries the
     /// payload the drainer left.
     Granted(usize),
 }
+
+/// The waker a withdrawal took out of the node, for its holder to drop after
+/// the pass the withdrawal asks for: dropping it is user code.
+#[must_use = "bind it, so it drops after the withdrawal's pass"]
+pub(in crate::sync) struct Shelved(
+    #[expect(dead_code, reason = "held to be dropped")] Option<Waker>,
+);
 
 /// What a future's look at its node found.
 pub(in crate::sync) enum Park {
@@ -54,9 +61,11 @@ impl Wait {
     /// settles it with [`park`](Self::park) and no waker.
     pub(in crate::sync) fn enqueue(&mut self, queue: &WaitQueue, payload: usize, waker: &Waker) {
         debug_assert!(self.node.is_none(), "a future queues twice");
+        // Cloned before a node is taken: a clone that panics leaves none out.
+        let waker = waker.clone();
         let node = queue.pool().take();
         // SAFETY: fresh from the pool, so this future owns it alone.
-        unsafe { node.as_ref() }.arm(payload, waker.clone());
+        unsafe { node.as_ref() }.arm(payload, waker);
         queue.push(node);
         self.node = Some(node);
     }
@@ -177,7 +186,9 @@ impl Wait {
     }
 
     /// Leaves the queue: the future was dropped, or took what it waits
-    /// for on its own. Reports a grant that got there first.
+    /// for on its own. Reports a grant that got there first. The node is
+    /// released before any user code runs; the withdrawn waker comes back
+    /// for the caller to drop last.
     pub(in crate::sync) fn cancel(&mut self, queue: &WaitQueue) -> Cancel {
         let Some(node) = self.node.take() else {
             return Cancel::Idle;
@@ -185,10 +196,7 @@ impl Wait {
         // SAFETY: this future held its reference until now.
         let waiter = unsafe { node.as_ref() };
         let outcome = match waiter.withdraw() {
-            Some((waker, nudged)) => {
-                drop(waker);
-                Cancel::Withdrawn(nudged)
-            }
+            Some((waker, nudged)) => Cancel::Withdrawn(nudged, Shelved(waker)),
             None => Cancel::Granted(waiter.payload()),
         };
         release(node, FUTURE_REF, queue);
@@ -245,7 +253,7 @@ mod tests {
             wait.park(&queue, Some(&counter.waker())),
             Park::Nudged
         ));
-        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false, _)));
     }
 
     /// The same nudge to an armed waiter claims its waker and calls it: what
@@ -261,7 +269,7 @@ mod tests {
             wait.park(&queue, Some(&counter.waker())),
             Park::Nudged
         ));
-        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false, _)));
     }
 
     /// A mark set just as the spin gives up is not lost: the look that arms
@@ -282,7 +290,7 @@ mod tests {
             matches!(wait.park(&queue, Some(&counter.waker())), Park::Nudged),
             "the look found the nudge; the waiter does not sleep beside it"
         );
-        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false, _)));
     }
 
     /// A node marked before the spin begins needs no spin: `begin_spin`
@@ -299,6 +307,6 @@ mod tests {
             wait.park(&queue, Some(&counter.waker())),
             Park::Nudged
         ));
-        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false, _)));
     }
 }

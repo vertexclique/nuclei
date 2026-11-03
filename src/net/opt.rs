@@ -228,6 +228,12 @@ pub(crate) fn linger_time(raw: Raw) -> io::Result<Option<Duration>> {
     get::<Linger>(raw, SOL_SOCKET, SO_LINGER).map(|l| linger_of(l).map(Duration::from_secs))
 }
 
+/// Whether a close with `linger` set resets the connection (`set_linger_time` sets whole seconds,
+/// so under a second is zero).
+pub(crate) fn aborts(linger: Option<Duration>) -> bool {
+    linger.is_some_and(|t| t.as_secs() == 0)
+}
+
 /// Sets `SO_LINGER`: `None` closes at once, sending what is left in the
 /// background; `Some(time)` waits up to `time` (whole seconds) for it.
 pub(crate) fn set_linger_time(raw: Raw, time: Option<Duration>) -> io::Result<()> {

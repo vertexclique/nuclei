@@ -26,12 +26,7 @@ struct Starved {
 
 impl Starved {
     fn new() -> Self {
-        let highest = std::fs::read_dir("/proc/self/fd")
-            .or_else(|_| std::fs::read_dir("/dev/fd"))
-            .unwrap()
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::rlim_t>().ok())
-            .max()
-            .unwrap_or(0);
+        let highest = highest_open();
         let limit = libc::rlimit {
             rlim_cur: highest + 32,
             rlim_max: highest + 32,
@@ -72,6 +67,37 @@ impl Starved {
     fn free(&mut self) {
         self.held.clear();
     }
+}
+
+/// The highest descriptor this process has open, from the directory the
+/// system lists them in.
+#[cfg(not(target_os = "freebsd"))]
+fn highest_open() -> libc::rlim_t {
+    std::fs::read_dir("/proc/self/fd")
+        .or_else(|_| std::fs::read_dir("/dev/fd"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::rlim_t>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// FreeBSD's `/dev/fd` lists only the first three without `fdescfs`: each
+/// number below the soft limit is asked of the kernel, from the top.
+#[cfg(target_os = "freebsd")]
+fn highest_open() -> libc::rlim_t {
+    // SAFETY: plain data, all zeroes valid; the kernel fills it.
+    let mut limit: libc::rlimit = unsafe { core::mem::zeroed() };
+    // SAFETY: a plain call with our own struct.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    let soft = limit.rlim_cur.min(1 << 20) as libc::c_int;
+    // SAFETY: F_GETFD only reads a descriptor's flags.
+    (0..soft)
+        .rev()
+        .find(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+        .unwrap_or(0) as libc::rlim_t
 }
 
 fn out_of_descriptors(err: &io::Error) -> bool {

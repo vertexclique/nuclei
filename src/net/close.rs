@@ -31,9 +31,12 @@ macro_rules! shut {
             /// `Write` and `Both` wait until the kernel took every byte the handle accepted, so
             /// the peer reads all of them before the end of the stream, then ask the kernel; a
             /// peer that never reads holds them up, as it would hold up std's blocking writes.
-            /// `Read` leaves the writes alone. After `Read` or `Both`, reads answer as std's do:
-            /// Linux hands out what came before the shutdown, then the end; macOS and Windows end
-            /// at once, so there the handle drops what it read ahead.
+            /// `Read` leaves the writes alone. After `Read` or `Both`, Linux hands out what came
+            /// before the shutdown, then the end, as std's reads do. On macOS, the BSDs and
+            /// Windows every read answers the end at once (on Windows too, where std's read
+            /// answers an error): the handle drops what it read ahead, and any bytes a receive
+            /// made before the shut brings later. The design is checked by
+            /// `proofs/tla/close/ShutRead.tla`.
             ///
             /// It is not named `shutdown`, so that `stream.shutdown(how)` still calls std's own,
             /// reached through `Deref`, which shuts the halves at once: the bytes still behind

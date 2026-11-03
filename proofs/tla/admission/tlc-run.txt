@@ -1,14 +1,27 @@
-TLC run of every configuration in proofs/tla/admission, 2026-10-30 17:55 UTC.
+TLC run of every configuration in proofs/tla/admission, 2026-11-03 05:41 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers 1, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-G_admits                          2247        400      1  pass                                  pass                                  yes
-M_no_group_fit                     570        165      1  violated:CqNeverOverfull              violated:CqNeverOverfull              yes
-M_no_long_exemption                 22         14      1  violated:NoRoomDeadlock               violated:NoRoomDeadlock               yes
-W_room_used                         67         28      1  violated:NoRoomEver                   violated:NoRoomEver                   yes
-W_long_past_cap                     25         13      1  violated:LongWithinCap                violated:LongWithinCap                yes
-M_once_counted                      46         24      1  violated:NoRoomDeadlock               violated:NoRoomDeadlock               yes
-W_once_past_cap                     54         24      1  violated:OnceWithinCap                violated:OnceWithinCap                yes
+G_admits                         12225       1600      1  pass                                  pass                                  yes
+M_no_group_fit                    1400        339      1  violated:CqNeverOverfull              violated:CqNeverOverfull              yes
+M_no_long_exemption                 38         20      1  violated:NoRoomDeadlock               violated:NoRoomDeadlock               yes
+W_room_used                        131         45      1  violated:NoRoomEver                   violated:NoRoomEver                   yes
+W_long_past_cap                     41         18      1  violated:LongWithinCap                violated:LongWithinCap                yes
+M_once_counted                      78         35      1  violated:NoRoomDeadlock               violated:NoRoomDeadlock               yes
+W_once_past_cap                     87         34      1  violated:OnceWithinCap                violated:OnceWithinCap                yes
+M_sends_counted                    101         41      1  violated:NoRoomDeadlock               violated:NoRoomDeadlock               yes
+W_sends_past_cap                   115         41      0  violated:SendsWithinCap               violated:SendsWithinCap               yes
+G_polls_overflow                109873      13960      4  pass                                  pass                                  yes
+M_no_rearm_after_full            21929       3400      1  violated:EndedRearmed                 violated:EndedRearmed                 yes
+W_poll_edges_past_queue           1452        364      1  violated:NoOverflow                   violated:NoOverflow                   yes
+G_dropped                       625153      77224     25  pass                                  pass                                  yes
+G_dropped_ends                  909713     116260     37  pass                                  pass                                  yes
+M_panic_on_dropped                3024        725      1  violated:ShardLives                   violated:ShardLives                   yes
+M_drop_uncounted                102033      13992      3  violated:DropsCounted                 violated:DropsCounted                 yes
+M_poll_end_dropped               31369       4656      2  violated:DroppedRecovered             violated:DroppedRecovered             yes
+G_dropped_recovers              118393      16836      8  pass                                  pass                                  yes
+M_skip_sweep                     64129       9240      3  violated:DroppedRecovered             violated:DroppedRecovered             yes
+M_no_cancel                       2764        701      1  violated:NoFalseSweep                 violated:NoFalseSweep                 yes
 
-results matching EXPECTED.txt: 7 of 7
+results matching EXPECTED.txt: 20 of 20

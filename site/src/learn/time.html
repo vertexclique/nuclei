@@ -6,6 +6,7 @@
 <li><code>sleep(duration)</code> and <code>sleep_until(instant)</code> give a <code>Sleep</code>; <code>reset</code> moves its deadline, <code>deadline</code> and <code>is_elapsed</code> read it.</li>
 <li><code>timeout(duration, future)</code> and <code>timeout_at(deadline, future)</code> give <code>Ok(output)</code>, or <code>Err(Elapsed)</code> if the time ran out first. The future is polled before the clock is read, so one that is ready at once always wins.</li>
 <li>Dropping a timer's future cancels it.</li>
+<li>A sleep that completes spends one operation of the task's <a href="tasks.html#yield">budget</a>, as IO does, so a loop over sleeps that are already due still lets the shard's other tasks run.</li>
 </ul>
 
 <h2 id="wheel">The clock and the wheel</h2>
@@ -23,7 +24,7 @@
 </ul>
 
 <h2 id="interval">Intervals</h2>
-<p><code>interval(period)</code> ticks every period, the first tick at once; <code>interval_at(start, period)</code> starts at <code>start</code>. <code>tick().await</code> gives the instant the tick was due, and <code>poll_tick</code> is the same wait for a hand-written future. A period of zero panics.</p>
+<p><code>interval(period)</code> ticks every period, the first tick at once; <code>interval_at(start, period)</code> starts at <code>start</code>. <code>tick().await</code> gives the instant the tick was due, and <code>poll_tick</code> is the same wait for a hand-written future. A period of zero panics. A tick that would fall past the clock's range waits in the far future instead, so a period too large for the clock ticks once.</p>
 <!--example time_interval-->
 <table class="table">
 <thead><tr><th>MissedTickBehavior</th><th>When the interval was polled late</th></tr></thead>
@@ -38,9 +39,10 @@
 <p>Code that sleeps is slow to test. A paused clock stands still and moves only when asked, so an hour's timeout passes at once and the test still sees an hour on the clock.</p>
 <ul>
 <li><code>time::pause()</code> stops the clock of the runtime the code runs in. <code>Builder::start_paused(true)</code>, <code>#[nuclei::main(start_paused = true)]</code> and <code>#[nuclei::test(start_paused = true)]</code> start it stopped.</li>
-<li><strong>It moves by itself when nothing else can.</strong> Once every shard of the runtime is idle with a timer armed, the clock jumps to the earliest timer.</li>
+<li><strong>It moves by itself when nothing else can.</strong> Once every shard of the runtime is idle with a timer armed, no blocking job runs and no poll the handoff took from its worker still runs, the clock jumps to the earliest timer.</li>
 <li><code>time::advance(duration).await</code> moves it by hand and lets the timers that came due fire before it returns.</li>
 <li><code>time::resume()</code> starts it again from where it stands.</li>
+<li><strong>A pause counts every thread inside the runtime's <code>block_on</code></strong>, from a task on any worker, so the clock does not jump while one is busy. A nested <code>block_on</code> of another runtime on the same thread keeps its own clock and timers, so a paused inner clock never fires the outer runtime's sleeps early; its paused clock does not count that shard.</li>
 </ul>
 <!--example time_paused-->
 <p>A paused clock never goes backwards, on any thread, across a pause, a resume or an advance. While no runtime's clock is paused or advanced, reading it costs one load more than reading the system clock.</p>

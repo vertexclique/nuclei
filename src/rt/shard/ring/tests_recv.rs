@@ -83,7 +83,7 @@ fn set_buffers(fd: std::os::fd::RawFd, bytes: libc::c_int) {
     }
 }
 
-fn pattern(len: usize) -> Vec<u8> {
+pub(super) fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 + i / 251) as u8).collect()
 }
 
@@ -91,7 +91,7 @@ async fn read(src: &Arc<Source>, buf: &mut [u8]) -> usize {
     poll_fn(|cx| src.poll_read(cx, buf, false)).await.unwrap()
 }
 
-async fn read_exact(src: &Arc<Source>, out: &mut [u8]) {
+pub(super) async fn read_exact(src: &Arc<Source>, out: &mut [u8]) {
     let mut at = 0;
     while at < out.len() {
         match read(src, &mut out[at..]).await {

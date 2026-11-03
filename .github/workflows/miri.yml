@@ -1,0 +1,37 @@
+name: Miri
+
+# The unit tests Miri can run, under Miri: those that make no system call Miri cannot carry out
+# and touch none of the lock-free structures underneath. `miri.sh` names them and says why each
+# group can run.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    # A test that hangs fails the job here, not at the runner's six hours.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup Miri
+        run: cargo miri setup
+
+      - name: Run Miri tests
+        run: |
+          bash .github/workflows/miri.sh
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows"
+          RUSTFLAGS: "-C target-feature=+cmpxchg16b"

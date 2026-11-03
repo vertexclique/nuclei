@@ -35,7 +35,7 @@ fn a_take_takes_every_counted_item_once_and_in_order() {
 #[test]
 fn items_pushed_on_other_threads_are_all_taken_in_each_threads_order() {
     const THREADS: u32 = 4;
-    const EACH: u32 = 2_000;
+    const EACH: u32 = if cfg!(miri) { 200 } else { 2_000 };
     let q = Arc::new(Counted::new());
     let pushers: Vec<_> = (0..THREADS)
         .map(|t| {

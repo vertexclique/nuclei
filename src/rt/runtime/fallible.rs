@@ -8,7 +8,7 @@ use std::io;
 use std::sync::Arc;
 
 use super::super::context;
-use super::{DEFAULT, Inner, Runtime, Task, spawn_here, spawn_on};
+use super::{DEFAULT, Inner, Runtime, Task, context_hooks, spawn_here, spawn_on, spawn_unworked};
 
 /// The process default runtime, started now if it is not running; the
 /// error of its start, if it cannot.
@@ -64,7 +64,7 @@ where
         Some(shard) => Ok(spawn_on(inner, shard, future)),
         None => {
             ensure_shard()?;
-            Ok(spawn_here(future, false))
+            Ok(spawn_unworked(inner, future))
         }
     }
 }
@@ -89,7 +89,7 @@ where
         ));
     }
     ensure_shard()?;
-    Ok(spawn_here(future, true))
+    Ok(spawn_here::<_, true>(future, context_hooks()))
 }
 
 /// [`spawn_blocking`](super::spawn_blocking); a worker named for it is

@@ -141,6 +141,14 @@ impl Poller {
         })
     }
 
+    /// The time from its arming to the deadline the timer change the next
+    /// wait submits is for, if there is one.
+    #[cfg(all(test, precise_timer))]
+    pub(crate) fn precise_armed_in(&self) -> Option<Duration> {
+        self.timer
+            .map(|event| Duration::from_nanos(u64::try_from(event.data).unwrap_or(0)))
+    }
+
     /// Makes the next wait end at the precise deadline `at`, `after` from
     /// now: a one-shot `EVFILT_TIMER` in nanoseconds (on Apple's systems
     /// marked critical, so it is not coalesced), submitted with the wait
@@ -355,7 +363,6 @@ impl Registrar {
 impl Notifier {
     /// Wakes the poller, or makes its next wait return at once.
     pub(crate) fn notify(&self) {
-        // A failure here means the queue is gone, so nobody waits on it.
-        let _ = submit(&self.queue, &wake_event(0, libc::NOTE_TRIGGER));
+        super::notify_until_taken(|| submit(&self.queue, &wake_event(0, libc::NOTE_TRIGGER)));
     }
 }

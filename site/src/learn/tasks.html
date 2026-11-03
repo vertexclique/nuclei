@@ -1,7 +1,7 @@
 <!--title Tasks-->
 <!--lede Spawn work, wait for it, cancel it, and run what is not Send or not async.-->
 <h2 id="spawn">Spawn and await</h2>
-<p><code>nuclei::spawn</code> takes a future that is <code>Send + 'static</code> and returns a <code>Task&lt;T&gt;</code>. A task is a future itself: awaiting it gives the task's output. If the task panics, awaiting it resumes the panic.</p>
+<p><code>nuclei::spawn</code> takes a future that is <code>Send + 'static</code> and returns a <code>Task&lt;T&gt;</code>. A task is a future itself: awaiting it gives the task's output. If the task panics, awaiting it resumes the panic. So does a future that panics as it is dropped, once it completed or as it was cancelled: the panic is the task's outcome, even for a handle that cancelled it. A panic no handle can take is logged at error; the runtime and its other tasks run on.</p>
 <!--example tasks_spawn-->
 
 <h2 id="lifetime">Dropping, detaching, cancelling</h2>
@@ -43,9 +43,10 @@
 <p>Blocking code finds its way into tasks: a lock of a synchronous library, a slow system call, a loop longer than planned. When one poll of a task runs past <a href="api:nuclei::Builder::handoff_after"><code>handoff_after</code></a> (10 ms by default), the task holds up only itself: its worker's shard, with every other task, timer and IO of it, goes on on another thread on the same core, and the blocked task carries on once its poll returns. A task placed on a worker stays on that worker through it.</p>
 <ul>
 <li>The blocked thread still shares the core, so a handoff is a rescue, not a place to run work: give long work to <code>spawn_blocking</code> or break it up with yields.</li>
-<li>Tasks that <code>spawn_local</code> keeps on the blocked thread, and a nested <code>block_on</code> there, wait for it and finish on that thread.</li>
+<li>Tasks that <code>spawn_local</code> keeps on the blocked thread, and a nested <code>block_on</code> there, wait for it and finish on that thread. The rest of the blocked poll still runs for its worker (<code>worker_index()</code> answers it, and a <code>spawn</code> with no worker taking tasks goes to that worker's shard), while a <code>blocking_*</code> call or a nested <code>block_on</code> in it runs on the thread's own shard, its bound tasks woken there. A <code>shard_local!</code> value they or the rest of the blocked poll use is lent back to each <code>with</code> by the shard's new thread, between two of its polls. Dropping the runtime waits for that thread once its poll has returned, as for any other; only a thread still blocked in that poll is left to exit on its own.</li>
+<li>On io_uring the kernel completes an operation on the thread that submitted it. The new thread arms again what only waits for readiness (a datagram's poll, a write waiting for room, the shard's wake) and a receive into the ring's buffers, so those go on whatever the blocked thread waits in; an accept, a receive into a task's own buffer, a send, a connect and a file's call it submitted complete once it returns from the kernel, which a wait no signal ends (a slow disk, a <code>vfork</code>) delays.</li>
 <li><a href="api:nuclei::Builder::on_long_poll"><code>on_long_poll</code></a> names the task that blocked (<a href="production.html#hooks">Production</a>), and <code>stats()</code> counts each worker's <code>handoffs</code> and its <code>longest_poll</code>.</li>
-<li>Watching costs each poll two plain stores and a load, and each call a task makes into its worker (a wake, a spawn, a send or a receive) two loads and two stores: on io_uring a 64-byte TCP round trip runs 12% more instructions with it, a spawn and its join 25% more. <code>handoff_after(None)</code> turns it off.</li>
+<li>Watching costs each poll two plain stores and a load, and each call a task makes into its worker (a wake, a spawn, a send or a receive) two loads and two stores: on io_uring a 64-byte TCP round trip runs 10.8% more instructions with it, a spawn and its join 20% more. <code>handoff_after(None)</code> turns it off.</li>
 </ul>
 
 <h2 id="task-local">Task-local values</h2>
@@ -53,5 +54,5 @@
 <!--example tasks_task_local-->
 
 <h2 id="yield">Yielding and the budget</h2>
-<p>Each poll of a task may complete a budget of operations (<a href="api:nuclei::task::coop::BUDGET"><code>coop::BUDGET</code></a>) before it yields, so one busy task cannot hold its shard. IO that completes spends one, and so does a receive, an acquire or a lock of <a href="sync.html#budget"><code>nuclei::sync</code></a> that completes without waiting, so a loop over a channel that is never empty yields too. A loop that awaits nothing else can spend the budget itself with <code>coop::consume_budget()</code>; <code>task::yield_now()</code> gives the other tasks a turn at once, and <code>coop::unconstrained</code> runs a future with no budget.</p>
+<p>Each poll of a task may complete a budget of operations (<a href="api:nuclei::task::coop::BUDGET"><code>coop::BUDGET</code></a>) before it yields, so one busy task cannot hold its shard. IO that completes spends one, and so does a sleep that completes (a loop over sleeps that are already due yields), and so does a receive, an acquire or a lock of <a href="sync.html#budget"><code>nuclei::sync</code></a> that completes in the poll that began it, so a loop over a channel that is never empty yields too. A loop that awaits nothing else can spend the budget itself with <code>coop::consume_budget()</code>; <code>task::yield_now()</code> gives the other tasks a turn at once, and <code>coop::unconstrained</code> runs a future with no budget.</p>
 <!--example tasks_yield-->

@@ -15,3 +15,8 @@ W_spin_mark              Waiter   violated:NoSpinMark
 W_reuse                  Waiter   violated:NoReuse
 W_forgive                Waiter   violated:NoForgive
 W_cancel_take            Waiter   violated:NoCancelTake
+M_free_on_wake_release   Waiter   violated:NoStaleAccess
+WL_walk                  MC_WakeList   pass
+WL_panic                 MC_WakeList   pass
+MWL_no_rest              MC_WakeList   violated:AllWoken
+MWL_link_after_take      MC_WakeList   violated:NoStaleAccess

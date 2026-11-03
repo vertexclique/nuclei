@@ -10,4 +10,11 @@ EXTENDS ReentrantMutex
 TwoDeep == <<<<"L", "L", "U", "L", "U", "U">>, <<"L", "L", "U", "L", "U", "U">>>>
 \* An owner three deep beside one that locks once, twice over.
 DeepShallow == <<<<"L", "L", "L", "U", "U", "U">>, <<"L", "U", "L", "U">>>>
+\* An owner that joins two locks, polled older first, then lets both go, beside one that
+\* locks and unlocks.
+JoinBeside == <<<<"J", "U", "U">>, <<"L", "U">>>>
+\* The same, with the join polling the younger request first.
+JoinYoungFirst == <<<<"JR", "U", "U">>, <<"L", "U">>>>
+\* Two tasks that each lock once and unlock.
+TwoOnce == <<<<"L", "U">>, <<"L", "U">>>>
 =============================================================================

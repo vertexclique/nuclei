@@ -89,7 +89,11 @@ impl UnixAddr {
 
 /// Whether `bytes` holds a zero byte, by the C library's own scan.
 fn has_nul(bytes: &[u8]) -> bool {
-    // SAFETY: reads at most `bytes.len()` bytes of `bytes`.
+    // An empty slice's pointer may dangle, and C wants a valid pointer even for no bytes.
+    if bytes.is_empty() {
+        return false;
+    }
+    // SAFETY: reads at most `bytes.len()` bytes of `bytes`, which lie in one allocation.
     !unsafe { libc::memchr(bytes.as_ptr().cast(), 0, bytes.len()) }.is_null()
 }
 

@@ -11,9 +11,9 @@
 
 use core::task::{RawWakerVTable, Waker};
 
-use super::abort_on_panic;
 use super::raw::TaskVTable;
 use super::state::{AWAITER, NOTIFYING, REFERENCE, REGISTERING, SCHEDULED, TASK};
+use crate::rt::caught::{self, Panic};
 use crate::sync::internal::{AtomicPtr, AtomicUsize, Ordering, UnsafeCell};
 
 /// The type-erased head of a task's memory; the task pointer points at it.
@@ -32,6 +32,8 @@ pub(super) struct Header {
     /// Its place in a shard's inbox, which it is in at most once (see
     /// `rt::inbox`).
     pub(super) link: crate::rt::inbox::Link,
+    /// Its place in its owner's list of live tasks.
+    pub(super) links: super::list::Links,
     /// The thread its memory came from (see `mem`).
     pub(super) owner: crate::mem::Owner,
 }
@@ -53,6 +55,7 @@ impl Header {
             vtable,
             id: super::Id(core::num::NonZeroU64::new(id).unwrap_or(core::num::NonZeroU64::MIN)),
             link: crate::rt::inbox::Link::new(),
+            links: super::list::Links::new(),
             owner,
         }
     }
@@ -60,7 +63,7 @@ impl Header {
     /// Takes the awaiter out and wakes it, unless it would wake `current`.
     pub(super) fn notify(&self, current: Option<&Waker>) {
         if let Some(waker) = self.take(current) {
-            abort_on_panic(|| waker.wake());
+            wake_caught(waker);
         }
     }
 
@@ -80,7 +83,7 @@ impl Header {
             .fetch_and(!NOTIFYING & !AWAITER, Ordering::Release);
         match (waker, current) {
             (Some(waker), Some(current)) if waker.will_wake(current) => {
-                abort_on_panic(|| drop(waker));
+                drop_caught(waker);
                 None
             }
             (waker, _) => waker,
@@ -118,6 +121,9 @@ impl Header {
     /// handled here: the waker is woken at once instead of being left behind.
     #[inline(always)]
     pub(super) fn register(&self, waker: &Waker) {
+        // Cloned before any flag is held: a clone that panics leaves the word
+        // untouched.
+        let new = waker.clone();
         // A stale first look costs the exchange below a retry, no more.
         let mut state = self.state.load(Ordering::Acquire);
         loop {
@@ -127,8 +133,9 @@ impl Header {
                 // wakes this one's task, its wake is this registration's;
                 // otherwise this waker would miss it, so it is woken now and
                 // polls again.
+                drop_caught(new);
                 if state & AWAITER == 0 || !self.stored_wakes_as(waker) {
-                    abort_on_panic(|| waker.wake_by_ref());
+                    wake_by_ref_caught(waker);
                 }
                 return;
             }
@@ -150,7 +157,7 @@ impl Header {
         // and leaves the cell alone.
         let old = self
             .awaiter
-            .with_mut(|cell| unsafe { (*cell).replace(waker.clone()) });
+            .with_mut(|cell| unsafe { (*cell).replace(new) });
         // Published by the exchange below that sets AWAITER.
         self.awaiter_data
             .store(waker.data().cast_mut(), Ordering::Relaxed);
@@ -158,7 +165,6 @@ impl Header {
             core::ptr::from_ref(waker.vtable()).cast_mut(),
             Ordering::Relaxed,
         );
-        abort_on_panic(|| drop(old));
 
         let mut missed = None;
         loop {
@@ -181,8 +187,54 @@ impl Header {
                 Err(actual) => state = actual,
             }
         }
-        if let Some(waker) = missed {
-            abort_on_panic(|| waker.wake());
+        // No flag is held: a user waker that panics here is caught.
+        if let Some(old) = old {
+            drop_caught(old);
+        }
+        if let Some(missed) = missed {
+            wake_caught(missed);
         }
     }
+}
+
+/// Wakes `waker` outside every change of the state word; a panic is logged.
+#[inline(always)]
+pub(super) fn wake_caught(waker: Waker) {
+    if let Some(panic) = caught::catch(|| waker.wake()) {
+        lost_waking(panic);
+    }
+}
+
+/// [`wake_caught`] for a borrowed waker.
+#[inline(always)]
+fn wake_by_ref_caught(waker: &Waker) {
+    if let Some(panic) = caught::catch(|| waker.wake_by_ref()) {
+        lost_waking(panic);
+    }
+}
+
+/// Drops `waker` outside every change of the state word; a panic is logged.
+#[inline(always)]
+fn drop_caught(waker: Waker) {
+    if let Some(panic) = caught::catch(|| drop(waker)) {
+        lost_dropping(panic);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn lost_waking(panic: Panic) {
+    caught::lost(
+        format_args!("a task handle's waker panicked as it was woken"),
+        panic,
+    );
+}
+
+#[cold]
+#[inline(never)]
+fn lost_dropping(panic: Panic) {
+    caught::lost(
+        format_args!("a task handle's waker panicked as it was dropped"),
+        panic,
+    );
 }

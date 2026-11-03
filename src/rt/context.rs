@@ -26,7 +26,12 @@ use super::handoff::home::Home;
 use super::handoff::slot::{Back, Slot};
 use super::runtime::Inner;
 use super::shard::{Limits, Shard, Shared};
-use super::task::Runnable;
+use super::task::{Runnable, ScheduleInfo};
+
+mod lent;
+pub(crate) use lent::{ForgetLost, Unlent, lent_back};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use lent::{lends_a_value, without_shard};
 
 /// The nesting a thread's own shard allows unless its runtime says
 /// otherwise.
@@ -53,6 +58,9 @@ pub(crate) struct Here {
     slot: Cell<*const Slot>,
     /// The epoch of the last poll begun.
     epochs: Cell<u64>,
+    /// The word of the poll a call marked by [`mark_call`] found, which [`unmark_call`] puts
+    /// back.
+    saved: Cell<u64>,
     /// The address of the `Shared` of the shard this thread was detached
     /// from, compared, never followed; 0 for none.
     detached: Cell<usize>,
@@ -71,6 +79,13 @@ pub(crate) struct Here {
     own: Cell<*const Shard>,
     /// The shard this thread lets go of as its runner (`letting_go`), null for none.
     letting_go: Cell<*const Arc<Shared>>,
+    /// The shard this thread was detached from, null for none: kept alive by the frame of
+    /// `run_shard` that ran it (src/rt/workers.rs), which clears it before it lets go. Only
+    /// its `Shared` and its monitor are followed, until a call asks for it back
+    /// ([`lent_back`]).
+    lost: Cell<*const Shard>,
+    /// The shard lent to this thread's call now ([`lent_back`]), null for none.
+    lent: Cell<*const Shard>,
 }
 
 impl Here {
@@ -82,6 +97,7 @@ impl Here {
             depth: Cell::new(0),
             slot: Cell::new(core::ptr::null()),
             epochs: Cell::new(0),
+            saved: Cell::new(0),
             detached: Cell::new(0),
             home: Cell::new(core::ptr::null()),
             task: Cell::new(None),
@@ -89,15 +105,22 @@ impl Here {
             runtime: Cell::new(core::ptr::null()),
             own: Cell::new(core::ptr::null()),
             letting_go: Cell::new(core::ptr::null()),
+            lost: Cell::new(core::ptr::null()),
+            lent: Cell::new(core::ptr::null()),
         }
     }
 
-    /// The thread found its shard taken: it runs no shard from now on.
+    /// The thread found its shard taken: it runs no shard from now on. Until it ends what it
+    /// runs of the shard's (its poll, then its bound tasks), it counts among the shard's live
+    /// tasks, so a stopped worker stays up to lend the shard back to it ([`ForgetLost`]).
     #[cold]
     fn detach(&self) {
         // SAFETY: `current` points at a shard while its `Entered` lives.
         if let Some(shard) = unsafe { self.current.get().as_ref() } {
             self.detached.set(shard.shared_addr());
+            self.lost.set(shard);
+            shard.shared.detached_began();
+            aim_home(self);
         }
         self.current.set(core::ptr::null());
         self.slot.set(core::ptr::null());
@@ -189,7 +212,7 @@ impl Bracket {
                 Some(Self { slot, word })
             }
             (_, Back::Taken) => {
-                here.detach();
+                detach_here();
                 None
             }
         }
@@ -228,7 +251,7 @@ pub(crate) fn current_held() -> Current {
     if out.is_null() {
         return Current {
             shard: here.current.get(),
-            bracket: Cell::new(None),
+            _bracket: None,
         };
     }
     bracketed()
@@ -248,7 +271,7 @@ pub(crate) fn bracketed() -> Current {
         } else {
             core::ptr::null()
         },
-        bracket: Cell::new(bracket),
+        _bracket: bracket,
     }
 }
 
@@ -277,21 +300,135 @@ pub(crate) fn running_inside(here: &Here) -> Option<&Shard> {
 /// What [`unbracketed`] answers where a call into the shard needs a bracket.
 pub(crate) struct Bracketed;
 
+/// The shard this thread runs, if any, for a caller that marks its call itself
+/// ([`mark_call`]) before it touches anything of the shard but its fixed parts.
+#[inline(always)]
+pub(crate) fn running(here: &Here) -> Option<&Shard> {
+    // SAFETY: as in `Current::shard`.
+    unsafe { here.current.get().as_ref() }
+}
+
+/// What [`mark_call`] did.
+pub(crate) enum Marked {
+    /// No mark was needed: the thread is inside its shard, or nobody watches it.
+    Not,
+    /// The call is marked, a bracket that [`unmark_call`] ends.
+    In,
+    /// The shard was taken: the thread is detached from it and runs none.
+    Taken,
+}
+
+/// Marks a call into the shard this thread runs from a task's code on a shard the monitor
+/// watches, as a bracket does, for a caller that keeps the mark with what it settles last (an
+/// IO step's `After`) and ends it there with [`unmark_call`]: no guard is held meanwhile, and a
+/// thread that needs no mark pays one look at a word. Nothing in the call may mark again or
+/// poll (`out` is null meanwhile, as in a bracket). For a caller that found the thread running
+/// its shard ([`running`]), so not detached from it: `out` is then its slot.
+#[inline(always)]
+pub(crate) fn mark_call() -> Marked {
+    let here = local();
+    if here.out.get().is_null() {
+        return Marked::Not;
+    }
+    debug_assert!(core::ptr::eq(here.out.get(), here.slot.get()));
+    // SAFETY: as in `Bracket::take`; the slot is `out`, read again where the path that needs
+    // no mark does not keep it.
+    let slot = unsafe { &*here.slot.get() };
+    match slot.mark() {
+        (word, Back::In) => {
+            here.saved.set(word);
+            here.out.set(core::ptr::null());
+            Marked::In
+        }
+        (_, Back::Taken) => {
+            detach_here();
+            Marked::Taken
+        }
+    }
+}
+
+/// Pushes `runnable` into the empty LIFO slot of the shard this thread runs, when `ours` says
+/// the task is that shard's, from a task's code on a shard the monitor watches (`out` is set),
+/// as a leaf: the call marked with no contest of a claim (`Slot::mark_unless_claimed`), and
+/// nothing of a bracket's but its mark. `Err` gives `runnable` back, the poll's word put back,
+/// when a claim is up or the push is another (the slot holds a task, the task is another
+/// shard's, it woke itself), for the full bracket (proofs/tla/handoff, the leaf push).
+#[inline(always)]
+pub(crate) fn push_lifo_marked<O>(
+    runnable: Runnable,
+    info: ScheduleInfo,
+    ours: O,
+) -> Result<(), Runnable>
+where
+    O: FnOnce(&Shard) -> bool,
+{
+    let here = local();
+    let out = here.out.get();
+    // `out` is the thread's slot, or the one its shard was taken from under a call that has
+    // ended since (`Bracket`'s drop), whose claim stays taken (proofs/tla/handoff, `D_safe`).
+    debug_assert!(core::ptr::eq(out, here.slot.get()) || here.slot.get().is_null());
+    // SAFETY: as in `Bracket::take`.
+    let slot = unsafe { &*out };
+    let Some(word) = slot.mark_unless_claimed() else {
+        return Err(runnable);
+    };
+    debug_assert!(
+        core::ptr::eq(out, here.slot.get()),
+        "the leaf marked a taken slot"
+    );
+    let pushed = match running(here) {
+        Some(current) if ours(current) => {
+            current.push_lifo_alone(runnable, info, here.in_task.get())
+        }
+        _ => Err(runnable),
+    };
+    slot.unmark(word);
+    pushed
+}
+
+/// [`Here::detach`] of this thread, out of line: a caller that reaches it only rarely keeps no
+/// pointer to its `Here` for it (its other looks go to the thread's own storage directly).
+#[cold]
+#[inline(never)]
+fn detach_here() {
+    local().detach();
+}
+
+/// Ends the call [`mark_call`] marked: the poll's word back, outside the shard again.
+#[inline(always)]
+pub(crate) fn unmark_call() {
+    let here = local();
+    let slot = here.slot.get();
+    debug_assert!(here.out.get().is_null(), "a call ended that no mark began");
+    debug_assert!(
+        !slot.is_null(),
+        "a marked call polled: its thread lost the shard in it"
+    );
+    here.out.set(slot);
+    // SAFETY: as in `Bracket::take`; the call ran no poll, so the thread still runs the shard
+    // whose slot this is.
+    unsafe { &*slot }.unmark(here.saved.get());
+}
+
+/// [`unmark_call`] for a marked step that unwinds, unless its settle ended the call already
+/// (a panic in a wake it ran after): the call is still marked while `out` is null on the slot
+/// the thread still runs.
+#[cold]
+#[inline(never)]
+pub(crate) fn unmark_unwound() {
+    let here = local();
+    if here.out.get().is_null() && !here.slot.get().is_null() {
+        unmark_call();
+    }
+}
+
 /// What [`current_held`] found: the shard, while it lives.
 pub(crate) struct Current {
     shard: *const Shard,
-    bracket: Cell<Option<Bracket>>,
+    _bracket: Option<Bracket>,
 }
 
 impl Current {
-    /// Ends the bracket, if one was made, before the result drops: what follows touches the
-    /// shard no more, the one handed out by [`shard`](Self::shard) included, until a call of
-    /// its own brackets again.
-    #[inline(always)]
-    pub(crate) fn end(&self) {
-        drop(self.bracket.take());
-    }
-
     /// The shard this thread is running, if any.
     #[inline(always)]
     pub(crate) fn shard(&self) -> Option<&Shard> {
@@ -316,6 +453,36 @@ pub(crate) fn letting_go<R>(shared: &Arc<Shared>, f: impl FnOnce() -> R) -> R {
     }
     let _restore = Restore(local().letting_go.replace(shared));
     f()
+}
+
+/// Runs `f` with the `Shared` of the shard this thread's poll lost (`Here::lost`), `None` when
+/// it lost none: the shard whose task the rest of the poll still is.
+pub(crate) fn lost_shared<R>(f: impl FnOnce(Option<&Arc<Shared>>) -> R) -> R {
+    // SAFETY: as in `lent_back`: `lost` points at a shard while the frame of `run_shard` that
+    // ran it holds it, and only its `Shared` is followed here.
+    f(unsafe { local().lost.get().as_ref() }.map(|shard| &shard.shared))
+}
+
+/// Whether this thread's poll lost a shard to the monitor.
+pub(crate) fn lost_a_shard() -> bool {
+    !local().lost.get().is_null()
+}
+
+/// Aims the home's target at the own shard once the thread lost a shard and has both: the rest
+/// of a poll the monitor took, and every nested wait in it, runs the thread's bound tasks on
+/// its own shard, so their remote wakes go there from now on, before any loop of the own shard
+/// first looks (proofs/tla/handoff/Detached.tla, `home_not_moved`).
+#[cold]
+#[inline(never)]
+fn aim_home(here: &Here) {
+    if here.lost.get().is_null() {
+        return;
+    }
+    // SAFETY: `HOME` keeps the home alive while `home` points at it, and `OWN` the own shard.
+    let (home, own) = unsafe { (here.home.get().as_ref(), here.own.get().as_ref()) };
+    if let (Some(home), Some(own)) = (home, own) {
+        home.target().move_to(&own.shared);
+    }
 }
 
 /// Runs `f` with the shard this thread lets go of ([`letting_go`]), if any.
@@ -388,6 +555,19 @@ pub(crate) fn own_shard_if_made() -> Option<Rc<Shard>> {
     }
 }
 
+/// Whether this thread runs a worker shard the monitor watches: its polls may
+/// be taken from it, so nothing of the shard may be touched after one.
+#[inline]
+pub(crate) fn watched() -> bool {
+    !local().slot.get().is_null()
+}
+
+/// The address of the `Shared` of the shard this thread was detached from,
+/// compared, never followed; 0 for none.
+pub(crate) fn detached_from_addr() -> usize {
+    local().detached.get()
+}
+
 /// Marks `shard` as the one this thread runs, its own code running, until
 /// the guard drops.
 pub(crate) fn enter(shard: &Shard) -> Entered<'_> {
@@ -450,15 +630,18 @@ pub(crate) enum Polled {
 pub(crate) fn poll<R>(shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
     let here = local();
     if here.slot.get().is_null() {
-        return poll_unwatched(here, shared, poll);
+        return poll_unwatched(here, poll);
     }
     poll_watched(here, shared, poll)
 }
 
 /// [`poll`] on a shard no monitor watches: no slot to go out of and come
-/// back into, and no call from the poll needs a bracket.
+/// back into, and no call from the poll needs a bracket. Such a poll is never
+/// taken: only a watched slot's claim detaches a thread, and a thread runs a
+/// shard it was detached from only once handed it again, with a slot
+/// (`enter_watched`); so it ends `In`, with no look.
 #[inline(always)]
-fn poll_unwatched<R>(here: &Here, shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
+fn poll_unwatched<R>(here: &Here, poll: impl FnOnce() -> R) -> (R, Polled) {
     /// Back into the shard, by return or unwind.
     struct Back<'a>(&'a Here, bool);
     impl Drop for Back<'_> {
@@ -470,7 +653,7 @@ fn poll_unwatched<R>(here: &Here, shared: &Shared, poll: impl FnOnce() -> R) -> 
     let back = Back(here, here.in_task.replace(true));
     let result = poll();
     drop(back);
-    (result, polled(here, shared))
+    (result, Polled::In)
 }
 
 /// [`poll`] on a shard the monitor watches through this thread's slot. A
@@ -516,14 +699,14 @@ fn poll_watched<R>(here: &'static Here, shared: &Shared, poll: impl FnOnce() -> 
 }
 
 /// [`poll`] for a task's run, `run`, which never unwinds: each part of it that runs the task's
-/// own code (its future, its hooks, its drops) catches a panic or aborts on one
-/// (`rt::task::raw`). On a shard the monitor watches, the run then keeps no guard to come back
-/// in by: an unwind there would be the runtime's own bug, and aborts.
+/// own code (its future, its hooks, its drops) catches a panic (`rt::task::raw`), and a waker
+/// that panics in a transition aborts. On a shard the monitor watches, the run then keeps no
+/// guard to come back in by: an unwind there would be the runtime's own bug, and aborts.
 #[inline(always)]
 pub(crate) fn run_task(shared: &Shared, run: impl FnOnce()) -> Polled {
     let here = local();
     if here.slot.get().is_null() {
-        return poll_unwatched(here, shared, run).1;
+        return poll_unwatched(here, run).1;
     }
     run_task_watched(here, run);
     polled(here, shared)
@@ -547,6 +730,15 @@ fn run_task_watched(here: &'static Here, run: impl FnOnce()) {
         here.detach();
     }
     here.in_task.set(in_task);
+}
+
+/// Whether this thread was detached from the shard of `shared`: a poll on it found it taken, and
+/// the shard was not handed back to the thread since (`enter_watched`). For a caller whose loop
+/// on a watched shard ended with its future's output, which the poll that found the take may have
+/// made.
+#[inline]
+pub(crate) fn detached_from(shared: &Shared) -> bool {
+    polled(local(), shared) == Polled::Detached
 }
 
 /// What a poll on the shard of `shared` found as it ended.
@@ -624,13 +816,14 @@ fn make_own_shard() -> io::Result<Rc<Shard>> {
         if let Some(shard) = own.borrow().as_ref() {
             return Ok(Rc::clone(shard));
         }
-        let shard = Rc::new(Shard::new(Limits {
+        let shard = Shard::new_rc(Limits {
             max_nesting: DEFAULT_MAX_NESTING,
             buffer_cap: crate::buf::DEFAULT_CAP,
             backend: super::backend::chosen()?,
-        })?);
+        })?;
         *own.borrow_mut() = Some(Rc::clone(&shard));
         local().own.set(Rc::as_ptr(&shard));
+        aim_home(local());
         Ok(shard)
     })
 }
@@ -681,9 +874,66 @@ pub(crate) fn try_set_runtime(inner: &Arc<Inner>) -> Option<RuntimeSet> {
     Some(RuntimeSet { previous })
 }
 
+/// Makes `inner` the runtime set on this thread and answers the one it replaced, for a caller
+/// that puts that back itself ([`put_runtime`]); `None` once this thread's locals are gone.
+pub(crate) fn swap_runtime(inner: &Arc<Inner>) -> Option<Option<Arc<Inner>>> {
+    RUNTIME
+        .try_with(|r| r.replace(Some(Arc::clone(inner))))
+        .ok()
+}
+
+/// Puts back the runtime [`swap_runtime`] replaced.
+pub(crate) fn put_runtime(previous: Option<Arc<Inner>>) {
+    drop(RuntimeSet { previous });
+}
+
+/// Marks `served` on this thread's own shard, if it is the shard this thread runs now and no
+/// mark is there (`Shard::mark_served`): code of another runtime is about to be current under
+/// its loop. Answers whether it marked, for [`unmark_own`].
+pub(crate) fn mark_own(served: &Arc<Inner>) -> bool {
+    let own = local().own.get();
+    current(|current| {
+        current.is_some_and(|shard| core::ptr::eq(shard, own) && shard.mark_served(served))
+    })
+}
+
+/// Takes back the mark [`mark_own`] set.
+pub(crate) fn unmark_own() {
+    // SAFETY: `Here::own` points at the thread's own shard while `OWN` holds it, and at none
+    // once it goes.
+    if let Some(own) = unsafe { local().own.get().as_ref() } {
+        own.unmark();
+    }
+}
+
+/// The visiting mark of an enter guard ([`mark_own`]), taken back as it drops.
+pub(crate) struct ServedMark(bool);
+
+impl ServedMark {
+    /// Marks `served`, the runtime current before the guard, if [`mark_own`] does.
+    pub(crate) fn new(served: Option<&Arc<Inner>>) -> Self {
+        Self(served.is_some_and(mark_own))
+    }
+}
+
+impl Drop for ServedMark {
+    fn drop(&mut self) {
+        if self.0 {
+            unmark_own();
+        }
+    }
+}
+
 /// Restores the runtime that was set before [`set_runtime`].
 pub(crate) struct RuntimeSet {
     previous: Option<Arc<Inner>>,
+}
+
+impl RuntimeSet {
+    /// The runtime that was set before.
+    pub(crate) fn previous(&self) -> Option<&Arc<Inner>> {
+        self.previous.as_ref()
+    }
 }
 
 impl Drop for RuntimeSet {

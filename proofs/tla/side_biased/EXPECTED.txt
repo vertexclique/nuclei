@@ -39,6 +39,17 @@ M_nudge_lost                   MC_SideBiased        deadlock
 W_unserved                     MC_SideBiased        violated:NoUnserved
 W_fail_shared                  MC_SideBiased        violated:NoFailShared
 W_nudge                        MC_SideBiased        violated:NoNudgePass
+P_claim_stops                  MC_SideBiased        pass
+P_claim_stops_maybe            MC_SideBiased        pass
+P_claim_stops_live             MC_SideBiased        pass
+M_claim_kept                   MC_SideBiased        deadlock
+M_leave_no_look                MC_SideBiased        deadlock
+M_no_recheck_claim             MC_SideBiased        deadlock
+W_given_up                     MC_SideBiased        violated:NoGivenUp
+P_rehome                       MC_SideBiased        pass
+P_rehome_fail                  MC_SideBiased        pass
+P_rehome_fail_live             MC_SideBiased        pass
+M_self_nudge                   MC_SideBiased        violated:Termination
 R_two                          MC_Retire            pass
 R_three                        MC_Retire            pass
 R_live                         MC_Retire            pass
@@ -53,3 +64,9 @@ R_rehome_live                  MC_Retire            pass
 MR_rehome_early_submit         MC_Retire            violated:NoLostUpdate
 MR_rehome_no_fence             MC_Retire            violated:NoLostUpdate
 WR_rehome_waits                MC_Retire            violated:NoRehomeWait
+C_claims                       MC_Claim             pass
+MCL_claim_store                MC_Claim             violated:Exclusive
+MCL_owner_any                  MC_Claim             violated:Exclusive
+MCL_nested_as_owner            MC_Claim             violated:Exclusive
+MCL_home_unchecked             MC_Claim             violated:HomeClaims
+WCL_early_claim                MC_Claim             violated:NoEarlyClaim
