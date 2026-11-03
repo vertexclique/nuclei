@@ -18,8 +18,13 @@
   epoll, and the test then waited for ring operations that never came.
 - `tcp_pair_with_a_closed_window` (a unit test) closes the peer's window on macOS too: the
   listener's receive buffer is not carried to the accepted socket there, and autotuning grew the
-  peer's to about 320 KiB, so it took every byte. The accepted socket's is set, and the setup
-  fails if the peer still holds everything written.
+  peer's to about 320 KiB, so it took every byte. The accepted socket's is set. The setup also
+  waits, with a deadline and backoff, until the bytes the peer takes have landed and some stay
+  unacknowledged, writing more until they do: bytes still in flight on a slow loopback were taken
+  for a closed window, then acknowledged within milliseconds.
+- `tests/time_precise.rs` compares the median precise sleep with the median sleep on the wheel,
+  not their totals: on a loaded host one preemption of the shard lands in one sleep, and it
+  decided the comparison.
 
 ## 0.5.4
 
