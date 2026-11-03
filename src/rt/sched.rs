@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::caught::{self, Panic};
 use super::context::{self, Bracketed};
 use super::handoff::home::Home;
-use super::shard::Shared;
+use super::shard::{IoOp, ListOp, Shared};
 use super::task::list::Links;
 use super::task::{Runnable, Schedule, ScheduleInfo};
 use crate::sync::internal::Ordering;
@@ -117,7 +117,8 @@ unsafe impl<const BOUND: bool> Schedule for Sched<BOUND> {
 
     #[inline(always)]
     fn pending(&self, links: &Links) {
-        if !BOUND && !links.is_listed() {
+        // SAFETY: this is the task's poll, which has posted nothing yet.
+        if !BOUND && !unsafe { links.is_listed_in_poll() } {
             self.list(links);
         }
     }
@@ -127,7 +128,7 @@ unsafe impl<const BOUND: bool> Schedule for Sched<BOUND> {
         if BOUND {
             // SAFETY: a bound task is listed from its spawn until its future is dropped, which
             // happens on its home's thread only.
-            unsafe { links.unlink() };
+            unsafe { links.unlink_home() };
             if let Some(home) = &*self.home {
                 // SAFETY: as above.
                 unsafe { home.task_ended() };
@@ -135,21 +136,18 @@ unsafe impl<const BOUND: bool> Schedule for Sched<BOUND> {
         } else if links.is_listed() {
             self.unlist(links);
         }
-        {
-            // Woken after its shard stopped, a task is dropped on its
-            // waker's thread: what its drop hands on (a dropped handle's
-            // bytes) still goes to its runtime (proofs/tla/going/Linger.tla).
-            // A visitor's goes to the runtime it visits for.
-            let _runtime = match self.kind {
-                Kind::Counted => self.shard.enter_runtime(),
-                Kind::Visitor => self.visited_runtime(),
-                Kind::Uncounted => return drop(),
-            };
-            drop();
+        self.dropped(drop);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drop_future_off(&self, links: &Links, drop: impl FnOnce()) {
+        if BOUND {
+            self.drop_future(links, drop);
+            return;
         }
-        if self.shard.load.fetch_sub(1, Ordering::Release) == 1 {
-            self.shard.last_task_done();
-        }
+        self.unlist_off(links);
+        self.dropped(drop);
     }
 
     #[inline]
@@ -314,20 +312,92 @@ fn queue_home_on(
 }
 
 impl<const BOUND: bool> Sched<BOUND> {
-    /// Puts a task of the shard on its list, at its first poll that returned pending.
+    /// Puts a task of the shard on its list, at its first poll that returned pending: itself
+    /// where this thread still runs the shard (in a bracket, from a poll on a shard the monitor
+    /// watches), else by a post to the shard's owner (proofs/tla/listowner/ListOwner.tla).
     #[cold]
     #[inline(never)]
     fn list(&self, links: &Links) {
-        // SAFETY: a task of the shard is polled only by the shard's runner, its list's owner.
-        unsafe { self.shard.tasks.push(links) }
+        let held = context::current_held();
+        match held.shard() {
+            // SAFETY: this thread runs the shard, held in for the edit: the list's owner.
+            current if self.owns(current) => unsafe { self.shard.tasks.push(links) },
+            _ => {
+                // SAFETY: the task is live: its run holds a reference.
+                self.shard
+                    .post_io(IoOp::List(unsafe { ListOp::list(links) }));
+            }
+        }
     }
 
-    /// Takes a task of the shard off its list as its future is dropped.
+    /// Whether this thread is the shard's list owner: it runs the shard (`current`, as a call
+    /// into it finds it) or lets it go for good as its last holder.
+    fn owns(&self, current: Option<&super::shard::Shard>) -> bool {
+        current.is_some_and(|current| current.is(&self.shard))
+            || context::letting_go_of(|gone| {
+                gone.is_some_and(|gone| Arc::ptr_eq(gone, &self.shard))
+            })
+    }
+
+    /// Takes a task of the shard off its list as its future is dropped: as [`list`](Self::list).
     #[cold]
     #[inline(never)]
     fn unlist(&self, links: &Links) {
-        // SAFETY: a listed task's future is dropped only on its list owner's thread.
-        unsafe { links.unlink() };
+        let held = context::current_held();
+        match held.shard() {
+            current if self.owns(current) => {
+                if links.is_listed() {
+                    // SAFETY: this thread runs the shard, held in for the edit: the list's owner.
+                    unsafe { links.unlink() };
+                }
+            }
+            // SAFETY: the task is live: its future is being dropped.
+            _ => self
+                .shard
+                .post_io(IoOp::List(unsafe { ListOp::unlist(links) })),
+        }
+    }
+
+    /// The unlisting of a task whose runnable is dropped on any thread: the list's owner does as
+    /// [`unlist`](Self::unlist), any other posts it without looking at the task's links, which
+    /// the owner may be changing; the owner unlinks the task only if it is listed.
+    #[cold]
+    #[inline(never)]
+    fn unlist_off(&self, links: &Links) {
+        let owner = {
+            let held = context::current_held();
+            let owner = self.owns(held.shard());
+            if owner && links.is_listed() {
+                // SAFETY: this thread runs the shard, held in for the edit: the list's owner.
+                unsafe { links.unlink() };
+            }
+            owner
+        };
+        if !owner {
+            // SAFETY: the task is live: its runnable is being dropped.
+            self.shard
+                .post_io(IoOp::List(unsafe { ListOp::unlist(links) }));
+        }
+    }
+
+    /// Drops the future and counts the task out.
+    #[inline(always)]
+    fn dropped(&self, drop: impl FnOnce()) {
+        {
+            // Woken after its shard stopped, a task is dropped on its
+            // waker's thread: what its drop hands on (a dropped handle's
+            // bytes) still goes to its runtime (proofs/tla/going/Linger.tla).
+            // A visitor's goes to the runtime it visits for.
+            let _runtime = match self.kind {
+                Kind::Counted => self.shard.enter_runtime(),
+                Kind::Visitor => self.visited_runtime(),
+                Kind::Uncounted => return drop(),
+            };
+            drop();
+        }
+        if self.shard.load.fetch_sub(1, Ordering::Release) == 1 {
+            self.shard.last_task_done();
+        }
     }
 
     /// [`Schedule::schedule`] for a task woken anywhere but on its own

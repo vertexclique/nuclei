@@ -391,6 +391,7 @@ impl Shard {
                 drop(runnable);
                 quiet = false;
             }
+            self.apply_list_ops();
             // SAFETY: this thread is the shard's last holder, the owner of its list, and of its
             // home's when the shard is a thread's own.
             quiet &= unsafe { self.shared.tasks.cancel_all() } == 0;

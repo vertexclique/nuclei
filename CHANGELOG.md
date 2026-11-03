@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **A task's list could be edited by two threads at once after a handoff.** A shard keeps its
+  tasks that returned pending on an intrusive list that only the shard's runner may edit. When the
+  monitor took a shard from a thread blocked in a task's poll, that thread, back from the poll,
+  still put the task on the list or took it off, while the shard's new runner edited the same list.
+  A debug build aborted with "null reference produced" and a release build crashed or lost a
+  task, which showed as a hang (seen in `a_runtime_dropped_after_a_handoff_leaves_no_descriptor_open`).
+  The thread now comes back into the shard for the edit and makes it only if the shard is still its
+  own; if it was taken, it posts the edit, holding a reference to the task, to the shard's mailbox
+  of registration changes, which the owner applies where it applies those and before it walks the
+  list as the shard goes. A posted listing links only a task still open and not listed, and a task's runnable dropped on another thread posts an unlisting without reading the task's links. An edit
+  left in the mailbox as the shard goes cancels the task it would have listed
+  (`proofs/tla/listowner`, `proofs/lean/Nuclei/ListOwner.lean`).
 - **A sleeping shard no longer reads as busy.** `ShardStats::parked` was published only as the
   shard went to sleep and grew only when the sleep ended, so a shard asleep for 30 seconds
   reported 30 seconds of `busy`. The time parked is now one word that says whether the shard is

@@ -73,6 +73,7 @@ mod detached;
 mod ending;
 mod foreign;
 mod going;
+mod list_op;
 pub(crate) mod locals;
 mod made;
 mod order;
@@ -84,6 +85,7 @@ mod spin;
 mod stats;
 mod timers;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
+pub(crate) use list_op::ListOp;
 pub(crate) use run::Worked;
 #[cfg(test)]
 pub(crate) use timers::fire_panic_set;
@@ -203,6 +205,9 @@ pub(crate) enum IoOp {
     Touch(Arc<Source>),
     /// Watch a child's exit for a thread that runs no shard.
     Watch(Arc<crate::process::exit::Exit>),
+    /// An edit of the shard's list of tasks, from a thread that lost the shard in a poll
+    /// (proofs/tla/listowner/ListOwner.tla).
+    List(ListOp),
 }
 
 impl IoOp {
@@ -214,6 +219,7 @@ impl IoOp {
         match self {
             IoOp::Register(source) => source.registration_orphaned(),
             IoOp::Watch(exit) => exit.unwatched(),
+            IoOp::List(op) => op.late(),
             other => drop(other),
         }
     }
@@ -330,6 +336,23 @@ impl Shared {
             return;
         }
         self.unpark();
+    }
+
+    /// How many registration changes and list edits are posted, for a test.
+    #[cfg(test)]
+    pub(crate) fn list_ops_len(&self) -> usize {
+        self.io_ops.len()
+    }
+
+    /// The list edits posted and not applied, taken out for a test.
+    #[cfg(test)]
+    pub(crate) fn take_list_ops(&self) -> Vec<ListOp> {
+        let mut ops = Vec::new();
+        self.io_ops.take_all(|op| match op {
+            IoOp::List(op) => ops.push(op),
+            other => self.io_ops.push(other),
+        });
+        ops
     }
 
     /// Nothing applies the mailbox from now on: what it holds is let go of,
@@ -763,6 +786,23 @@ impl Shard {
         true
     }
 
+    /// A runnable from the shard's inbox, for a test.
+    #[cfg(test)]
+    pub(crate) fn pop_inbox_for_test(&self) -> Option<Runnable> {
+        self.pop_inbox()
+    }
+
+    /// Applies the edits of the shard's list that are posted, and leaves the rest of the mailbox
+    /// to the shard's next `apply_io_ops`: for the walk of the list as the shard stops, which
+    /// must see every edit posted before it.
+    pub(crate) fn apply_list_ops(&self) {
+        self.shared.io_ops.take_all(|op| match op {
+            // SAFETY: this thread runs the shard, the list's owner.
+            IoOp::List(op) => unsafe { op.apply(&self.shared.tasks) },
+            other => self.shared.io_ops.push(other),
+        });
+    }
+
     /// Applies the registration changes other threads asked for.
     fn apply_io_ops(&self) {
         self.shared.io_ops.take_all(|op| {
@@ -782,6 +822,8 @@ impl Shard {
                     drop(gone);
                 }
                 IoOp::Watch(exit) => self.watch(exit),
+                // SAFETY: this thread runs the shard, the list's owner.
+                IoOp::List(op) => unsafe { op.apply(&self.shared.tasks) },
                 #[cfg(ring)]
                 IoOp::RingAttach(token, lease) => {
                     let source = self.sources.borrow().get(token).cloned();

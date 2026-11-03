@@ -51,6 +51,7 @@ use core::task::{RawWaker, Waker};
 
 use self::header::Header;
 pub use self::join::{AbortHandle, FallibleTask, Join, JoinError, Task};
+use crate::sync::internal::Ordering;
 
 /// A task's id: unique among the tasks of the process, never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -103,6 +104,12 @@ pub(crate) unsafe trait Schedule {
     /// on one.
     fn drop_future(&self, _links: &list::Links, drop: impl FnOnce()) {
         drop();
+    }
+
+    /// [`drop_future`](Self::drop_future) for a runnable dropped without running, which may be
+    /// on any thread: one that is not the list's owner decides nothing from `links`.
+    fn drop_future_off(&self, links: &list::Links, drop: impl FnOnce()) {
+        self.drop_future(links, drop);
     }
 
     /// A poll of the task returned pending, the run's reference still held:
@@ -253,6 +260,59 @@ pub(crate) unsafe fn close_listed(links: &list::Links) -> Option<Runnable> {
     closed
         .idle
         .then(|| unsafe { Runnable::from_raw(NonNull::new_unchecked(ptr.cast_mut().cast())) })
+}
+
+/// A reference to a task that was listed or is to be, held in an edit of a list posted to its
+/// owner: the task's memory stays until the owner applies the edit.
+pub(crate) struct TaskRef(Waker);
+
+impl TaskRef {
+    /// A reference to the task whose header holds `links`.
+    ///
+    /// # Safety
+    ///
+    /// `links` is the `links` of a live task's header.
+    pub(crate) unsafe fn new(links: &list::Links) -> Self {
+        let offset = core::mem::offset_of!(Header, links);
+        // SAFETY: the links are the `links` field of a task's header, which is the start of its cell.
+        let ptr = unsafe { core::ptr::from_ref(links).cast::<u8>().sub(offset) };
+        // SAFETY: the task is live; the borrowed waker is never dropped, so it counts no
+        // reference, and its clone counts its own.
+        let borrowed = ManuallyDrop::new(unsafe {
+            Waker::from_raw(RawWaker::new(
+                ptr.cast(),
+                &(*ptr.cast::<Header>()).vtable.waker,
+            ))
+        });
+        Self((*borrowed).clone())
+    }
+
+    fn header(&self) -> &Header {
+        // SAFETY: the waker's data is the task pointer, kept alive by its reference.
+        unsafe { &*self.0.data().cast::<Header>() }
+    }
+
+    /// The task's place in its list.
+    pub(crate) fn links(&self) -> &list::Links {
+        &self.header().links
+    }
+
+    /// Whether the task was neither completed nor closed: its future is live.
+    pub(crate) fn is_open(&self) -> bool {
+        self.header().state.load(Ordering::Acquire) & (state::COMPLETED | state::CLOSED) == 0
+    }
+
+    /// How many references the task has, for a test.
+    #[cfg(test)]
+    pub(crate) fn references(&self) -> usize {
+        self.header().state.load(Ordering::Acquire) / state::REFERENCE
+    }
+
+    /// [`close_listed`] for the task, which needs no list.
+    pub(crate) fn close(&self) -> Option<Runnable> {
+        // SAFETY: the links are the task's, live while this reference is.
+        unsafe { close_listed(self.links()) }
+    }
 }
 
 /// Spawns `future` as a task that `schedule` places when it is woken.

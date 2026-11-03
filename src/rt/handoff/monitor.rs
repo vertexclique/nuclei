@@ -936,4 +936,393 @@ mod tests {
         assert_eq!((stats.handoffs, stats.handoffs_failed), (1, 1));
         drop(gift);
     }
+
+    /// What the list-owner tests run: a future that drops a flag, takes the shard from its own
+    /// poll (`take_at`), and answers `Pending` until `ready_at`; it wakes itself before the take.
+    struct Probe {
+        dropped: Arc<core::sync::atomic::AtomicUsize>,
+        polls: usize,
+        take_at: usize,
+        ready_at: usize,
+        /// From this poll on the future keeps no waker of the task.
+        orphan_at: usize,
+        taker: Box<dyn FnMut()>,
+        /// Keeps a waker of the task, as a future that waits for something does.
+        waker: Option<core::task::Waker>,
+        /// A waker of the task, for the test to wake it from.
+        handed: Arc<std::sync::Mutex<Option<core::task::Waker>>>,
+    }
+
+    impl core::future::Future for Probe {
+        type Output = ();
+
+        fn poll(
+            mut self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
+            self.polls += 1;
+            if self.polls >= self.orphan_at {
+                self.waker = None;
+            } else {
+                self.waker = Some(cx.waker().clone());
+                *self.handed.lock().unwrap() = Some(cx.waker().clone());
+            }
+            if self.polls == self.take_at {
+                (self.taker)();
+            }
+            if self.polls >= self.ready_at {
+                return core::task::Poll::Ready(());
+            }
+            if self.polls < self.take_at {
+                cx.waker().wake_by_ref();
+            }
+            core::task::Poll::Pending
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Spawns a [`Probe`] on `shard` and returns its runnable and drop flag. `gift` receives the
+    /// shard the take hands out.
+    fn probe_task(
+        shard: &Arc<Shard>,
+        monitor: &Arc<Monitor>,
+        slot: &Arc<Slot>,
+        runner: &Runner,
+        gift: &std::rc::Rc<core::cell::Cell<Option<Gift>>>,
+        (take_at, ready_at, orphan_at): (usize, usize, usize),
+    ) -> (
+        crate::rt::task::Runnable,
+        Arc<core::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Option<core::task::Waker>>>,
+    ) {
+        let handed = Arc::new(std::sync::Mutex::new(None));
+        let dropped = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let (monitor, slot, runner, gift) = (
+            Arc::clone(monitor),
+            Arc::clone(slot),
+            runner.clone(),
+            std::rc::Rc::clone(gift),
+        );
+        let probe = Probe {
+            dropped: Arc::clone(&dropped),
+            polls: 0,
+            take_at,
+            ready_at,
+            orphan_at,
+            waker: None,
+            handed: Arc::clone(&handed),
+            taker: Box::new(move || {
+                let word = slot.word();
+                let mut watch = Watch {
+                    runner: runner.clone(),
+                    last: word,
+                    streak: STREAK,
+                    longest: 0,
+                    reported: slot::inside(0),
+                };
+                let place = monitor.places[0].get().unwrap();
+                gift.set(take(&monitor, &Weak::new(), place, 0, &mut watch, word));
+            }),
+        };
+        let sched =
+            crate::rt::sched::Sched::<false>::counted(Arc::clone(&shard.shared), None, None);
+        // SAFETY: the future is polled and dropped on this thread only, and the test outlives it.
+        let (runnable, task) = unsafe { crate::rt::task::spawn_unchecked(probe, sched) };
+        task.detach();
+        (runnable, dropped, handed)
+    }
+
+    /// A monitor with one place whose shard is `shard`, and the runner it watches.
+    fn watching(shard: &Arc<Shard>) -> (Arc<Monitor>, Arc<Slot>, Runner) {
+        let monitor = Arc::new(Monitor::new(Duration::from_millis(10), 1, Vec::new(), None));
+        let slot = monitor.slot();
+        let runner = Runner {
+            slot: Arc::clone(&slot),
+            life: Arc::new(Life::new()),
+        };
+        monitor.started(0, shard, runner.clone());
+        (monitor, slot, runner)
+    }
+
+    /// A task whose first poll that returns pending ran while the shard was taken is not listed
+    /// by the thread that lost the shard: it posts the listing, which holds a reference to the
+    /// task, and the shard's owner lists it. The shard going cancels it
+    /// (proofs/tla/listowner/ListOwner.tla).
+    #[test]
+    fn a_first_pending_after_a_take_is_listed_by_the_owner() {
+        use crate::rt::context;
+        use core::sync::atomic::Ordering::SeqCst;
+        let shard = worker_shard();
+        let (monitor, slot, runner) = watching(&shard);
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let gift = std::rc::Rc::new(core::cell::Cell::new(None));
+        let (runnable, dropped, _) =
+            probe_task(&shard, &monitor, &slot, &runner, &gift, (1, 99, usize::MAX));
+        let polled = context::run_task(&shard.shared, || {
+            runnable.run();
+        });
+        assert_eq!(polled, context::Polled::Detached);
+        let gift = gift.take().expect("the shard was not taken in the poll");
+        // SAFETY: the list is read here and the test thread stands in for its owner.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            0,
+            "the loser listed it"
+        );
+        assert_eq!(shard.shared.list_ops_len(), 1, "no listing was posted");
+        gift.shard.0.apply_list_ops();
+        assert_eq!(shard.shared.list_ops_len(), 0);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            1,
+            "the owner did not list it"
+        );
+        assert_eq!(dropped.load(SeqCst), 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { shard.shared.tasks.cancel_all() }, 1);
+        assert!(dropped.load(SeqCst) > 0, "the walk left the task live");
+        assert_eq!(shard.shared.load.load(SeqCst), 0);
+    }
+
+    /// A listed task whose later poll returns ready while the shard is taken is not unlisted by
+    /// the thread that lost the shard: the unlisting is posted with a reference that keeps the
+    /// task's memory, and the owner takes it off the list.
+    #[test]
+    fn a_ready_of_a_listed_task_after_a_take_is_unlisted_by_the_owner() {
+        use crate::rt::context;
+        use core::sync::atomic::Ordering::SeqCst;
+        let shard = worker_shard();
+        let (monitor, slot, runner) = watching(&shard);
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let gift = std::rc::Rc::new(core::cell::Cell::new(None));
+        let (runnable, dropped, _) =
+            probe_task(&shard, &monitor, &slot, &runner, &gift, (2, 2, usize::MAX));
+        let polled = context::run_task(&shard.shared, || {
+            runnable.run();
+        });
+        assert_eq!(polled, context::Polled::In);
+        // SAFETY: the list is read here and the test thread stands in for its owner.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            1,
+            "the first pending was not listed"
+        );
+        assert_eq!(shard.shared.list_ops_len(), 0);
+        let _ = shard.turn(1, Some(Duration::ZERO));
+        assert!(gift.take().is_some(), "the shard was not taken in the poll");
+        assert!(dropped.load(SeqCst) > 0, "the ready left the future live");
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            1,
+            "the loser unlisted it"
+        );
+        let ops = shard.shared.take_list_ops();
+        assert_eq!(ops.len(), 1, "no unlisting was posted");
+        assert_eq!(ops[0].task().references(), 1, "the post holds no reference");
+        for op in ops {
+            // SAFETY: as above.
+            unsafe { op.apply(&shard.shared.tasks) };
+        }
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            0,
+            "the owner did not unlist it"
+        );
+    }
+
+    /// A listing posted after the shard's list was walked for the last time cancels the task at
+    /// once, whether it was queued before the list closed or reaches the closed list.
+    #[test]
+    fn a_listing_posted_after_the_walk_cancels_the_task() {
+        use crate::rt::context;
+        use core::sync::atomic::Ordering::SeqCst;
+        let shard = worker_shard();
+        let (monitor, slot, runner) = watching(&shard);
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let gift = std::rc::Rc::new(core::cell::Cell::new(None));
+        let (queued, queued_dropped, _) =
+            probe_task(&shard, &monitor, &slot, &runner, &gift, (1, 99, usize::MAX));
+        context::run_task(&shard.shared, || {
+            queued.run();
+        });
+        let first = gift.take().expect("the shard was not taken in the poll");
+        assert_eq!(queued_dropped.load(SeqCst), 0);
+        // SAFETY: the test thread stands in for the list's owner.
+        unsafe {
+            assert_eq!(shard.shared.tasks.cancel_all(), 0);
+            shard.shared.tasks.forget_all();
+        }
+        shard.shared.close_io();
+        assert!(
+            queued_dropped.load(SeqCst) > 0,
+            "the late listing left the task live"
+        );
+        assert_eq!(shard.shared.load.load(SeqCst), 0);
+        drop(first);
+        // The shard was handed back to this thread by the take's gift being dropped; a poll that
+        // takes it again reaches the closed list.
+        let again = std::rc::Rc::new(core::cell::Cell::new(None));
+        let (late, late_dropped, _) = probe_task(
+            &shard,
+            &monitor,
+            &slot,
+            &runner,
+            &again,
+            (1, 99, usize::MAX),
+        );
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        slot.go_out(0);
+        context::run_task(&shard.shared, || {
+            late.run();
+        });
+        assert!(
+            again.take().is_some(),
+            "the shard was not taken in the poll"
+        );
+        assert!(
+            late_dropped.load(SeqCst) > 0,
+            "the closed list kept the task live"
+        );
+        assert_eq!(shard.shared.load.load(SeqCst), 0);
+    }
+
+    /// A runnable dropped on a thread that is not the list's owner while a listing of its task is
+    /// posted and not applied: that thread decides nothing from the task's links, which the
+    /// owner may be changing, it posts an unlisting; the owner applies both, leaves the task
+    /// unlisted, and the task's memory stays until the last edit is let go of.
+    #[test]
+    fn a_runnable_dropped_off_the_owner_posts_an_unlisting() {
+        use crate::rt::context;
+        use core::sync::atomic::Ordering::SeqCst;
+        let shard = worker_shard();
+        let (monitor, slot, runner) = watching(&shard);
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let gift = std::rc::Rc::new(core::cell::Cell::new(None));
+        let (runnable, dropped, handed) =
+            probe_task(&shard, &monitor, &slot, &runner, &gift, (1, 99, usize::MAX));
+        context::run_task(&shard.shared, || {
+            runnable.run();
+        });
+        assert!(gift.take().is_some(), "the shard was not taken in the poll");
+        assert_eq!(shard.shared.list_ops_len(), 1, "no listing was posted");
+        // The idle task is woken: its runnable reaches the shard's inbox, where the cancel finds it.
+        handed.lock().unwrap().take().expect("no waker").wake();
+        let woken = shard
+            .pop_inbox_for_test()
+            .expect("the wake left no runnable");
+        /// A runnable handed to the thread that drops it.
+        struct Handed(crate::rt::task::Runnable);
+        // SAFETY: the task is `Send`; the runnable is dropped on the other thread only.
+        unsafe impl Send for Handed {}
+        let handed_over = Handed(woken);
+        std::thread::spawn(move || {
+            let Handed(runnable) = handed_over;
+            drop(runnable);
+        })
+        .join()
+        .unwrap();
+        assert!(dropped.load(SeqCst) > 0, "the cancel left the future live");
+        // SAFETY: the test thread stands in for the list's owner.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            0,
+            "the dropping thread listed it"
+        );
+        let ops = shard.shared.take_list_ops();
+        assert_eq!(ops.len(), 2, "no unlisting was posted");
+        assert_eq!(ops[0].task().references(), 2, "the posts hold no reference");
+        let mut ops = ops.into_iter();
+        let (first, second) = (ops.next().unwrap(), ops.next().unwrap());
+        // SAFETY: as above.
+        unsafe { first.apply(&shard.shared.tasks) };
+        assert_eq!(
+            second.task().references(),
+            1,
+            "the memory went before the last edit"
+        );
+        assert!(
+            !second.task().links().is_listed(),
+            "the closed task was listed"
+        );
+        // SAFETY: as above.
+        unsafe { second.apply(&shard.shared.tasks) };
+        // SAFETY: as above.
+        assert_eq!(unsafe { shard.shared.tasks.len() }, 0);
+        assert_eq!(shard.shared.load.load(SeqCst), 0);
+    }
+
+    /// A listed task whose poll, run on a thread that lost the shard, drops the task's last waker
+    /// and returns pending, with no handle: the run's reference is the last, so the task ends
+    /// there. The unlisting that ends posts takes a reference, which keeps the task; the
+    /// future is dropped once, and the task is freed once, when the owner lets the edit go.
+    #[test]
+    fn a_task_ended_by_a_run_that_lost_the_shard_outlives_its_posted_unlisting() {
+        use crate::rt::context;
+        use core::sync::atomic::Ordering::SeqCst;
+        let shard = worker_shard();
+        let (monitor, slot, runner) = watching(&shard);
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let gift = std::rc::Rc::new(core::cell::Cell::new(None));
+        // The first poll lists the task, which wakes itself; the second drops its last waker.
+        let (runnable, dropped, handed) =
+            probe_task(&shard, &monitor, &slot, &runner, &gift, (2, 99, 2));
+        let holders = Arc::strong_count(&shard.shared);
+        context::run_task(&shard.shared, || {
+            runnable.run();
+        });
+        // SAFETY: the list is read here and the test thread stands in for its owner.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            1,
+            "the first pending was not listed"
+        );
+        drop(handed.lock().unwrap().take());
+        let _ = shard.turn(1, Some(Duration::ZERO));
+        assert!(gift.take().is_some(), "the shard was not taken in the poll");
+        assert_eq!(dropped.load(SeqCst), 1, "the future was not dropped once");
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            1,
+            "the loser unlisted it"
+        );
+        let ops = shard.shared.take_list_ops();
+        assert_eq!(ops.len(), 1, "no unlisting was posted");
+        assert_eq!(
+            ops[0].task().references(),
+            1,
+            "the task was freed under the post"
+        );
+        assert_eq!(
+            Arc::strong_count(&shard.shared),
+            holders,
+            "the task went early"
+        );
+        for op in ops {
+            // SAFETY: as above.
+            unsafe { op.apply(&shard.shared.tasks) };
+        }
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { shard.shared.tasks.len() },
+            0,
+            "the owner did not unlist it"
+        );
+        assert_eq!(dropped.load(SeqCst), 1, "the future was dropped again");
+        assert_eq!(
+            Arc::strong_count(&shard.shared),
+            holders - 1,
+            "the task was not freed once"
+        );
+        assert_eq!(shard.shared.load.load(SeqCst), 0);
+    }
 }

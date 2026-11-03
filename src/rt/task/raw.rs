@@ -255,8 +255,32 @@ where
             let new = header.state.fetch_sub(REFERENCE, Ordering::AcqRel) - REFERENCE;
             if new & !FLAGS == 0 && new & TASK == 0 {
                 if new & (COMPLETED | CLOSED) == 0 {
-                    Self::drop_unawaited(ptr);
+                    Self::end_unawaited(ptr);
+                } else {
+                    Self::destroy(ptr);
                 }
+            }
+        }
+    }
+
+    /// Ends an open task whose last reference was just dropped, with no handle: closed, with a
+    /// reference of its own while its future is dropped, so one a list edit posted in the drop
+    /// takes keeps the task (its last drop finds it closed and frees it), and the future is not
+    /// dropped twice. The task is freed here only if that reference is the last.
+    ///
+    /// # Safety
+    ///
+    /// The task is open with no reference left and no handle: nothing else touches it.
+    #[cold]
+    #[inline(never)]
+    unsafe fn end_unawaited(ptr: *const ()) {
+        // SAFETY: the caller's contract; the reference added here keeps the task meanwhile.
+        unsafe {
+            let header = &Self::cell(ptr).header;
+            header.state.fetch_add(REFERENCE + CLOSED, Ordering::AcqRel);
+            Self::drop_unawaited(ptr);
+            let new = header.state.fetch_sub(REFERENCE, Ordering::AcqRel) - REFERENCE;
+            if new & !FLAGS == 0 && new & TASK == 0 {
                 Self::destroy(ptr);
             }
         }
@@ -309,24 +333,55 @@ where
     #[inline(always)]
     unsafe fn drop_future_here(ptr: *const ()) -> Option<Panic> {
         // SAFETY: the caller owns the live future.
+        unsafe { Self::drop_future_in::<false>(ptr) }
+    }
+
+    /// [`drop_future_here`](Self::drop_future_here), through the schedule's way for a thread that
+    /// may not own the task's list when `OFF`.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the live future.
+    #[inline(always)]
+    unsafe fn drop_future_in<const OFF: bool>(ptr: *const ()) -> Option<Panic> {
+        // SAFETY: the caller owns the live future.
         unsafe {
             let cell = Self::cell(ptr);
             let mut dropped = None;
-            cell.schedule.drop_future(
-                &cell.header.links,
-                #[inline(always)]
-                || {
-                    dropped = caught::catch(|| {
-                        cell.core
-                            .with_mut(|core| ManuallyDrop::drop(&mut (*core).future))
-                    });
-                },
-            );
+            macro_rules! dropping {
+                () => {
+                    #[inline(always)]
+                    || {
+                        dropped = caught::catch(|| {
+                            cell.core
+                                .with_mut(|core| ManuallyDrop::drop(&mut (*core).future))
+                        });
+                    }
+                };
+            }
+            if OFF {
+                cell.schedule
+                    .drop_future_off(&cell.header.links, dropping!());
+            } else {
+                cell.schedule.drop_future(&cell.header.links, dropping!());
+            }
             if dropped.is_none() && !cell.schedule.has_hooks() {
                 return None;
             }
             ended_with(&cell.schedule, cell.header.id, dropped)
         }
+    }
+
+    /// [`drop_future`](Self::drop_future) for a runnable dropped on any thread.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the live future.
+    #[cold]
+    #[inline(never)]
+    unsafe fn drop_future_off(ptr: *const ()) -> Option<Panic> {
+        // SAFETY: the caller's contract.
+        unsafe { Self::drop_future_in::<true>(ptr) }
     }
 
     /// The exchange that ends a cancel once the future is gone: clears
@@ -426,7 +481,7 @@ where
             }
             // A runnable exists only for a task that has not completed, so
             // its future is there, and the runnable owns it now.
-            let panic = Self::drop_future(ptr);
+            let panic = Self::drop_future_off(ptr);
             let state = Self::settle(ptr, SCHEDULED, panic);
             if state & AWAITER != 0 {
                 header.notify(None);
@@ -627,8 +682,7 @@ where
                                 // The last reference, with no handle: nothing can
                                 // wake or await the task again.
                                 if new & !FLAGS == 0 && new & TASK == 0 {
-                                    Self::drop_unawaited(ptr);
-                                    Self::destroy(ptr);
+                                    Self::end_unawaited(ptr);
                                 }
                                 return false;
                             }

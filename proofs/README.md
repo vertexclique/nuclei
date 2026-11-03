@@ -578,7 +578,7 @@ worker and the pool's file jobs.
 whose stores wait in a store buffer, as x86's do: each thread's buffer in order, the flush of
 its oldest store at any time, and each store, load, fence and swap of the pair. A store passed by
 a later load of another word is the one reordering of the pair a weaker ordering lets through.
-7 configurations: 2 that must pass (every access sequentially consistent, a store that waits for
+8 configurations: 2 that must pass (every access sequentially consistent, a store that waits for
 its buffer and a push that is a locked read-modify-write; relaxed accesses with a sequentially
 consistent fence on both sides), each with two wakers notifying once (`OneNotify`) and no wake
 lost (`AllEnd`); 3 mutations that lose a wake (relaxed with no fence, as the measurement's
@@ -3569,6 +3569,32 @@ second stop, and the publish after the lock is let go, each breaking `DropReturn
 look at the close left out, the monitor's look left out, and the late monitor left untaken, each
 breaking `StartedJoined`), and 2 witnesses (a publish between the stop and the take; a start that
 finds the list closed).
+
+## Who edits a shard's list of tasks
+
+`listowner` (`tla/listowner/ListOwner.tla`, `lean/Nuclei/ListOwner.lean`) checks who may edit a
+shard's intrusive list of tasks when the monitor takes the shard from a thread that is in a task's
+poll (`Sched::list` and `Sched::unlist` in `src/rt/sched.rs`; `run_task_watched` in
+`src/rt/context.rs`; `TaskList` in `src/rt/task/list.rs`; `ListOp` in `src/rt/shard/list_op.rs`;
+`IoOp::List`, `IoOp::gone` and `Shard::apply_list_ops` in `src/rt/shard.rs`; `Shard::end_tasks`
+and `Shard::go`). The list has no atomics, so only the shard's runner may edit it. The thread in
+the poll comes back into the shard (a bracket) for its edit: if the shard is still its own it edits
+the list itself, and if the shard was taken it posts the edit, with a reference to the task, to
+the shard's existing mailbox of registration changes, which the owner applies where it applies
+those and before it walks the list as the shard goes. A posted listing links only a task that is
+open and not listed (a task the owner polled to its end meanwhile is not linked), and a posted
+unlisting unlinks only a listed task. An edit still in the mailbox as the shard goes, or posted
+after it, is let go of with the rest of the mailbox, and a listing then cancels its task at once.
+A task's runnable dropped on a thread that is not the owner decides nothing from the task's links: it posts an unlisting unconditionally (the model's `M_foreign_reads` configuration, which posts only after seeing the task listed, breaks `NoDeadListed`), and the links' writes and the reads of other threads are relaxed atomics. Before, the thread edited the list from inside a window in which the new owner edited it too: two
+threads wrote the same links, which showed as a null link in a debug build and as a crash or a
+task lost for good in a release build. 7 configurations: 2 that must pass (a first pending and a
+ready of a listed task, each with the take at any moment: `OwnerOnly`, `NoUseAfterFree`,
+`NoDangling`, `NoDoubleLink`, `NoDeadListed`, `NoneLost`) and 6 mutations (the edit made anyway, breaking
+`OwnerOnly`; the edit dropped, breaking `NoneLost`; the post without a reference to the task,
+breaking `NoDangling`; a posted listing of a task that is listed already, breaking `NoDoubleLink`;
+a posted listing of a task that ended, breaking `NoDangling`; an unlisting posted only if the task looked listed, breaking `NoDeadListed`). `lean/Nuclei/ListOwner.lean` proves
+that edits of different tasks commute, so an edit posted and applied after the owner's edits of
+other tasks leaves the list as making it at once would have.
 
 ## The runtime a nested `block_on` runs its tasks under
 

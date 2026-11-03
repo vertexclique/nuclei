@@ -22,6 +22,7 @@ impl Shard {
                 drop(runnable);
                 dropped += 1;
             }
+            self.apply_list_ops();
             // SAFETY: this thread runs the shard, the list's owner.
             dropped += unsafe { self.shared.tasks.cancel_all() };
             if dropped == 0 {

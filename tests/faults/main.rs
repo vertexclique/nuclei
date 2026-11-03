@@ -11,6 +11,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 mod cancel;
+mod contention;
 mod datagram;
 mod datagram_quick;
 mod drops;

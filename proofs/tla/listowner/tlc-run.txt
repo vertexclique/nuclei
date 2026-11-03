@@ -1,0 +1,15 @@
+TLC run of every configuration in proofs/tla/listowner, 2026-11-03 21:33 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 2, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_first_poll                       217         92      1  pass                                  pass                                  yes
+L_listed                           103         55      1  pass                                  pass                                  yes
+M_edit_anyway                       14         12      0  violated:OwnerOnly                    violated:OwnerOnly                    yes
+M_drop_edit                         52         37      1  violated:NoneLost                     violated:NoneLost                     yes
+M_no_ref                            16         13      1  violated:NoDangling                   violated:NoDangling                   yes
+M_no_skip_listed                    45         33      1  violated:NoDoubleLink                 violated:NoDoubleLink                 yes
+M_no_skip_ended                     49         36      1  violated:NoDangling                   violated:NoDangling                   yes
+M_foreign_reads                    102         64      1  violated:NoDeadListed                 violated:NoDeadListed                 yes
+
+results matching EXPECTED.txt: 8 of 8
