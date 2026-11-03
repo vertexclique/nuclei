@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.5
+
+### Fixed
+
+- **A sleeping shard no longer reads as busy.** `ShardStats::parked` was published only as the
+  shard went to sleep and grew only when the sleep ended, so a shard asleep for 30 seconds
+  reported 30 seconds of `busy`. The time parked is now one word that says whether the shard is
+  parked and since when, which a reader turns into the time parked with its own clock: `parked`
+  includes the park in progress and `busy` is the age less that. A shard driven by hand with
+  `the manual turn` now counts the parks of its turns too, which it never did
+  (`proofs/tla/busy`, `proofs/lean/Nuclei/Busy.lean`).
+- A shard whose io_uring ring could not be made (out of memory, or unsupported) and that runs
+  epoll instead now says so with a warning, once per shard.
+- `tests/cq_overflow.rs` takes whether the server has a ring from the server shard's own backend,
+  not the process's: under load a worker's ring can fail to be made and the shard falls back to
+  epoll, and the test then waited for ring operations that never came.
+- `tcp_pair_with_a_closed_window` (a unit test) closes the peer's window on macOS too: the
+  listener's receive buffer is not carried to the accepted socket there, and autotuning grew the
+  peer's to about 320 KiB, so it took every byte. The accepted socket's is set, and the setup
+  fails if the peer still holds everything written.
+
 ## 0.5.4
 
 ### Fixed
