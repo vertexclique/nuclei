@@ -3768,10 +3768,13 @@ waking to say so. The model has the shard park and wake while a reader reads at 
 checks that every read is within the truth: `NeverBelow` (a read counts at least the parked time the
 shard had when it loaded the word: a sleeping shard is never read as busy) and `NeverAboveGap`
 (it counts at most that plus the time between its load and its clock read: a busy shard is never
-read as asleep). 3 configurations: 1 that must pass (`B_safe`); and 2 mutations, each of which
-must break a property: a park that does not store the word (the code of 0.5.4), so the sleeping
-shard reads as busy, breaks `NeverBelow`; a wake that does not store the word, so the running
-time after it counts as parked, breaks `NeverAboveGap`. `lean/Nuclei/Busy.lean` proves for every
+read as asleep). The shard also publishes its counts inside the park, on its way into the kernel
+(`Counters::publish`), and that publish leaves a parked word as it is. 4 configurations: 1 that
+must pass (`B_safe`); and 3 mutations, each of which must break a property: a park that does not
+store the word (the code of 0.5.4), so the sleeping shard reads as busy, breaks `NeverBelow`; a
+wake that does not store the word, so the running time after it counts as parked, breaks
+`NeverAboveGap`; a publish inside the park that stores the total over the parked word breaks
+`NeverBelow` again. `lean/Nuclei/Busy.lean` proves for every
 clock reading that a running word decodes to its total (`decode_ran`), that a parked word decodes
 to the time parked before plus the park so far (`decode_parks`), that no decoded value passes the
 reader's clock (`decode_parks_le`), and that a wake continues from the same total

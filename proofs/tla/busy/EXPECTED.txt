@@ -1,0 +1,5 @@
+# configuration                spec                 expected
+B_safe                         MC_Busy              pass
+M_no_store_begin               MC_Busy              violated:NeverBelow
+M_no_store_end                 MC_Busy              violated:NeverAboveGap
+M_publish_overwrites           MC_Busy              violated:NeverBelow
