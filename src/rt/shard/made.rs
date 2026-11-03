@@ -185,7 +185,7 @@ impl Shard {
             last_drive: Cell::new(Quartz::now()),
             polls: Cell::new(0),
             sleeps: Cell::new(0),
-            slept: Cell::new(core::time::Duration::ZERO),
+            slept: Cell::new(0),
             remote_wakes: Cell::new(0),
             looks: Cell::new(0),
             spin: Spin::new(),

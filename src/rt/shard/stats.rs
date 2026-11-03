@@ -4,10 +4,6 @@
 use super::{Driver, Shard};
 use crate::rt::counters::Published;
 
-fn nanos(length: std::time::Duration) -> u64 {
-    u64::try_from(length.as_nanos()).unwrap_or(u64::MAX)
-}
-
 impl Driver {
     /// The kernel interface the driver runs IO on.
     pub(super) fn backend(&self) -> crate::IoBackend {
@@ -47,28 +43,29 @@ impl Shard {
         }
     }
 
-    /// Counts a sleep of `slept` for `stats` and, unless a blocking job was out
-    /// (`tells_the_spin` false), tells the spin how long it was.
-    pub(super) fn slept_for(&self, slept: std::time::Duration, tells_the_spin: bool) {
+    /// Counts a sleep of `slept` nanoseconds for `stats` and, unless a blocking
+    /// job was out (`tells_the_spin` false), tells the spin how long it was.
+    #[inline]
+    pub(super) fn slept_for(&self, slept: u64, tells_the_spin: bool) {
         self.sleeps.set(self.sleeps.get() + 1);
-        self.slept.set(self.slept.get() + slept);
+        self.slept.set(self.slept.get().saturating_add(slept));
         if tells_the_spin {
             self.spin.parked_for(slept);
         }
     }
 
-    /// The shard parks, from `slept` on: `stats` counts the park as it goes.
-    pub(super) fn park_began(&self, slept: std::time::Instant) {
+    /// The shard parks, from `slept` on (a `system_nanos` reading): `stats`
+    /// counts the park as it goes.
+    #[inline]
+    pub(super) fn park_began(&self, slept: u64) {
         let counters = &self.shared.counters;
-        counters.park_began(
-            nanos(slept.duration_since(counters.born())),
-            nanos(self.slept.get()),
-        );
+        counters.park_began(slept.saturating_sub(counters.born()), self.slept.get());
     }
 
     /// The shard woke, its park counted by `slept_for`.
+    #[inline]
     pub(super) fn park_ended(&self) {
-        self.shared.counters.park_ended(nanos(self.slept.get()));
+        self.shared.counters.park_ended(self.slept.get());
     }
 
     /// Publishes the polls, the sleeps, the queue, the remote wakes, the

@@ -33,9 +33,9 @@ fn a_blocking_job_out_is_not_work_that_comes_soon() {
 fn a_short_park_a_blocking_job_ended_leaves_the_spin_cold() {
     let jobs = Arc::new(AtomicUsize::new(0));
     let shard = worker_with_pool(&jobs);
-    shard.slept_for(Duration::from_micros(3), false);
+    shard.slept_for(3_000, false);
     assert!(!shard.spin.is_hot());
-    shard.slept_for(Duration::from_micros(3), true);
+    shard.slept_for(3_000, true);
     assert!(shard.spin.is_hot());
 }
 

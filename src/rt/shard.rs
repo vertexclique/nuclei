@@ -639,7 +639,7 @@ pub(crate) struct Shard {
     polls: Cell<u64>,
     /// Sleeps with nothing to run, and their time in all, for `stats`.
     sleeps: Cell<u64>,
-    slept: Cell<Duration>,
+    slept: Cell<u64>,
     remote_wakes: Cell<u64>,
     /// Looks at the driver from the run loop.
     looks: Cell<u32>,

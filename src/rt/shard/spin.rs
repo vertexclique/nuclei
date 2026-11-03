@@ -10,7 +10,7 @@ const SPIN_START: u32 = 4_000;
 /// The spin a shard whose park was cut short starts again with.
 const SPIN_RESTART: u32 = 1_000;
 /// A park that ended this soon would have been caught by a spin.
-const SHORT_PARK: Duration = Duration::from_micros(50);
+const SHORT_PARK: u64 = 50_000;
 /// The longest gap between two looks of a spin, in pauses: each look reads
 /// lines the waker writes, so looking seldom leaves it to run at full speed.
 const SPIN_GAP_MAX: u32 = 64;
@@ -113,9 +113,9 @@ impl Spin {
         self.hot.get()
     }
 
-    /// The shard slept for `slept`: a short sleep means work came right
-    /// after the spin gave up.
-    pub(super) fn parked_for(&self, slept: Duration) {
+    /// The shard slept for `slept` nanoseconds: a short sleep means work came
+    /// right after the spin gave up.
+    pub(super) fn parked_for(&self, slept: u64) {
         if slept < SHORT_PARK {
             self.hot.set(true);
             self.budget.set(self.budget.get().max(SPIN_RESTART));
@@ -169,7 +169,7 @@ mod tests {
         );
         assert_eq!(looks, 0, "it never looked");
         assert_eq!(spin.budget.get(), SPIN_START);
-        spin.parked_for(Duration::from_micros(3));
+        spin.parked_for(3_000);
         assert!(spin.hot.get(), "a short park: work comes soon after one");
         assert_eq!(
             spin.run(|| false, || true),
@@ -200,13 +200,13 @@ mod tests {
         for _ in 0..20 {
             spin.run(|| true, || false);
         }
-        spin.parked_for(Duration::from_millis(5));
+        spin.parked_for(5_000_000);
         assert_eq!(
             spin.budget.get(),
             0,
             "a long sleep: spinning would not have helped"
         );
-        spin.parked_for(Duration::from_micros(3));
+        spin.parked_for(3_000);
         assert_eq!(spin.budget.get(), SPIN_RESTART);
     }
 }

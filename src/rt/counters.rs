@@ -112,7 +112,7 @@ pub(crate) struct Counters {
     parked: AtomicU64,
     queue_depth: AtomicUsize,
     /// When the shard was made: its busy time is its age less its parks.
-    born: std::time::Instant,
+    born: u64,
     remote_wakes: AtomicU64,
     timers: AtomicUsize,
     buffer_bytes: AtomicUsize,
@@ -147,11 +147,6 @@ pub(crate) struct Counters {
     errors: Errors,
 }
 
-/// A duration in nanoseconds, saturating.
-fn nanos(length: std::time::Duration) -> u64 {
-    u64::try_from(length.as_nanos()).unwrap_or(u64::MAX)
-}
-
 /// The top bit of a [`Parked`] word: the shard is parked.
 const PARKED_FLAG: u64 = 1 << 63;
 
@@ -173,6 +168,7 @@ pub(crate) enum Parked {
 
 impl Parked {
     /// The word for `self`.
+    #[inline]
     pub(crate) fn encode(self) -> u64 {
         match self {
             Self::Total(total) => total.min(!PARKED_FLAG),
@@ -197,7 +193,7 @@ impl Parked {
 pub(crate) struct Published {
     pub(crate) polls: u64,
     pub(crate) parks: u64,
-    pub(crate) parked: std::time::Duration,
+    pub(crate) parked: u64,
     pub(crate) queue_depth: usize,
     pub(crate) remote_wakes: u64,
     pub(crate) timers: usize,
@@ -216,7 +212,7 @@ impl Counters {
             parks: AtomicU64::new(0),
             parked: AtomicU64::new(0),
             queue_depth: AtomicUsize::new(0),
-            born: std::time::Instant::now(),
+            born: crate::time::clock::system_nanos(),
             remote_wakes: AtomicU64::new(0),
             timers: AtomicUsize::new(0),
             buffer_bytes: AtomicUsize::new(0),
@@ -246,7 +242,8 @@ impl Counters {
         self.parks.store(now.parks, Ordering::Relaxed);
         // The park's own drive publishes after `park_began`: that word already says the same.
         if self.parked.load(Ordering::Relaxed) & PARKED_FLAG == 0 {
-            self.park_ended(nanos(now.parked));
+            self.parked
+                .store(now.parked.min(!PARKED_FLAG), Ordering::Relaxed);
         }
         self.queue_depth.store(now.queue_depth, Ordering::Relaxed);
         self.remote_wakes.store(now.remote_wakes, Ordering::Relaxed);
@@ -319,13 +316,15 @@ impl Counters {
     }
 
     /// When the shard was made, the zero of the times `park_began` takes.
-    pub(crate) fn born(&self) -> std::time::Instant {
+    #[inline]
+    pub(crate) fn born(&self) -> u64 {
         self.born
     }
 
     /// The shard parks, `began_nanos` after it was made, having parked `parked_before_nanos` in
     /// all before: `stats` counts the park in progress (proofs/tla/busy/Busy.tla). Its own
     /// thread only.
+    #[inline]
     pub(crate) fn park_began(&self, began_nanos: u64, parked_before_nanos: u64) {
         let word = Parked::Since {
             began: began_nanos,
@@ -335,6 +334,7 @@ impl Counters {
     }
 
     /// The shard woke, having parked `parked_total_nanos` in all. Its own thread only.
+    #[inline]
     pub(crate) fn park_ended(&self, parked_total_nanos: u64) {
         let word = Parked::Total(parked_total_nanos);
         self.parked.store(word.encode(), Ordering::Relaxed);
@@ -376,7 +376,7 @@ impl Counters {
 
     /// The counts as they are now, with `tasks` the shard's live tasks.
     pub(crate) fn read(&self, tasks: usize) -> ShardStats {
-        let now = nanos(self.born.elapsed());
+        let now = crate::time::clock::system_nanos().saturating_sub(self.born);
         let parked = Parked::decode(self.parked.load(Ordering::Relaxed), now);
         ShardStats {
             worker: self.owner.map(|(_, place)| place),
