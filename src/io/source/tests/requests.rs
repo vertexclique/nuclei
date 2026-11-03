@@ -1030,20 +1030,56 @@ fn tcp_pair_with_a_closed_window() -> (std::net::TcpStream, std::net::TcpStream,
     set_buf(peer.as_raw_fd(), libc::SO_RCVBUF, 4096);
     set_buf(writer.as_raw_fd(), libc::SO_SNDBUF, 256 * 1024);
     writer.set_nonblocking(true).unwrap();
+    let readable = || {
+        let mut readable: libc::c_int = 0;
+        // SAFETY: `peer` is open and FIONREAD writes one `c_int` through the pointer.
+        let ret = unsafe { libc::ioctl(peer.as_raw_fd(), libc::FIONREAD, &raw mut readable) };
+        assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+        usize::try_from(readable).unwrap()
+    };
+    let counts = cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut written = 0;
-    loop {
-        match writer.write(&[0u8; 4096]) {
-            Ok(n) => written += n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => panic!("{e}"),
+    // Bytes still in flight when the writer blocks can be delivered and acknowledged a moment
+    // later, so the window is closed only once the peer's count stops growing with bytes
+    // unacknowledged; if everything got acknowledged, write more and settle again.
+    'settled: loop {
+        loop {
+            match writer.write(&[0u8; 4096]) {
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let mut backoff = Duration::from_micros(300);
+        let mut last = readable();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the peer's window never settled closed: {last} of {written} bytes taken, \
+                 {:?} unacknowledged",
+                sys::unacked(writer.as_raw_fd())
+            );
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(20));
+            let now = readable();
+            if now != last {
+                last = now;
+                continue;
+            }
+            if !counts || sys::unacked(writer.as_raw_fd()).is_some_and(|n| n > 0) {
+                break 'settled;
+            }
+            break;
         }
     }
-    let mut readable: libc::c_int = 0;
-    // SAFETY: `peer` is open and FIONREAD writes one `c_int` through the pointer.
-    let ret = unsafe { libc::ioctl(peer.as_raw_fd(), libc::FIONREAD, &raw mut readable) };
-    assert_eq!(ret, 0, "{}", io::Error::last_os_error());
     assert!(
-        usize::try_from(readable).unwrap() < written,
+        readable() < written,
         "the peer's window did not close: it holds all {written} bytes written"
     );
     (writer, peer, written)
