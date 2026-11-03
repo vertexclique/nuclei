@@ -14,7 +14,7 @@ use core::future::Future;
 use core::pin::{Pin, pin};
 use core::task::{Context, Poll};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::Shard;
 use super::signal::Signal;
@@ -24,6 +24,7 @@ use crate::rt::quartz::Quartz;
 use crate::rt::task::Runnable;
 use crate::rt::tuning::QUARTZ_EVERY;
 use crate::sync::internal::Ordering;
+use crate::time::clock::system_nanos;
 
 #[cfg(test)]
 thread_local! {
@@ -284,13 +285,15 @@ impl Shard {
             let pool_out = self.blocking_out();
             if self.begin_park(|| self.has_remote_work() || signal.woken.load(Ordering::SeqCst)) {
                 self.count_again(self.since_drive());
-                let slept = Instant::now();
+                let slept = system_nanos();
+                self.park_began(slept);
                 self.tuning.hooks.parked();
                 self.drive_or_report(None);
                 shared.park.end_park();
                 self.parked_ended();
                 self.tuning.hooks.unparked();
-                self.slept_for(slept.elapsed(), !pool_out);
+                self.slept_for(system_nanos().saturating_sub(slept), !pool_out);
+                self.park_ended();
             } else if spun == Spun::Missed {
                 // Every look of the spin asked the poller.
                 self.count_again(self.since_drive());
@@ -345,10 +348,16 @@ impl Shard {
             (w, t) => w.or(t),
         };
         self.publish();
+        let slept = sleeps.then(system_nanos);
+        if let Some(slept) = slept {
+            self.park_began(slept);
+        }
         let result = self.poll_io(max, timeout);
-        if sleeps {
+        if let Some(slept) = slept {
             shared.park.end_park();
             self.parked_ended();
+            self.slept_for(system_nanos().saturating_sub(slept), false);
+            self.park_ended();
         }
         if quiet {
             self.after_park();

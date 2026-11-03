@@ -1,0 +1,11 @@
+TLC run of every configuration in proofs/tla/busy, 2026-11-03 14:37 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+B_safe                          635811     180262      2  pass                                  pass                                  yes
+M_no_store_begin                    89         57      2  violated:NeverBelow                   violated:NeverBelow                   yes
+M_no_store_end                     280        177      1  violated:NeverAboveGap                violated:NeverAboveGap                yes
+M_publish_overwrites               296        200      1  violated:NeverBelow                   violated:NeverBelow                   yes
+
+results matching EXPECTED.txt: 4 of 4

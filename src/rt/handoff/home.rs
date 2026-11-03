@@ -93,7 +93,7 @@ impl Home {
     #[inline(always)]
     pub(crate) unsafe fn push_task(&self, task: &Links) {
         // SAFETY: the caller's contract.
-        unsafe { self.tasks.push(task) }
+        unsafe { self.tasks.push_home(task) }
     }
 
     /// A task of the home ended: its future was dropped and it left the list.

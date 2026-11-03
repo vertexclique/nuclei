@@ -1,0 +1,9 @@
+# configuration                spec                 expected
+L_first_poll                   MC_ListOwner         pass
+L_listed                       MC_ListOwner         pass
+M_edit_anyway                  MC_ListOwner         violated:OwnerOnly
+M_drop_edit                    MC_ListOwner         violated:NoneLost
+M_no_ref                       MC_ListOwner         violated:NoDangling
+M_no_skip_listed               MC_ListOwner         violated:NoDoubleLink
+M_no_skip_ended                MC_ListOwner         violated:NoDangling
+M_foreign_reads                MC_ListOwner         violated:NoDeadListed

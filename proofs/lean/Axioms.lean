@@ -273,3 +273,19 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Mesh.one_pair_per_channel
 #print axioms Nuclei.Mesh.pairs_do_not_share
 #print axioms Nuclei.Mesh.example_three
+
+-- A shard's parked word: the running word reads its total, a parked one the parks so far, never
+-- past the reader's clock, and a wake carries the park's length into the total.
+#print axioms Nuclei.Busy.decode_ran
+#print axioms Nuclei.Busy.decode_parks
+#print axioms Nuclei.Busy.decode_parks_le
+#print axioms Nuclei.Busy.wake_continues
+
+-- A list edit posted to the list's owner and applied after its own edits of other tasks ends
+-- where the edit itself would: edits of different tasks commute.
+#print axioms Nuclei.ListOwner.apply_other
+#print axioms Nuclei.ListOwner.apply_own
+#print axioms Nuclei.ListOwner.apply_comm
+#print axioms Nuclei.ListOwner.defer
+#print axioms Nuclei.ListOwner.deferred_task
+#print axioms Nuclei.ListOwner.deferred_others

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.5
+
+### Fixed
+
+- **A task's list could be edited by two threads at once after a handoff.** A shard keeps its
+  tasks that returned pending on an intrusive list that only the shard's runner may edit. When the
+  monitor took a shard from a thread blocked in a task's poll, that thread, back from the poll,
+  still put the task on the list or took it off, while the shard's new runner edited the same list.
+  A debug build aborted with "null reference produced" and a release build crashed or lost a
+  task, which showed as a hang (seen in `a_runtime_dropped_after_a_handoff_leaves_no_descriptor_open`).
+  The thread now comes back into the shard for the edit and makes it only if the shard is still its
+  own; if it was taken, it posts the edit, holding a reference to the task, to the shard's mailbox
+  of registration changes, which the owner applies where it applies those and before it walks the
+  list as the shard goes. A posted listing links only a task still open and not listed, and a task's runnable dropped on another thread posts an unlisting without reading the task's links. An edit
+  left in the mailbox as the shard goes cancels the task it would have listed
+  (`proofs/tla/listowner`, `proofs/lean/Nuclei/ListOwner.lean`).
+- **A sleeping shard no longer reads as busy.** `ShardStats::parked` was published only as the
+  shard went to sleep and grew only when the sleep ended, so a shard asleep for 30 seconds
+  reported 30 seconds of `busy`. The time parked is now one word that says whether the shard is
+  parked and since when, which a reader turns into the time parked with its own clock: `parked`
+  includes the park in progress and `busy` is the age less that. A shard driven by hand with
+  `the manual turn` now counts the parks of its turns too, which it never did
+  (`proofs/tla/busy`, `proofs/lean/Nuclei/Busy.lean`).
+- A shard whose io_uring ring could not be made (out of memory, or unsupported) and that runs
+  epoll instead now says so with a warning, once per shard.
+- `tests/cq_overflow.rs` takes whether the server has a ring from the server shard's own backend,
+  not the process's: under load a worker's ring can fail to be made and the shard falls back to
+  epoll, and the test then waited for ring operations that never came.
+- `tcp_pair_with_a_closed_window` (a unit test) closes the peer's window on macOS too: the
+  listener's receive buffer is not carried to the accepted socket there, and autotuning grew the
+  peer's to about 320 KiB, so it took every byte. The accepted socket's is set. The setup also
+  waits, with a deadline and backoff, until the bytes the peer takes have landed and some stay
+  unacknowledged, writing more until they do: bytes still in flight on a slow loopback were taken
+  for a closed window, then acknowledged within milliseconds.
+- `tests/time_precise.rs` compares the median precise sleep with the median sleep on the wheel,
+  not their totals: on a loaded host one preemption of the shard lands in one sleep, and it
+  decided the comparison.
+
 ## 0.5.4
 
 ### Fixed

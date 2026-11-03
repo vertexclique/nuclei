@@ -91,11 +91,12 @@ pub struct ShardStats {
     pub polls: u64,
     /// Times the shard slept with nothing to run (published).
     pub parks: u64,
-    /// Time the shard spent asleep, in all (published).
+    /// Time the shard spent asleep, in all, the park in progress included.
     pub parked: std::time::Duration,
     /// Time since the shard was made that it did not spend asleep: running
     /// tasks, driving its IO and timers, spinning before a park (from the
-    /// published time asleep).
+    /// time asleep): a shard asleep for a while reads as parked for it, not
+    /// as busy.
     pub busy: std::time::Duration,
     /// Runnables waiting in the shard's own queue, its LIFO slot included
     /// (published).

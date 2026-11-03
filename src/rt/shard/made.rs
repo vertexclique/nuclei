@@ -185,7 +185,7 @@ impl Shard {
             last_drive: Cell::new(Quartz::now()),
             polls: Cell::new(0),
             sleeps: Cell::new(0),
-            slept: Cell::new(core::time::Duration::ZERO),
+            slept: Cell::new(0),
             remote_wakes: Cell::new(0),
             looks: Cell::new(0),
             spin: Spin::new(),
@@ -256,6 +256,9 @@ unsafe fn driver_at(
                         && (err.raw_os_error() == Some(libc::ENOMEM)
                             || err.kind() == io::ErrorKind::Unsupported) =>
                 {
+                    log::warn!(
+                        "a worker's io_uring ring could not be made ({err}); this shard uses epoll instead"
+                    );
                     poller()
                 }
                 Err(err) => Err(err),

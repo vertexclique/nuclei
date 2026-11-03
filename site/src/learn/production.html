@@ -72,7 +72,7 @@ nuclei::config::IoUringConfiguration::aggressive_poll
 <p>The sizes are checked where they take effect: <code>queue_len</code> at least 64, <code>recv_buffers</code> 0 or a power of two below twice <code>queue_len</code>, and <code>recv_buffer_size</code> from 512 bytes to 1 GiB while there are receive buffers. A value outside fails the first runtime built with it, with <code>InvalidInput</code> naming the setting.</p>
 
 <h2 id="stats">Counters</h2>
-<p><code>nuclei::stats()</code> takes a snapshot of every shard alive in the process (each runtime's workers, then the shard of each thread in <code>block_on</code>) and of the blocking pools; <code>Runtime::stats</code> takes one of a single runtime's workers and pool. It reads the shards without stopping them; most counts are published by a shard as it is about to wait for work, and by a busy one every few hundred task runs.</p>
+<p><code>nuclei::stats()</code> takes a snapshot of every shard alive in the process (each runtime's workers, then the shard of each thread in <code>block_on</code>) and of the blocking pools; <code>Runtime::stats</code> takes one of a single runtime's workers and pool. It reads the shards without stopping them; most counts are published by a shard as it is about to wait for work, and by a busy one every few hundred task runs. <code>parked</code> and <code>busy</code> are exact for a shard asleep: both include the park in progress, so a shard idle for a minute reads as a minute parked and no busier than before.</p>
 <!--example prod_stats-->
 <!--api-table
 Field | What it counts
