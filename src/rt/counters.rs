@@ -411,6 +411,7 @@ impl Counters {
             #[cfg(feature = "io-stats")]
             io: self.io.get().map(|totals| totals.read()),
             errors: self.errors.read(),
+            key: self as *const Self as usize,
         }
     }
 }
@@ -768,59 +769,72 @@ fn take_out_gone() {
     if WENT.load(Ordering::Relaxed) == 0 || WENT.swap(0, Ordering::Acquire) == 0 {
         return;
     }
-    let gone: Vec<usize> = registry()
-        .iter()
-        .filter(|(_, shard)| shard.upgrade().is_none_or(|s| s.counters.is_gone()))
-        .map(|(key, _)| key)
-        .collect();
-    for key in gone {
-        drop(registry().remove(&key));
+    // The walk takes each bucket's nodes before it yields any, so removing as it goes is safe.
+    for (key, shard) in registry().iter() {
+        if shard.upgrade().is_none_or(|s| s.counters.is_gone()) {
+            drop(registry().remove(&key));
+        }
     }
+}
+
+/// Fills the fields of `out` that belong to no shard: the pools' and the process's counts.
+fn fill_process(out: &mut Stats, threads: usize, queued: usize) {
+    out.blocking_threads = threads;
+    out.blocking_queue_depth = queued;
+    out.off_shard_errors = OFF_SHARD.read();
+    out.receive_buffers_missing = GROUPS_MISSING.load(Ordering::Relaxed);
+    out.completions_dropped = COMPLETIONS_DROPPED.load(Ordering::Relaxed);
+    out.operations_given_up = OPERATIONS_GIVEN_UP.load(Ordering::Relaxed);
+    out.write_behind_lost = WRITE_BEHIND_LOST.load(Ordering::Relaxed);
+    out.tasks_left = TASKS_LEFT.load(Ordering::Relaxed);
+}
+
+/// Workers first, by runtime and place; then the threads' own shards, by where their counters
+/// sit. The key is unique per shard, so the unstable sort (which takes no scratch memory) is
+/// deterministic.
+fn sort_shards(shards: &mut [ShardStats]) {
+    shards.sort_unstable_by_key(|s| (s.worker.is_none(), s.runtime, s.worker, s.key));
 }
 
 /// The counts of every live shard and of the blocking pools.
 pub(crate) fn snapshot() -> Stats {
-    take_out_gone();
-    let mut shards: Vec<ShardStats> = registry()
-        .values()
-        .filter_map(|shared| shared.upgrade())
-        .filter(|shared| !shared.counters.is_gone())
-        .map(|shared| shared.stats())
-        .collect();
-    // Workers first, by runtime and place; then the threads' own shards.
-    shards.sort_by_key(|shard| (shard.worker.is_none(), shard.runtime, shard.worker));
-    Stats {
-        shards,
-        blocking_threads: super::blocking::threads_alive(),
-        blocking_queue_depth: super::blocking::queued_everywhere(),
-        off_shard_errors: OFF_SHARD.read(),
-        receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
-        completions_dropped: COMPLETIONS_DROPPED.load(Ordering::Relaxed),
-        operations_given_up: OPERATIONS_GIVEN_UP.load(Ordering::Relaxed),
-        write_behind_lost: WRITE_BEHIND_LOST.load(Ordering::Relaxed),
-        tasks_left: TASKS_LEFT.load(Ordering::Relaxed),
-    }
+    let mut out = Stats::default();
+    snapshot_into(&mut out);
+    out
 }
 
-/// The counts of the worker shards of runtime `runtime`, by place, with the
+/// [`snapshot`] into `out`, its `shards` cleared and refilled with their capacity reused.
+pub(crate) fn snapshot_into(out: &mut Stats) {
+    take_out_gone();
+    out.shards.clear();
+    out.shards.extend(
+        registry()
+            .values()
+            .filter_map(|shared| shared.upgrade())
+            .filter(|shared| !shared.counters.is_gone())
+            .map(|shared| shared.stats()),
+    );
+    sort_shards(&mut out.shards);
+    fill_process(
+        out,
+        super::blocking::threads_alive(),
+        super::blocking::queued_everywhere(),
+    );
+}
+
+/// The counts of the worker shards of a runtime, by place, with the
 /// blocking pool's `threads` and `queued` jobs, and the process's counts of
-/// what belongs to no runtime.
-pub(crate) fn runtime_snapshot(
+/// what belongs to no runtime, into `out`: its `shards` cleared and refilled
+/// with their capacity reused.
+pub(crate) fn runtime_snapshot_into(
+    out: &mut Stats,
     workers: impl Iterator<Item = ShardStats>,
     threads: usize,
     queued: usize,
-) -> Stats {
-    Stats {
-        shards: workers.collect(),
-        blocking_threads: threads,
-        blocking_queue_depth: queued,
-        off_shard_errors: OFF_SHARD.read(),
-        receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
-        completions_dropped: COMPLETIONS_DROPPED.load(Ordering::Relaxed),
-        operations_given_up: OPERATIONS_GIVEN_UP.load(Ordering::Relaxed),
-        write_behind_lost: WRITE_BEHIND_LOST.load(Ordering::Relaxed),
-        tasks_left: TASKS_LEFT.load(Ordering::Relaxed),
-    }
+) {
+    out.shards.clear();
+    out.shards.extend(workers);
+    fill_process(out, threads, queued);
 }
 
 /// A poll on the shard this thread runs spent its budget and yielded. Out

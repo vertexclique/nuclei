@@ -534,13 +534,11 @@ fn take_out_gone() {
     {
         return;
     }
-    let gone: Vec<usize> = pools()
-        .iter()
-        .filter(|(_, pool)| pool.strong_count() == 0)
-        .map(|(key, _)| key)
-        .collect();
-    for key in gone {
-        drop(pools().remove(&key));
+    // The walk takes each bucket's nodes before it yields any, so removing as it goes is safe.
+    for (key, pool) in pools().iter() {
+        if pool.strong_count() == 0 {
+            drop(pools().remove(&key));
+        }
     }
 }
 

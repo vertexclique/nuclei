@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.6
+
+### Added
+
+- **`stats_into`, `Runtime::stats_into` and `RuntimeHandle::stats_into` read the counters into a
+  `Stats` the caller keeps.** A program that scrapes the counters again and again built a new
+  `Stats`, and a new `Vec` of shards inside it, on every read. These clear `out.shards` and fill it
+  again, reusing its capacity, and overwrite every other field; once `out.shards` has room for the
+  shards alive, a read allocates nothing. `stats()`, `Runtime::stats` and `RuntimeHandle::stats`
+  are a default `Stats` filled the same way, so the two forms always agree.
+- **`Stats` implements `Default`** (no shards, every count zero), since `Stats` is
+  `#[non_exhaustive]` and a caller could not make the buffer `stats_into` fills.
+
+### Changed
+
+- A snapshot sorts its shards with an unstable sort on a key that is unique per shard, which takes
+  no scratch memory (the stable sort allocated one past a handful of shards). The order is the
+  same: workers by runtime and place, then the shards of threads that run `block_on`, which are
+  now ordered by where their counters sit, so the same shards list the same way on every read.
+- Taking out the entries of shards and blocking pools that went no longer collects their keys into
+  a vector first; it removes them as it walks.
+
 ## 0.5.5
 
 ### Fixed

@@ -406,3 +406,44 @@ fn a_spawn_onto_a_worker_allocates_nothing_on_the_spawning_thread() {
         "{made} allocations in {RUNS} spawns onto a worker and awaits"
     );
 }
+
+/// Reading the counters into a `Stats` kept between reads: once its shards have room, the
+/// process's, a runtime's and a handle's forms take no memory, with worker shards and this
+/// thread's own `block_on` shard alive.
+#[test]
+fn reading_the_counters_into_a_kept_stats_allocates_nothing() {
+    let rt = nuclei::Runtime::builder()
+        .worker_threads(3)
+        .build()
+        .unwrap();
+    let handle = rt.handle();
+    rt.block_on(async {
+        for _ in 0..16 {
+            nuclei::spawn(async { 1u8 }).await;
+        }
+    });
+    // Room for the shards other tests of this process have alive meanwhile.
+    let mut out = nuclei::stats::Stats::default();
+    out.shards.reserve(1024);
+    let read = |out: &mut nuclei::stats::Stats| {
+        nuclei::stats_into(out);
+        rt.stats_into(out);
+        handle.stats_into(out);
+    };
+    rt.block_on(async {
+        read(&mut out);
+        let before = allocations();
+        for _ in 0..RUNS {
+            read(&mut out);
+        }
+        let made = allocations() - before;
+        assert_eq!(
+            made, 0,
+            "{made} allocations in {RUNS} reads of the counters"
+        );
+    });
+    assert!(
+        !out.shards.is_empty() && out.shards.iter().all(|s| s.worker.is_some()),
+        "the handle's form lists the runtime's workers only: {out:?}"
+    );
+}
