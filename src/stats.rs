@@ -21,7 +21,10 @@ use crate::IoBackend;
 use crate::rt::counters::{KINDS, kind_index};
 
 /// A snapshot of the runtime's counters: [`stats()`](crate::stats()).
-#[derive(Clone, Debug)]
+///
+/// [`Default`] is a snapshot of nothing (no shards, every count zero): the buffer
+/// [`stats_into`] refills, since a caller cannot build a `Stats` otherwise.
+#[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct Stats {
     /// Every shard alive: the workers first, by their place in their
@@ -162,6 +165,9 @@ pub struct ShardStats {
     pub io: Option<IoCounts>,
     /// Errors of IO run on the shard.
     pub errors: ErrorCounts,
+    /// Where the shard's counters sit: orders the shards of threads that run `block_on`, which
+    /// have no place or runtime, the same way on every snapshot.
+    pub(crate) key: usize,
 }
 
 /// The IO operations a shard's thread completed: see [`ShardStats::io`].
@@ -310,6 +316,7 @@ impl ErrorCounts {
     }
 }
 
+/// No errors counted: every count zero.
 impl Default for ErrorCounts {
     fn default() -> Self {
         Self {
@@ -350,4 +357,19 @@ impl core::fmt::Debug for ErrorCounts {
 /// ```
 pub fn stats() -> Stats {
     crate::rt::counters::snapshot()
+}
+
+/// [`stats()`] into a `Stats` the caller keeps, for a caller that reads the counters again and
+/// again: `out.shards` is cleared and filled, its capacity reused, and every other field is
+/// overwritten. Once `out.shards` has room for the shards alive, a call allocates nothing.
+///
+/// ```
+/// let mut stats = nuclei::stats::Stats::default();
+/// for _ in 0..3 {
+///     nuclei::stats_into(&mut stats);
+///     println!("{} shards", stats.shards.len());
+/// }
+/// ```
+pub fn stats_into(out: &mut Stats) {
+    crate::rt::counters::snapshot_into(out);
 }

@@ -162,5 +162,5 @@ pub use runtime::{
     Builder, FallibleTask, Runtime, RuntimeHandle, Task, block_on, spawn, spawn_blocking,
     spawn_local,
 };
-pub use stats::stats;
+pub use stats::{stats, stats_into};
 pub use time::{sleep, timeout};

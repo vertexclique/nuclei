@@ -86,6 +86,52 @@ fn a_threads_shard_is_listed_while_the_thread_lives() {
     assert_eq!(places(&nuclei::stats()).1, before, "gone with its thread");
 }
 
+/// The shards of a snapshot in order, by what names each.
+fn order(stats: &Stats) -> Vec<(Option<usize>, Option<nuclei::runtime::RuntimeId>)> {
+    stats.shards.iter().map(|s| (s.worker, s.runtime)).collect()
+}
+
+#[test]
+fn stats_into_lists_the_shards_stats_does_in_the_same_order() {
+    let _one = one();
+    let rt = Builder::new()
+        .worker_threads(3)
+        .pin_workers(false)
+        .build()
+        .unwrap();
+    let other = Builder::new()
+        .worker_threads(2)
+        .pin_workers(false)
+        .build()
+        .unwrap();
+    let threads: Vec<_> = (0..3)
+        .map(|_| std::thread::spawn(|| nuclei::block_on(async { std::thread::park() })))
+        .collect();
+    until("every shard listed", |stats| {
+        stats.shards.iter().filter(|s| s.worker.is_none()).count() >= 3
+            && stats.shards.iter().filter(|s| s.worker.is_some()).count() >= 5
+    });
+    // A buffer that holds another snapshot's shards: they must go.
+    let mut into = nuclei::stats();
+    into.shards.truncate(1);
+    nuclei::stats_into(&mut into);
+    let direct = nuclei::stats();
+    assert_eq!(order(&into), order(&direct));
+    assert_eq!(into.blocking_threads, direct.blocking_threads);
+
+    let mut mine = Stats::default();
+    for runtime in [&rt, &other] {
+        runtime.stats_into(&mut mine);
+        assert_eq!(order(&mine), order(&runtime.stats()));
+        runtime.handle().stats_into(&mut mine);
+        assert_eq!(order(&mine), order(&runtime.handle().stats()));
+    }
+    for thread in threads {
+        thread.thread().unpark();
+        thread.join().unwrap();
+    }
+}
+
 #[test]
 fn blocking_threads_count_the_pools_threads() {
     let _one = one();
