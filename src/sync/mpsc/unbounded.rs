@@ -13,7 +13,7 @@ use core::future::poll_fn;
 use core::task::{Context, Poll};
 
 use super::chan::{Chan, Limit};
-use super::error::{SendError, TryRecvError};
+use super::error::{RecvDeadlineError, SendError, TryRecvError};
 use super::queue;
 use crate::sync::internal::{self, Arc, AtomicUsize, Ordering};
 
@@ -488,6 +488,29 @@ impl<T> UnboundedReceiver<T> {
     /// ```
     pub fn blocking_recv(&mut self) -> Option<T> {
         internal::blocking(self.recv())
+    }
+
+    /// [`blocking_recv`](Self::blocking_recv) that waits until `deadline` at most.
+    ///
+    /// Returns the next value as soon as one is there (values buffered before a close are
+    /// received first), [`Disconnected`](RecvDeadlineError::Disconnected) once the channel is
+    /// closed and empty, and [`Timeout`](RecvDeadlineError::Timeout) when `deadline` passed with
+    /// the channel empty and open, never before it. A value that arrives as the deadline passes
+    /// is received, not lost. Off a shard the thread parks for the time left, with no polling;
+    /// on a shard the wait is the shard's, as for `blocking_recv`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`blocking_recv`](Self::blocking_recv).
+    pub fn blocking_recv_deadline(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<T, RecvDeadlineError> {
+        match internal::blocking_until(self.recv(), deadline) {
+            Some(Some(value)) => Ok(value),
+            Some(None) => Err(RecvDeadlineError::Disconnected),
+            None => Err(RecvDeadlineError::Timeout),
+        }
     }
 
     /// [`recv_many`](Self::recv_many) for a thread that may block; see

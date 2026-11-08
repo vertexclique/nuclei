@@ -375,6 +375,7 @@ impl Poller {
                     .min(u128::from(INFINITE - 1)) as u32,
             },
         };
+        super::before_sleep(timeout);
         let capacity = self.entries.len().min(max).max(1) as ULONG;
         let mut removed: ULONG = 0;
         // SAFETY: the entries buffer has room for `capacity` packets; the

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.7
+
+### Added
+
+- **`blocking_recv_deadline` on the mpsc receivers and the oneshot receiver**, for a thread that
+  waits for a value until an `Instant`. `mpsc::Receiver` and `mpsc::UnboundedReceiver` return
+  `Result<T, mpsc::error::RecvDeadlineError>` (`Timeout`, or `Disconnected` once the channel is
+  closed and drained; buffered values come first). `oneshot::Receiver::blocking_recv_deadline`
+  takes `&mut self`, so a `Timeout` leaves the receiver to wait again, and returns
+  `oneshot::error::RecvDeadlineError` (`Timeout`, `Closed`). Off a shard the thread parks for the
+  time left (no polling, no fixed sleep) on the same waker and parker as `blocking_recv`, wakes at
+  once on a send or a close, polls once more after the timed park so a value that lands as the
+  deadline passes is not lost, and times out no earlier than the deadline. On a shard the wait is
+  the shard's own, with a timer.
+
+### Fixed
+
+- **A thread that sleeps no longer holds back kovan's reclamation.** kovan frees a retired batch
+  only once every reservation it reached has drained, and a thread's reservation stays published
+  after its last guard until it pins again or flushes. A shard that pinned kovan on its last turn
+  and then parked, a thread blocked in `blocking_recv` (or any `blocking_*` call), an idle blocking
+  pool thread and the handoff monitor each kept every batch retired at or after their epoch alive
+  for as long as they slept, and kept their own partial batch unsubmitted. Each now calls
+  `kovan::quiesce()` at the last moment before it sleeps: the pollers (io_uring, epoll, kqueue and
+  completion port) right before their blocking call, and only for a wait that may sleep, so a shard
+  that finds work pays nothing; `block_on`'s park (which every blocking call uses); the blocking
+  pool's idle wait; the handoff monitor's bell; and the wait for a port's keeper. The shard's run
+  queue, spin and IO poll are unchanged.
+
+### Changed
+
+- **Requires kovan 0.2.4**, for `kovan::quiesce`.
+
 ## 0.5.6
 
 ### Added

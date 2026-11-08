@@ -234,6 +234,7 @@ impl Poller {
         let call = libc::SYS_epoll_wait;
         #[cfg(not(target_arch = "x86_64"))]
         let call = libc::SYS_epoll_pwait;
+        super::before_sleep(timeout);
         // SAFETY: the buffer has room for `capacity` events; the kernel says
         // how many it wrote.
         let n = match unsafe {

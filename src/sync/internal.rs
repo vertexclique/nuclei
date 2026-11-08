@@ -232,7 +232,35 @@ pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
         if let Poll::Ready(output) = crate::coop::outside(|| future.as_mut().poll(&mut cx)) {
             return output;
         }
+        // Leaves kovan's reservation before sleeping, so a blocked thread holds no retired batch.
+        kovan::quiesce();
         std::thread::park();
+    }
+}
+
+/// [`block_on`] that gives up at `deadline`: the output, or `None` once the deadline passed with
+/// the future still pending. The future is polled once more after the last timed park, so a wake
+/// that comes as the deadline passes is not lost, and `None` is never returned before the deadline.
+#[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
+fn block_on_until<F: core::future::Future>(
+    future: F,
+    deadline: std::time::Instant,
+) -> Option<F::Output> {
+    use core::task::{Context, Poll};
+
+    let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = core::pin::pin!(future);
+    loop {
+        if let Poll::Ready(output) = crate::coop::outside(|| future.as_mut().poll(&mut cx)) {
+            return Some(output);
+        }
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        if left.is_zero() {
+            return None;
+        }
+        kovan::quiesce();
+        std::thread::park_timeout(left);
     }
 }
 
@@ -424,6 +452,27 @@ pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
         Ok(output) => output,
         Err(stuck) => panic!("{stuck}"),
     }
+}
+
+/// [`blocking`] that gives up at `deadline`: the future's output, or `None` once the deadline
+/// passed with it still pending. On a thread that runs a shard the wait is the shard's own, with
+/// a timer; on any other it parks the thread for the time left, with no polling.
+pub(crate) fn blocking_until<F: core::future::Future>(
+    future: F,
+    deadline: std::time::Instant,
+) -> Option<F::Output> {
+    #[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
+    if !(crate::rt::context::current(|current| current.is_some())
+        || (crate::rt::context::lost_a_shard() && crate::rt::context::own_shard().is_ok())
+        || crate::rt::context::own_shard_if_made().is_some())
+    {
+        return block_on_until(future, deadline);
+    }
+    blocking(crate::time::timeout_at(
+        crate::time::Instant::from_std(deadline),
+        future,
+    ))
+    .ok()
 }
 
 #[cfg(all(test, not(loom)))]

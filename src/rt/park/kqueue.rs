@@ -230,6 +230,7 @@ impl Poller {
             .map_or((std::ptr::null(), 0), |c| (c as *const libc::kevent, 1));
         #[cfg(not(precise_timer))]
         let (changes, nchanges) = (std::ptr::null(), 0);
+        super::before_sleep(timeout);
         // SAFETY: the buffer has room for its capacity; the kernel says how
         // many it wrote. The change, if any, is a local that outlives the call.
         let n = unsafe {

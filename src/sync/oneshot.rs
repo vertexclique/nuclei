@@ -117,6 +117,17 @@ pub mod error {
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub struct RecvError(pub(crate) ());
 
+    /// Error returned by [`Receiver::blocking_recv_deadline`](super::Receiver::blocking_recv_deadline).
+    #[derive(Debug, Eq, PartialEq, Clone)]
+    pub enum RecvDeadlineError {
+        /// The deadline passed with nothing sent and the sender still there.
+        Timeout,
+
+        /// The sender was dropped without sending, the receiver was closed, or the value was
+        /// received already.
+        Closed,
+    }
+
     /// Error returned by [`Receiver::try_recv`](super::Receiver::try_recv).
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub enum TryRecvError {
@@ -136,6 +147,17 @@ pub mod error {
 
     impl std::error::Error for RecvError {}
 
+    impl fmt::Display for RecvDeadlineError {
+        fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                RecvDeadlineError::Timeout => write!(fmt, "timed out waiting for the value"),
+                RecvDeadlineError::Closed => write!(fmt, "channel closed"),
+            }
+        }
+    }
+
+    impl std::error::Error for RecvDeadlineError {}
+
     impl fmt::Display for TryRecvError {
         fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
@@ -148,7 +170,7 @@ pub mod error {
     impl std::error::Error for TryRecvError {}
 }
 
-use self::error::{RecvError, TryRecvError};
+use self::error::{RecvDeadlineError, RecvError, TryRecvError};
 
 /// What the receiver wrote down about its own close; see the module docs for
 /// why it must (the state word alone cannot say who owns the cell once the
@@ -618,6 +640,44 @@ impl<T> Receiver<T> {
     /// ```
     pub fn blocking_recv(self) -> Result<T, RecvError> {
         super::internal::blocking(self)
+    }
+
+    /// [`blocking_recv`](Self::blocking_recv) that waits until `deadline` at most.
+    ///
+    /// Takes `&mut self`, so a [`Timeout`](RecvDeadlineError::Timeout) leaves the receiver to
+    /// wait again. It returns the value as soon as it is sent, [`Closed`](RecvDeadlineError::Closed)
+    /// when the sender dropped without sending (or the value was received already), and `Timeout`
+    /// when `deadline` passed with nothing sent, never before it. A value sent as the deadline
+    /// passes is received, not lost. Off a shard the thread parks for the time left, with no
+    /// polling; on a shard the wait is the shard's, as for `blocking_recv`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`blocking_recv`](Self::blocking_recv).
+    ///
+    /// ```
+    /// use nuclei::sync::oneshot::{self, error::RecvDeadlineError};
+    /// use std::time::{Duration, Instant};
+    ///
+    /// let (tx, mut rx) = oneshot::channel::<u8>();
+    /// let soon = Instant::now() + Duration::from_millis(10);
+    /// assert_eq!(rx.blocking_recv_deadline(soon), Err(RecvDeadlineError::Timeout));
+    /// tx.send(7).unwrap();
+    /// let later = Instant::now() + Duration::from_secs(10);
+    /// assert_eq!(rx.blocking_recv_deadline(later), Ok(7));
+    /// ```
+    pub fn blocking_recv_deadline(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<T, RecvDeadlineError> {
+        if self.inner.is_none() {
+            return Err(RecvDeadlineError::Closed);
+        }
+        match super::internal::blocking_until(core::pin::Pin::new(&mut *self), deadline) {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(_)) => Err(RecvDeadlineError::Closed),
+            None => Err(RecvDeadlineError::Timeout),
+        }
     }
 }
 

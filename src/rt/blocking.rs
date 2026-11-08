@@ -441,6 +441,8 @@ impl Pool {
                 self.clear_bit(me);
                 continue;
             }
+            // Idle threads hold no retired batch of kovan's while they sleep.
+            kovan::quiesce();
             // The clock is read once to start the keep-alive, then only after
             // a park that ends with the slot still idle.
             let deadline = Instant::now() + self.config.keep_alive;

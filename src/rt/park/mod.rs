@@ -42,6 +42,15 @@ pub(crate) mod iocp;
 #[cfg(windows)]
 pub(crate) use self::iocp::{Notifier, Poller};
 
+/// Leaves kovan's reservation just before a wait that may sleep (a zero timeout only looks), so an
+/// idle shard holds no retired batch. Every poller calls it right before its blocking call.
+#[inline(always)]
+pub(crate) fn before_sleep(timeout: Option<core::time::Duration>) {
+    if timeout != Some(core::time::Duration::ZERO) {
+        kovan::quiesce();
+    }
+}
+
 #[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
 thread_local! {
     /// This thread's next notifications a test makes fail, as a failing

@@ -108,6 +108,7 @@ impl Shard {
         // Ends the keeper's wait; a wake left on the port after it stopped
         // only ends a wait of the shard's, which looks for work then.
         self.shared.notifier.notify();
+        kovan::quiesce();
         while keeper.state.load(Ordering::Acquire) != DONE {
             std::thread::park();
         }
