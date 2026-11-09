@@ -56,7 +56,7 @@ recycle = ["kovan/recycle", "kovan-channel/recycle", "kovan-map/recycle", "kovan
 io-stats = []
 
 [dependencies]
-nuclei-macros = { version = "0.5.7", path = "nuclei-macros", optional = true }
+nuclei-macros = { version = "0.5.8", path = "nuclei-macros", optional = true }
 futures-io = "0.3"
 futures-core = { version = "0.3", default-features = false }
 kovan = "0.2.4"
@@ -132,4 +132,4 @@ members = [
 
 # Every crate of the workspace carries this one version, and they release together.
 [workspace.package]
-version = "0.5.7"
+version = "0.5.8"
