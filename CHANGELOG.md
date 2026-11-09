@@ -17,21 +17,17 @@
 
 ### Fixed
 
-- **A thread that sleeps no longer holds back kovan's reclamation.** kovan frees a retired batch
-  only once every reservation it reached has drained, and a thread's reservation stays published
-  after its last guard until it pins again or flushes. A shard that pinned kovan on its last turn
-  and then parked, a thread blocked in `blocking_recv` (or any `blocking_*` call), an idle blocking
-  pool thread and the handoff monitor each kept every batch retired at or after their epoch alive
-  for as long as they slept, and kept their own partial batch unsubmitted. Each now calls
-  `kovan::quiesce()` at the last moment before it sleeps: the pollers (io_uring, epoll, kqueue and
-  completion port) right before their blocking call, and only for a wait that may sleep, so a shard
-  that finds work pays nothing; `block_on`'s park (which every blocking call uses); the blocking
-  pool's idle wait; the handoff monitor's bell; and the wait for a port's keeper. The shard's run
-  queue, spin and IO poll are unchanged.
+- **A thread that sleeps no longer holds back kovan's reclamation.** With kovan 0.2.4 a thread's
+  reservation ends with its last guard, so a sleeping thread holds back nothing another thread
+  retires. What the thread itself retired still waited in its own partial batch until it pinned
+  again; each place a thread sleeps now submits it first (`kovan::flush_pending`, nothing to pay
+  when it retired nothing): the pollers (io_uring, epoll, kqueue and completion port) right before
+  a wait that may sleep, `block_on`'s park (which every blocking call uses), the blocking pool's
+  idle wait, the handoff monitor's bell and the wait for a port's keeper.
 
 ### Changed
 
-- **Requires kovan 0.2.4**, for `kovan::quiesce`.
+- **Requires kovan 0.2.4.**
 
 ## 0.5.6
 

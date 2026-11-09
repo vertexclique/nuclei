@@ -1,7 +1,7 @@
 //! A thread that sleeps holds nothing of kovan's: a shard that parks, a thread blocked in a
-//! channel's `blocking_recv`, and every shard of an idle runtime leave their reservation first, so
-//! a value any of them retired, or another thread retired after they slept, is freed while they
-//! stay asleep. The test thread flushes to drain its own slot; no task runs on a shard after it
+//! channel's `blocking_recv`, and every shard of an idle runtime hold no reservation (kovan 0.2.4
+//! ends it at the guard's drop) and submit what they retired before they sleep, so a value any of
+//! them retired, or another thread retired after they slept, is freed while they stay asleep. The test thread flushes to drain its own slot; no task runs on a shard after it
 //! parks, and nothing wakes a blocked receiver until the value is freed.
 
 use std::sync::Arc;

@@ -42,12 +42,13 @@ pub(crate) mod iocp;
 #[cfg(windows)]
 pub(crate) use self::iocp::{Notifier, Poller};
 
-/// Leaves kovan's reservation just before a wait that may sleep (a zero timeout only looks), so an
-/// idle shard holds no retired batch. Every poller calls it right before its blocking call.
+/// Submits what this thread retired to kovan just before a wait that may sleep (a zero timeout
+/// only looks), so nothing an idle shard retired waits for it to wake. Every poller calls it right
+/// before its blocking call; a thread that retired nothing pays nothing.
 #[inline(always)]
 pub(crate) fn before_sleep(timeout: Option<core::time::Duration>) {
     if timeout != Some(core::time::Duration::ZERO) {
-        kovan::quiesce();
+        kovan::flush_pending();
     }
 }
 

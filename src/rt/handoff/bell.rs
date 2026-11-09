@@ -57,7 +57,7 @@ impl Bell {
 
     /// Waits for a ring (or wakes early, spuriously).
     pub(super) fn wait(&self) {
-        kovan::quiesce();
+        kovan::flush_pending();
         #[cfg(any(windows, target_vendor = "apple"))]
         if self.handles.as_ref().is_some_and(|h| h.wait(None)) {
             return;
@@ -67,7 +67,7 @@ impl Bell {
 
     /// Waits for a ring or for `left` to pass (or wakes early, spuriously).
     pub(super) fn wait_for(&self, left: Duration) {
-        kovan::quiesce();
+        kovan::flush_pending();
         #[cfg(any(windows, target_vendor = "apple"))]
         if self.handles.as_ref().is_some_and(|h| h.wait(Some(left))) {
             return;

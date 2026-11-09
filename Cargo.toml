@@ -134,5 +134,9 @@ members = [
 [workspace.package]
 version = "0.5.7"
 
-# Development against the unreleased kovan that has `quiesce`; removed before release, when the
-# dependencies above read "0.2.4" from crates.io.
+# kovan 0.2.4 from its release commit until it is on crates.io; removed before this release.
+[patch.crates-io]
+kovan = { git = "https://github.com/vertexclique/kovan", rev = "45ff5099b48357c2a303f140e1d9b94550ab97b5" }
+kovan-channel = { git = "https://github.com/vertexclique/kovan", rev = "45ff5099b48357c2a303f140e1d9b94550ab97b5" }
+kovan-map = { git = "https://github.com/vertexclique/kovan", rev = "45ff5099b48357c2a303f140e1d9b94550ab97b5" }
+kovan-queue = { git = "https://github.com/vertexclique/kovan", rev = "45ff5099b48357c2a303f140e1d9b94550ab97b5" }

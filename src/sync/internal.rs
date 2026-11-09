@@ -232,8 +232,8 @@ pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
         if let Poll::Ready(output) = crate::coop::outside(|| future.as_mut().poll(&mut cx)) {
             return output;
         }
-        // Leaves kovan's reservation before sleeping, so a blocked thread holds no retired batch.
-        kovan::quiesce();
+        // What this thread retired goes to reclamation before it sleeps.
+        kovan::flush_pending();
         std::thread::park();
     }
 }
@@ -259,7 +259,7 @@ fn block_on_until<F: core::future::Future>(
         if left.is_zero() {
             return None;
         }
-        kovan::quiesce();
+        kovan::flush_pending();
         std::thread::park_timeout(left);
     }
 }
