@@ -4,8 +4,8 @@
 //! filter fires only while bytes are there and never sets `EV_EOF`, and the close does not
 //! trigger it (`poll` is as silent; only a `read` returns 0). Go keeps FIFOs out of kqueue on
 //! darwin for it (golang/go#24164). A side that waits for its next edge after its reads drained a
-//! FIFO would wait for good, so here it also looks again on a timer of its own: 1 ms after it
-//! blocks, twice as long after each look that finds nothing, up to 64 ms, and from 1 ms again
+//! FIFO would wait for good, so here it also looks again on a timer of its own: 1 ms after a task
+//! waits, twice as long after each look that finds nothing, up to 64 ms, and from 1 ms again
 //! once an edge brings bytes. Bytes still come at the edge; only the end is seen late, by at most
 //! the period the side waits. An anonymous pipe, which kqueue reports the end of, is left out:
 //! only a FIFO on a file system answers `F_GETPATH`.
@@ -27,7 +27,7 @@ const PATH: usize = 1024;
 /// A side's looks at a FIFO the poller will not say the end of.
 #[derive(Default)]
 pub(super) struct FifoLook {
-    /// Whether the descriptor is a named FIFO: found the first time the side blocks.
+    /// Whether the descriptor is a named FIFO: found the first time a task waits on the side.
     fifo: Option<bool>,
     /// The wait before the next look; zero for the first.
     period: Duration,
@@ -38,45 +38,48 @@ pub(super) struct FifoLook {
 }
 
 impl FifoLook {
-    /// The side of `fd` waits for an edge: whether it looks again now (its timer fired), else
-    /// the timer armed for `waker`. Never for a descriptor that is not a named FIFO.
-    pub(super) fn due(&mut self, fd: RawFd, waker: &Waker) -> bool {
-        if !*self.fifo.get_or_insert_with(|| is_named_fifo(fd)) {
+    /// Whether the armed look's time came: the side reads again now, and the next look, if this
+    /// one finds nothing, waits twice as long.
+    #[inline(always)]
+    pub(super) fn due(&mut self) -> bool {
+        if !self.armed || !self.timer.as_ref().is_some_and(|timer| timer.is_elapsed()) {
             return false;
         }
-        let mut cx = Context::from_waker(waker);
-        if self.armed {
-            let fired = self
-                .timer
+        self.armed = false;
+        self.period = (self.period * 2).min(LAST);
+        true
+    }
+
+    /// A task waits on the side of `fd` for an edge: for a named FIFO, the next look is armed if
+    /// none is, and its timer holds `waker`. Never for a descriptor that is not one.
+    pub(super) fn hold(&mut self, fd: RawFd, waker: &Waker) {
+        if !*self.fifo.get_or_insert_with(|| is_named_fifo(fd)) {
+            return;
+        }
+        if !self.armed {
+            self.period = self.period.max(FIRST);
+            let deadline = Instant::now() + self.period;
+            match &mut self.timer {
+                Some(timer) => timer.as_mut().reset(deadline),
+                None => self.timer = Some(Box::pin(crate::time::sleep_until(deadline))),
+            }
+            self.armed = true;
+        }
+        // A look whose time came since the side read wakes the task at once.
+        if let Some(timer) = &mut self.timer
+            && timer
                 .as_mut()
-                .is_some_and(|timer| timer.as_mut().poll(&mut cx).is_ready());
-            if fired {
-                self.armed = false;
-                // The next look, if this one finds nothing, waits twice as long.
-                self.period = (self.period * 2).min(LAST);
-            }
-            return fired;
+                .poll(&mut Context::from_waker(waker))
+                .is_ready()
+        {
+            waker.wake_by_ref();
         }
-        if self.period.is_zero() {
-            self.period = FIRST;
-        }
-        let deadline = Instant::now() + self.period;
-        let timer = match &mut self.timer {
-            Some(timer) => {
-                timer.as_mut().reset(deadline);
-                timer
-            }
-            None => self.timer.insert(Box::pin(crate::time::sleep(self.period))),
-        };
-        // Polled once so its timer holds `waker`; it fires after the period.
-        let _ = timer.as_mut().poll(&mut cx);
-        self.armed = true;
-        false
     }
 
     /// An edge came: the side's next wait looks first after the shortest period again.
     pub(super) fn settle(&mut self) {
         self.period = Duration::ZERO;
+        self.armed = false;
     }
 }
 
