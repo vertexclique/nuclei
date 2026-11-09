@@ -136,7 +136,7 @@ version = "0.5.7"
 
 # kovan 0.2.4 from its release commit until it is on crates.io; removed before this release.
 [patch.crates-io]
-kovan = { git = "https://github.com/vertexclique/kovan", rev = "45ff5099b48357c2a303f140e1d9b94550ab97b5" }
-kovan-channel = { git = "https://github.com/vertexclique/kovan", rev = "45ff5099b48357c2a303f140e1d9b94550ab97b5" }
-kovan-map = { git = "https://github.com/vertexclique/kovan", rev = "45ff5099b48357c2a303f140e1d9b94550ab97b5" }
-kovan-queue = { git = "https://github.com/vertexclique/kovan", rev = "45ff5099b48357c2a303f140e1d9b94550ab97b5" }
+kovan = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
+kovan-channel = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
+kovan-map = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
+kovan-queue = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
