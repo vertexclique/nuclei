@@ -157,6 +157,7 @@ variables
     runnerSlot = 1,
     nextSlot = 2,
     assign = [t \in Threads |-> 0],      \* the slot a spare is handed, with the shard
+    held = [t \in Threads |-> FALSE],    \* (Batches) the thread holds retired values not submitted
     inbox = 0,
     pushed = 0,
     ran = 0,
@@ -187,6 +188,8 @@ define
         /\ \A t \in gone : t \notin inS
     \* A bound task runs on the thread that created it, never elsewhere.
     BoundOnCreator == boundBy \subseteq {Creator}
+    \* A thread waiting as a spare holds no retired value back (with `Batches` tracked).
+    SpareHoldsNothing == \A t \in Threads : pc[t] = "Spare" => ~held[t]
     \* A worker's loop whose shard was taken says so ("detached"), even when the poll that found
     \* the take finished its future: it never answers "stopped" for a shard it no longer runs.
     TakenReportsDetached == \A t \in stopped : t \notin gone
@@ -207,6 +210,8 @@ define
     Wait == Mode \in {"wait", "wait_no_start", "start_drops_gift"}
     \* The leaf push is part of the algorithm under these modes: the leaf and its mutations.
     Leaf == Mode \in {"leaf", "leaf_no_check", "leaf_keeps_mark", "taken_cleared", "no_leaf_fence"}
+    \* The threads' kovan batches are tracked (the flush before a spare's park).
+    Batches == Mode \in {"flush", "spare_no_flush"}
     \* Whether runner `a` may look at its claim now. With no heavy fence (`Fence = "full"`) the
     \* look comes after a full fence, which waits until every store `a` made reached memory; with
     \* the heavy fence the runner needs none. `leaf` says whether the look is the leaf push's
@@ -288,6 +293,7 @@ R_loop:
     if inbox > 0 then
         inbox := inbox - 1;
         ran := ran + 1;
+        if Batches then held[self] := TRUE; end if;   \* the work retires into the thread's batch
         goto R_loop;
     elsif boundQ > 0 /\ (self = Creator \/ Mode = "bound_any") then
         boundQ := boundQ - 1;
@@ -598,6 +604,9 @@ D_drain:
         end while;
     end if;
 D_spare:
+    \* `wait_for_shard`: what the thread retired is submitted to kovan before it parks as a spare.
+    \* (MUTATION spare_no_flush: it waits holding its batch.)
+    if Batches /\ Mode # "spare_no_flush" then held[self] := FALSE; end if;
     goto Spare;
 end process;
 

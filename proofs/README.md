@@ -3014,7 +3014,10 @@ backs out with its mark still up, so a poll that blocks after a call is never se
 break `Rescued`); and 7 witnesses (a handoff, a cancel by the monitor, a call into the runtime
 from a detached thread, a cancel by the runner, a leaf push backing out on a claim, a detached
 thread's leaf push backing out on its old slot's claim, a detached thread's IO owner step going
-the way of any other thread). `tla/handoff/Retarget.tla` checks the waker of a
+the way of any other thread). A thread whose shard went submits what it retired to kovan before
+it parks as a spare (`wait_for_shard`): 2 more configurations, `H_flush` that must pass with
+`SpareHoldsNothing`, and the mutation that parks holding its batch, `M_spare_no_flush`, which
+breaks it. `tla/handoff/Retarget.tla` checks the waker of a
 only from pending, and the monitor never claims the old slot again), and stays out. A call may run
 a nested `block_on` on the same shard and slot (`Nested`), whose future may finish in the very poll
 that found the take: its caller looks at the take before it touches the shard

@@ -263,6 +263,8 @@ impl Monitor {
                 // spare goes.
                 return me.take_gift();
             }
+            // What this thread retired goes to reclamation before it sleeps.
+            kovan::flush_pending();
             std::thread::park();
         }
     }

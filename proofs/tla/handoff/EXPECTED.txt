@@ -119,3 +119,5 @@ MD_home_not_moved     Detached    violated:NoStrandedBound
 MD_spawn_own          Detached    violated:SpawnRuns
 WD_own_wake           Detached    violated:NoOwnWakeInWait
 M_asleep_no_flush     Asleep      violated:SleepsHoldingNothing
+H_flush               Handoff     pass
+M_spare_no_flush      Handoff     violated:SpareHoldsNothing
