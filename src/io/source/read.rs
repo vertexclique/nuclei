@@ -393,42 +393,41 @@ impl ReadState {
         if let Some(ready) = self.starved_look(io, kind) {
             return ready;
         }
-        #[cfg(target_vendor = "apple")]
-        if let Some(ready) = self.fifo_look(io, kind, len, waker, after) {
-            return ready;
-        }
         self.wait(waker, len);
         Poll::Pending
     }
 
-    /// On an Apple system, a named FIFO the side drained, which waits for an edge that will not
-    /// come for its end: once its timer fired, the driver reads again as an edge would make it,
-    /// and the next look is armed if that finds nothing (see `fifo`).
-    #[cfg(target_vendor = "apple")]
-    fn fifo_look(
+    /// A task's poll of the side, made by `step`. On an Apple system, a named FIFO's side that
+    /// waits for an edge which will not come for its end reads again once its look came due, as
+    /// an edge would make it, and a step that leaves the task waiting arms the next look for it
+    /// (see `fifo`). Elsewhere, the step alone.
+    #[cfg_attr(
+        not(target_vendor = "apple"),
+        expect(unused_variables, reason = "only Apple systems look at a FIFO")
+    )]
+    #[inline(always)]
+    pub(super) fn polled<R>(
         &mut self,
         io: Io<'_>,
         kind: Kind,
-        len: usize,
         waker: &Waker,
-        after: &mut After,
-    ) -> Option<Poll<bool>> {
-        let fd = match io.via {
-            Via::Fd(fd) => fd,
-            #[cfg(not(completion))]
-            Via::None(never, _) => match never {},
-        };
-        if !self.blocked || kind != Kind::Bytes || !self.fifo.due(fd, waker) {
-            return None;
+        step: impl FnOnce(&mut Self) -> Poll<R>,
+    ) -> Poll<R> {
+        #[cfg(target_vendor = "apple")]
+        if self.blocked && self.fifo.due() {
+            self.blocked = false;
         }
-        self.blocked = false;
-        self.complete(io, kind, len, after);
-        if self.has_result() {
-            return Some(Poll::Ready(self.eof));
+        let poll = step(self);
+        #[cfg(target_vendor = "apple")]
+        if poll.is_pending() && self.blocked && matches!(kind, Kind::Bytes | Kind::Fd) {
+            let fd = match io.via {
+                Via::Fd(fd) => fd,
+                #[cfg(not(completion))]
+                Via::None(never, _) => match never {},
+            };
+            self.fifo.hold(fd, waker);
         }
-        // Still nothing: the next look waits twice as long.
-        let _ = self.fifo.due(fd, waker);
-        None
+        poll
     }
 
     /// On a readiness driver, whether a stream socket the pool has no buffer
@@ -516,20 +515,6 @@ impl ReadState {
         let driver_out = false;
         if !self.blocked && !driver_out {
             return Poll::Ready(Ok(self.edges));
-        }
-        // A named FIFO on an Apple system: no edge says its end, so once its timer fired the
-        // caller looks again, and a read of its own finds the end (see `fifo`).
-        #[cfg(target_vendor = "apple")]
-        {
-            let fd = match io.via {
-                Via::Fd(fd) => fd,
-                #[cfg(not(completion))]
-                Via::None(never, _) => match never {},
-            };
-            if self.fifo.due(fd, waker) {
-                self.blocked = false;
-                return Poll::Ready(Ok(self.edges));
-            }
         }
         self.waiters.register(waker);
         self.complete(io, Kind::Fd, 0, after);

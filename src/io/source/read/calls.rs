@@ -86,8 +86,12 @@ impl Source {
             |cx| {
                 let cx_waker = cx.waker();
                 if let Some(io) = self.here(&self.read) {
-                    owner_poll!(self, self.read, io, cx_waker, |st, after, waker| self
-                        .read_step(st, io, waker, after, out, peek));
+                    owner_poll!(self, self.read, io, cx_waker, |st, after, waker| st.polled(
+                        io,
+                        self.kind,
+                        waker,
+                        |st| self.read_step(st, io, waker, after, out, peek)
+                    ));
                 }
                 self.poll_read_any(cx_waker, out, peek)
             },
@@ -190,7 +194,7 @@ impl Source {
                         }
                         #[cfg(not(unix))]
                         let _ = drive;
-                        step(st, io, waker(), after)
+                        st.polled(io, self.kind, waker(), |st| step(st, io, waker(), after))
                     },
                 )
             },
