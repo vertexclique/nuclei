@@ -145,6 +145,9 @@ macro_rules! mpsc_flavour {
             fn the_wait_inside_a_task_of_a_shard_ends_by_value_close_and_deadline() {
                 let rt = Builder::new().worker_threads(1).build().unwrap();
                 let (tx, mut rx) = $make;
+                // The value is sent once the task's first wait has timed out, however late the
+                // shard ran the task.
+                let (timed_out, wait_timed_out) = std::sync::mpsc::channel();
                 let task = rt.spawn(async move {
                     let t = Instant::now();
                     assert_eq!(
@@ -152,13 +155,15 @@ macro_rules! mpsc_flavour {
                         Err(RecvDeadlineError::Timeout)
                     );
                     assert!(t.elapsed() >= SHORT);
+                    timed_out.send(()).unwrap();
                     assert_eq!(rx.blocking_recv_deadline(Instant::now() + FAR), Ok(4));
                     assert_eq!(
                         rx.blocking_recv_deadline(Instant::now() + FAR),
                         Err(RecvDeadlineError::Disconnected)
                     );
                 });
-                std::thread::sleep(SHORT * 2);
+                wait_timed_out.recv().unwrap();
+                std::thread::sleep(SHORT);
                 $send(&tx, 4u32);
                 drop(tx);
                 rt.block_on(task);
