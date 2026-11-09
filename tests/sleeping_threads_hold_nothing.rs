@@ -274,3 +274,76 @@ fn an_idle_blocking_thread_holds_nothing() {
         "a value retired while a blocking thread idled was held by it"
     );
 }
+
+/// Holds both ends of a connection a shard made; its drop closes them on the thread that frees it.
+struct Connection(
+    #[allow(dead_code)] nuclei::net::TcpStream,
+    #[allow(dead_code)] nuclei::net::TcpStream,
+    Arc<AtomicUsize>,
+);
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.2.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_shard_closes_the_sockets_it_frees_before_it_sleeps() {
+    let _alone = alone();
+    // A destructor's panic is caught by kovan and only reported: the hook sees it.
+    let panicked = Arc::new(AtomicBool::new(false));
+    let previous = std::panic::take_hook();
+    {
+        let panicked = Arc::clone(&panicked);
+        std::panic::set_hook(Box::new(move |_| panicked.store(true, Ordering::SeqCst)));
+    }
+    let rt = Builder::new().worker_threads(1).build().unwrap();
+    let freed = Arc::new(AtomicUsize::new(0));
+    let retired = Arc::new(AtomicBool::new(false));
+    // Outlives the task: its own drop would flush inside the task, not before the sleep.
+    let atom = Arc::new(Atom::new(None::<Connection>));
+    // The task retires the connection and ends: the shard then sleeps, and the reclamation it
+    // runs first closes both sockets on that thread.
+    let _task = {
+        let (freed, retired, atom) = (Arc::clone(&freed), Arc::clone(&retired), Arc::clone(&atom));
+        rt.spawn(async move {
+            let listener = nuclei::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = nuclei::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            // A byte each way, so both sockets are the ring's sources when they close.
+            let mut byte = [0u8; 1];
+            nuclei::io::AsyncWriteExt::write_all(&mut client, b"x")
+                .await
+                .unwrap();
+            nuclei::io::AsyncReadExt::read_exact(&mut server, &mut byte)
+                .await
+                .unwrap();
+            atom.store(Some(Connection(client, server, freed)));
+            atom.store(None);
+            retired.store(true, Ordering::Release);
+        })
+    };
+    kovan::flush();
+    let deadline = Instant::now() + SETTLE;
+    while !retired.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "the task never ran");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let was_freed = freed_within(&freed, || {});
+    // The shard is alive and serves the next task.
+    let next = rt.block_on(rt.spawn(async { 7 }));
+    drop(std::panic::take_hook());
+    std::panic::set_hook(previous);
+    assert!(
+        was_freed,
+        "the connection a task retired was not freed by the shard that slept after it"
+    );
+    assert!(
+        !panicked.load(Ordering::SeqCst),
+        "closing a freed connection panicked on the shard that freed it before sleeping"
+    );
+    assert_eq!(next, 7);
+}

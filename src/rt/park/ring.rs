@@ -318,7 +318,6 @@ impl RingPoller {
                 .submit_or_look(self.entered_with_more)
                 .map(|e| entered = e)
         } else {
-            super::before_sleep(timeout);
             self.ring.submit_and_wait(1, timeout).map(drop)
         };
         match result {

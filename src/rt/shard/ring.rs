@@ -656,6 +656,8 @@ impl ShardRing {
         shard: Option<&Shard>,
         timeout: Option<Duration>,
     ) -> io::Result<(usize, bool)> {
+        // Before the poller is borrowed: the destructors it runs may close files, which take it.
+        crate::rt::park::before_sleep(timeout);
         self.take_back();
         let mut batch = CqeBatch::new();
         let mut woken = self.poller.borrow_mut().wait(timeout, &mut batch);

@@ -1003,6 +1003,8 @@ impl Shard {
         match &self.driver {
             #[cfg(readiness)]
             Driver::Poll(poller) => {
+                // Before the borrows: the destructors it runs may close sources, which take them.
+                crate::rt::park::before_sleep(timeout);
                 let sources = self.sources.borrow();
                 let mut events = 0;
                 poller
@@ -1019,6 +1021,8 @@ impl Shard {
             }
             #[cfg(port)]
             Driver::Poll(poller) => {
+                // Before the borrow: the destructors it runs may close sources, which take it.
+                crate::rt::park::before_sleep(timeout);
                 let mut events = 0;
                 poller.borrow_mut().wait_at_most(max, timeout, |entry| {
                     events += 1;
