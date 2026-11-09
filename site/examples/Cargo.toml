@@ -20,3 +20,11 @@ build-only = ["echo_server"]
 # A workspace of its own: the examples are checked by the site's build on Linux, apart from the
 # crate's suite on every platform.
 [workspace]
+
+# kovan 0.2.4 from its release commit until it is on crates.io, as the crate's own manifest takes
+# it; removed before this release.
+[patch.crates-io]
+kovan = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
+kovan-channel = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
+kovan-map = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
+kovan-queue = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
