@@ -42,6 +42,17 @@ pub(crate) mod iocp;
 #[cfg(windows)]
 pub(crate) use self::iocp::{Notifier, Poller};
 
+/// Submits what this thread retired to kovan just before a wait that may sleep (a zero timeout
+/// only looks), so nothing an idle shard retired waits for it to wake. A shard calls it before it
+/// borrows its poller or its sources for the wait: the destructors the submission runs may close
+/// sources, which take both. A thread that retired nothing pays nothing.
+#[inline(always)]
+pub(crate) fn before_sleep(timeout: Option<core::time::Duration>) {
+    if timeout != Some(core::time::Duration::ZERO) {
+        kovan::flush_pending();
+    }
+}
+
 #[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
 thread_local! {
     /// This thread's next notifications a test makes fail, as a failing

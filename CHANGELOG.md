@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.5.7
+
+### Added
+
+- **`blocking_recv_deadline` on the mpsc receivers and the oneshot receiver**, for a thread that
+  waits for a value until an `Instant`. `mpsc::Receiver` and `mpsc::UnboundedReceiver` return
+  `Result<T, mpsc::error::RecvDeadlineError>` (`Timeout`, or `Disconnected` once the channel is
+  closed and drained; buffered values come first). `oneshot::Receiver::blocking_recv_deadline`
+  takes `&mut self`, so a `Timeout` leaves the receiver to wait again, and returns
+  `oneshot::error::RecvDeadlineError` (`Timeout`, `Closed`). Off a shard the thread parks for the
+  time left (no polling, no fixed sleep) on the same waker and parker as `blocking_recv`, wakes at
+  once on a send or a close, polls once more after the timed park so a value that lands as the
+  deadline passes is not lost, and times out no earlier than the deadline. On a shard the wait is
+  the shard's own, with a timer.
+
+### Fixed
+
+- **A thread that sleeps no longer holds back kovan's reclamation.** With kovan 0.2.4 a thread's
+  reservation ends with its last guard, so a sleeping thread holds back nothing another thread
+  retires. What the thread itself retired still waited in its own partial batch until it pinned
+  again; each place a thread sleeps now submits it first (`kovan::flush_pending`, nothing to pay
+  when it retired nothing): a shard's wait that may sleep (io_uring, epoll, kqueue and completion
+  port), before the wait borrows the shard's poller and sources, since what the submission frees
+  may close a source; `block_on`'s park (which every blocking call uses); the blocking pool's idle
+  wait; a thread whose shard went, before it parks as a spare; the handoff monitor's bell; and the
+  wait for a port's keeper. Tests: `tests/sleeping_threads_hold_nothing.rs` (a parked shard, a
+  thread blocked in `blocking_recv`, an idle runtime and pool thread, and a shard whose freed
+  value closes its sockets as it goes to sleep), and
+  `handoff::a_thread_whose_shard_went_holds_nothing_while_it_waits_as_a_spare`.
+
+### Changed
+
+- **Requires kovan 0.2.4.** kovan 0.2.4 ends a thread's reservation at the drop of its outermost
+  guard, so an outermost pin and its drop cost two exchanges more than in 0.2.3. A call that pins
+  kovan once on a plain thread pays them: against 0.5.6, an mpsc `try_send` and `try_recv` pair
+  takes 14.6 ns instead of 9.7 ns, a `watch` borrow about 3 ns more, `broadcast::try_recv` on an
+  empty channel 8.1 ns instead of 5.3 ns. Every other benchmark (`run_loop`, `sync`, `features`)
+  is unchanged. #57 tracks taking these back below 0.5.6.
+
 ## 0.5.6
 
 ### Added

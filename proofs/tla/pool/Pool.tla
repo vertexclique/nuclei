@@ -52,7 +52,8 @@ variables
     woke = FALSE,                      \* (record) a submitter woke an idle thread
     lookFound = FALSE,                 \* (record) a thread's look after going idle found a job
     timedOut = FALSE,                  \* (record) a thread's time ran out and it left
-    reclaimed = FALSE;                 \* (record) a leaving thread took a job back
+    reclaimed = FALSE,                 \* (record) a leaving thread took a job back
+    batch = [t \in Threads |-> FALSE]; \* the thread holds retired values not submitted to kovan
 
 define
     Owners(i) == {t \in Threads : me[t] = i}
@@ -108,7 +109,9 @@ T_take:
     while queue > 0 do
         queue := queue - 1;
 T_run:
+        \* A job retires into the thread's kovan batch (every one does, the worst case).
         ran := ran + 1;
+        batch[self] := TRUE;
     end while;
 T_count:
     idle := idle + 1;
@@ -129,6 +132,10 @@ T_look_uncount:
 T_look_back:
         goto T_take;
     end if;
+T_flush:
+    \* `kovan::flush_pending()` before the keep-alive's parks: the batch submitted.
+    \* MUTATION no_flush: the thread waits holding its batch.
+    if Mutation # "no_flush" then batch[self] := FALSE; end if;
 T_wait:
     either
         await slot[me[self]] = "woken";
@@ -184,6 +191,9 @@ Bounded == threads <= Max /\ starts >= 0
 \* made and not counted out yet, one each at most.
 OneOwner == \A i \in Slots : Cardinality(Owners(i)) <= 1
 IdleCounted == idle >= 0 /\ idle <= Max + Cardinality(Submitters)
+
+\* A thread waiting for its slot holds no retired value back.
+SleepsHoldingNothing == \A t \in Threads : pc[t] = "T_wait" => ~batch[t]
 
 \* Every job pushed runs.
 AllRan == <>(ran = Total)

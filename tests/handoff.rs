@@ -628,3 +628,57 @@ fn many_blocking_receives_in_the_rest_of_a_taken_poll_outlast_the_poll_budget() 
     );
     assert_eq!(answered(&answer, "the blocking receives"), 300);
 }
+
+/// Counts its drops.
+struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_thread_whose_shard_went_holds_nothing_while_it_waits_as_a_spare() {
+    let rt = on();
+    let freed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Kept by the test: an atom dropped in the task would flush there, before the thread waits.
+    let atom = Arc::new(kovan::Atom::new(Probe(Arc::clone(&freed))));
+    // The task retires the probe into its thread's kovan batch, then blocks the thread in its
+    // poll: the shard goes to another thread, and this one waits as a spare once the poll ends.
+    let gate = Arc::new(Gate::default());
+    let task = {
+        let (held, atom) = (Arc::clone(&gate), Arc::clone(&atom));
+        let started = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&started);
+        let task = rt.spawn(async move {
+            atom.store(Probe(Arc::new(std::sync::atomic::AtomicUsize::new(0))));
+            seen.store(true, Ordering::SeqCst);
+            held.hold(false);
+            std::thread::current().id()
+        });
+        let deadline = Instant::now() + SAFETY;
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the blocking task never ran");
+            std::thread::yield_now();
+        }
+        task
+    };
+    // Runs only on the shard's new thread, the old one being held at the gate.
+    let runner = rt.block_on(rt.spawn(async { std::thread::current().id() }));
+    gate.release_after("a task of the shard");
+    let blocked = rt.block_on(task);
+    assert_ne!(blocked, runner, "the shard never went to another thread");
+    // Nothing more runs on the old thread: it waits as a spare, and frees what it retired first.
+    kovan::flush();
+    let deadline = Instant::now() + SAFETY;
+    let mut pause = Duration::from_micros(100);
+    while freed.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "a thread whose shard went held what it retired while it waited as a spare"
+        );
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(10));
+    }
+}

@@ -55,3 +55,4 @@ PF_sync                        MC_PortFile          pass
 MPF_no_wait                    MC_PortFile          violated:NoDeadWrite
 MPF_handle_wait                MC_PortFile          violated:NoDeadWrite
 WPF_pending                    MC_PortFile          violated:NoPendingWait
+MK_no_flush                    MC_PortKeep          violated:SleepsHoldingNothing

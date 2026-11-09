@@ -22,7 +22,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 JAR="$WORKDIR/tla2tools.jar"
 
 echo "Downloading tla2tools.jar (${TLA_RELEASE})..."
-curl -fsSL -o "$JAR" "$TLA_URL"
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o "$JAR" "$TLA_URL"
 
 ACTUAL_SHA256="$(sha256sum "$JAR" | cut -d' ' -f1)"
 if [ "$ACTUAL_SHA256" != "$TLA_SHA256" ]; then

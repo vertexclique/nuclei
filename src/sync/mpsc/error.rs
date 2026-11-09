@@ -110,6 +110,39 @@ impl<T> From<SendError<T>> for TrySendError<T> {
     }
 }
 
+/// Error returned by the `blocking_recv_deadline` of the receivers.
+///
+/// ```
+/// use nuclei::sync::mpsc::{self, error::RecvDeadlineError};
+/// use std::time::{Duration, Instant};
+///
+/// let (tx, mut rx) = mpsc::unbounded_channel::<u8>();
+/// let soon = Instant::now() + Duration::from_millis(10);
+/// assert_eq!(rx.blocking_recv_deadline(soon), Err(RecvDeadlineError::Timeout));
+/// drop(tx);
+/// let later = Instant::now() + Duration::from_secs(10);
+/// assert_eq!(rx.blocking_recv_deadline(later), Err(RecvDeadlineError::Disconnected));
+/// ```
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum RecvDeadlineError {
+    /// The deadline passed with the channel empty and open.
+    Timeout,
+
+    /// The channel is closed and every value it held was received.
+    Disconnected,
+}
+
+impl fmt::Display for RecvDeadlineError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RecvDeadlineError::Timeout => "timed out waiting on an empty channel".fmt(fmt),
+            RecvDeadlineError::Disconnected => "receiving on a closed channel".fmt(fmt),
+        }
+    }
+}
+
+impl Error for RecvDeadlineError {}
+
 /// Error returned by [`Sender::send_timeout`](super::Sender::send_timeout):
 /// the value was not sent, and comes back.
 #[derive(PartialEq, Eq, Clone, Copy)]

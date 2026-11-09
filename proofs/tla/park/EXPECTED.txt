@@ -31,3 +31,6 @@ WS_second_pass                 MC_ShardStop         violated:NoSecondPass
 MS_no_role                     MC_ShardStop         violated:OneTaker
 MS_no_look_again               MC_ShardStop         violated:NothingLeft
 WS_hand_back                   MC_ShardStop         violated:NoHandBack
+P_flush                        MC_Park              pass
+M_no_flush                     MC_Park              violated:SleepsHoldingNothing
+M_flush_in_wait                MC_Park              violated:NoCloseInBorrow

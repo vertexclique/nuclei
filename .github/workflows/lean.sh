@@ -20,7 +20,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 ARCHIVE="$WORKDIR/elan.tar.gz"
 
 echo "Downloading elan (${ELAN_RELEASE})..."
-curl -fsSL -o "$ARCHIVE" "$ELAN_URL"
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o "$ARCHIVE" "$ELAN_URL"
 
 ACTUAL_SHA256="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
 if [ "$ACTUAL_SHA256" != "$ELAN_SHA256" ]; then
