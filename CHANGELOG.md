@@ -21,13 +21,23 @@
   reservation ends with its last guard, so a sleeping thread holds back nothing another thread
   retires. What the thread itself retired still waited in its own partial batch until it pinned
   again; each place a thread sleeps now submits it first (`kovan::flush_pending`, nothing to pay
-  when it retired nothing): the pollers (io_uring, epoll, kqueue and completion port) right before
-  a wait that may sleep, `block_on`'s park (which every blocking call uses), the blocking pool's
-  idle wait, the handoff monitor's bell and the wait for a port's keeper.
+  when it retired nothing): a shard's wait that may sleep (io_uring, epoll, kqueue and completion
+  port), before the wait borrows the shard's poller and sources, since what the submission frees
+  may close a source; `block_on`'s park (which every blocking call uses); the blocking pool's idle
+  wait; a thread whose shard went, before it parks as a spare; the handoff monitor's bell; and the
+  wait for a port's keeper. Tests: `tests/sleeping_threads_hold_nothing.rs` (a parked shard, a
+  thread blocked in `blocking_recv`, an idle runtime and pool thread, and a shard whose freed
+  value closes its sockets as it goes to sleep), and
+  `handoff::a_thread_whose_shard_went_holds_nothing_while_it_waits_as_a_spare`.
 
 ### Changed
 
-- **Requires kovan 0.2.4.**
+- **Requires kovan 0.2.4.** kovan 0.2.4 ends a thread's reservation at the drop of its outermost
+  guard, so an outermost pin and its drop cost two exchanges more than in 0.2.3. A call that pins
+  kovan once on a plain thread pays them: against 0.5.6, an mpsc `try_send` and `try_recv` pair
+  takes 14.6 ns instead of 9.7 ns, a `watch` borrow about 3 ns more, `broadcast::try_recv` on an
+  empty channel 8.1 ns instead of 5.3 ns. Every other benchmark (`run_loop`, `sync`, `features`)
+  is unchanged. #57 tracks taking these back below 0.5.6.
 
 ## 0.5.6
 
