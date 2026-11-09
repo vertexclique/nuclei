@@ -133,10 +133,3 @@ members = [
 # Every crate of the workspace carries this one version, and they release together.
 [workspace.package]
 version = "0.5.7"
-
-# kovan 0.2.4 from its release commit until it is on crates.io; removed before this release.
-[patch.crates-io]
-kovan = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
-kovan-channel = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
-kovan-map = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
-kovan-queue = { git = "https://github.com/vertexclique/kovan", rev = "67fe623388312436a526d32116c202a731c40c0a" }
