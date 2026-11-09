@@ -86,12 +86,14 @@ impl Source {
             |cx| {
                 let cx_waker = cx.waker();
                 if let Some(io) = self.here(&self.read) {
-                    owner_poll!(self, self.read, io, cx_waker, |st, after, waker| st.polled(
-                        io,
-                        self.kind,
-                        waker,
-                        |st| self.read_step(st, io, waker, after, out, peek)
-                    ));
+                    owner_poll!(self, self.read, io, cx_waker, |st, after, waker| {
+                        #[cfg(target_vendor = "apple")]
+                        st.fifo_due();
+                        let poll = self.read_step(st, io, waker, after, out, peek);
+                        #[cfg(target_vendor = "apple")]
+                        st.fifo_hold(io, self.kind, waker, poll.is_pending());
+                        poll
+                    });
                 }
                 self.poll_read_any(cx_waker, out, peek)
             },
@@ -194,7 +196,12 @@ impl Source {
                         }
                         #[cfg(not(unix))]
                         let _ = drive;
-                        st.polled(io, self.kind, waker(), |st| step(st, io, waker(), after))
+                        #[cfg(target_vendor = "apple")]
+                        st.fifo_due();
+                        let poll = step(st, io, waker(), after);
+                        #[cfg(target_vendor = "apple")]
+                        st.fifo_hold(io, self.kind, waker(), poll.is_pending());
+                        poll
                     },
                 )
             },

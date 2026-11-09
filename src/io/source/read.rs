@@ -397,37 +397,32 @@ impl ReadState {
         Poll::Pending
     }
 
-    /// A task's poll of the side, made by `step`. On an Apple system, a named FIFO's side that
-    /// waits for an edge which will not come for its end reads again once its look came due, as
-    /// an edge would make it, and a step that leaves the task waiting arms the next look for it
-    /// (see `fifo`). Elsewhere, the step alone.
-    #[cfg_attr(
-        not(target_vendor = "apple"),
-        expect(unused_variables, reason = "only Apple systems look at a FIFO")
-    )]
+    /// Before a task's poll of the side, on an Apple system: a named FIFO's look that came due
+    /// ends the side's wait for an edge, so the poll reads again as an edge would make it (see
+    /// `fifo`).
+    #[cfg(target_vendor = "apple")]
     #[inline(always)]
-    pub(super) fn polled<R>(
-        &mut self,
-        io: Io<'_>,
-        kind: Kind,
-        waker: &Waker,
-        step: impl FnOnce(&mut Self) -> Poll<R>,
-    ) -> Poll<R> {
-        #[cfg(target_vendor = "apple")]
+    pub(super) fn fifo_due(&mut self) {
         if self.blocked && self.fifo.due() {
             self.blocked = false;
         }
-        let poll = step(self);
-        #[cfg(target_vendor = "apple")]
-        if poll.is_pending() && self.blocked && matches!(kind, Kind::Bytes | Kind::Fd) {
-            let fd = match io.via {
-                Via::Fd(fd) => fd,
-                #[cfg(not(completion))]
-                Via::None(never, _) => match never {},
-            };
-            self.fifo.hold(fd, waker);
+    }
+
+    /// After a task's poll of the side, on an Apple system, that left the task `waiting`: a named
+    /// FIFO's side that waits for an edge, which will not come for its end, arms its next look
+    /// with `waker` (see `fifo`).
+    #[cfg(target_vendor = "apple")]
+    #[inline(always)]
+    pub(super) fn fifo_hold(&mut self, io: Io<'_>, kind: Kind, waker: &Waker, waiting: bool) {
+        if !waiting || !self.blocked || !matches!(kind, Kind::Bytes | Kind::Fd) {
+            return;
         }
-        poll
+        let fd = match io.via {
+            Via::Fd(fd) => fd,
+            #[cfg(not(completion))]
+            Via::None(never, _) => match never {},
+        };
+        self.fifo.hold(fd, waker);
     }
 
     /// On a readiness driver, whether a stream socket the pool has no buffer
