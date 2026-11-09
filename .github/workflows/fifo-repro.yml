@@ -1,0 +1,30 @@
+name: fifo-repro
+on:
+  push:
+    branches: [repro/fifo]
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build the unit tests once
+        run: cargo test --lib --no-run
+      - name: run the FIFO test 2000 times, four copies at once
+        run: |
+          bin=$(cargo test --lib --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.profile.test == true and (.target.kind | index("lib"))) | .executable' | head -1)
+          run() {
+            for i in $(seq 1 500); do
+              out=$("$bin" fs::tests::a_fifo_opened_as_a_file_is_watched_by_the_poller --exact --nocapture 2>&1) \
+                || { echo "copy $1 failed on run $i"; echo "$out"; return 1; }
+            done
+          }
+          status=0
+          for c in 1 2 3 4; do run "$c" & done
+          for job in $(jobs -p); do wait "$job" || status=1; done
+          exit $status
