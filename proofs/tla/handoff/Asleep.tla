@@ -46,13 +46,16 @@ variables                                                                    \* 
     running = FALSE,     \* the worker runs the work: a poll that blocks for good
     backedOut = FALSE,   \* (record) the worker backed out of a park while the monitor slept
     mLook = FALSE,       \* (asleep_look_first) the monitor's second look, answered before its store
-    wLook = FALSE;       \* (backout_look_first) the worker's look at `asleep`, answered before its store
+    wLook = FALSE,       \* (backout_look_first) the worker's look at `asleep`, answered before its store
+    mBatch = FALSE;      \* the monitor holds retired values not submitted to kovan
 
 define                                                                       \* names the properties use:
     \* While the worker runs its blocked poll, the monitor is awake in the end.
     Watched == running ~> ~asleep                                            \* a running worker is watched
     \* Witness: a worker backs out of its park while the monitor sleeps.
     NoBackOutAsleep == ~backedOut                                            \* claims to: never
+    \* The monitor asleep holds no retired value back (`Bell::wait` flushes first).
+    SleepsHoldingNothing == pc["monitor"] = "M_sleep" => ~mBatch            \* asleep: nothing held
 end define;                                                                  \* end of the names
 
 \* A worker's ring of a monitor that sleeps (`worker_woke`): a look at `asleep` after the
@@ -110,6 +113,7 @@ fair process monitor = "monitor"                                             \* 
 begin                                                                        \* the monitor's steps:
 M_look:                                                                      \* its first look at the parks
     while TRUE do                                                            \* for as long as the runtime runs
+        mBatch := TRUE;                                                      \* its watch retires (worst case)
         if parked then                                                       \* every worker parked:
 M_say:                                                                       \* it says it sleeps
             \* MUTATION asleep_look_first: the second look is answered before the store of `asleep`
@@ -126,6 +130,9 @@ M_again:                                                                     \* 
             \* MUTATION no_second_look: the monitor sleeps on its first look.
             if (IF Mutation = "asleep_look_first" THEN mLook ELSE parked)    \* still parked (as it looked):
                \/ Mutation = "no_second_look" then                           \* or the mutation
+M_flush:                                                                     \* `Bell::wait`: kovan::flush_pending
+                \* MUTATION no_flush: the monitor sleeps holding its batch.
+                if Mutation # "no_flush" then mBatch := FALSE; end if;       \* the batch submitted
 M_sleep:                                                                     \* it sleeps
                 await rung;                                                  \* until a worker rings
                 rung := FALSE;                                               \* the ring is spent

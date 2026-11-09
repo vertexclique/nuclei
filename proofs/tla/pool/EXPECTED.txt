@@ -35,3 +35,4 @@ MS_hook_unwinds                Start                violated:AllRan
 MS_name_unwinds                Start                violated:AllRan
 WS_inline                      Start                violated:NoInline
 WS_caught                      Start                violated:NoCaught
+MO_no_flush                    MC_Pool              violated:SleepsHoldingNothing

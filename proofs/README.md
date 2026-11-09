@@ -430,18 +430,27 @@ notified. A
 thread that gives it work pushes the work, then looks whether the shard parks; if it does, it
 swaps the flag back and notifies, so only the first of a burst of wakes notifies. Every access
 of the pair is sequentially consistent, so whichever publication comes second, the look after
-it sees the other: the shard finds the work, or the waker finds the shard parked.
+it sees the other: the shard finds the work, or the waker finds the shard parked. A wait that may
+sleep first submits what the shard's tasks retired to kovan (`before_sleep` in
+`src/rt/park/mod.rs`, at the start of `ShardRing::wait` and of `poll_io`'s poller arms), so a
+sleeping shard holds nothing back, and before the wait borrows the poller and the sources: what
+the submission frees may close a source, which takes both.
 
-The family checks 32 configurations. `Park.tla`: 9 that must pass (one waker, three wakers
+The family checks 35 configurations. `Park.tla`: 10 that must pass (one waker, three wakers
 racing, liveness under weak fairness, a timer of the shard's own, its liveness, a
 `Proactor::wake` that ends a `Proactor::wait` wherever it lands, a ring whose submission queue
 is full and its liveness, and two wakers whose first two notifications fail, which the waker
-that took the flag back tries again), 8 mutations (the shard sleeping without its look after
+that took the flag back tries again, and every run retiring into the shard's batch whose frees
+close a source, with `SleepsHoldingNothing` and `NoCloseInBorrow`), 10 mutations (the shard
+sleeping without its look after
 publishing; a waker looking before it pushes; the drive waiting on the poller after a timer it
 fired; a `Proactor::wake` that notifies only a shard that parks already; a `Proactor::wait`
 made inside a task or a `block_on` that `WAITING` does not hold, `unregistered_wait`; a failed
 notification dropped, `notify_swallowed`: these deadlock; and the two enters that leave the
-wake's read out behind a full queue, which break `SleepSeesWake`), and 5 witnesses (a
+wake's read out behind a full queue, which break `SleepSeesWake`; the shard sleeping holding its
+batch, `no_flush`, which breaks `SleepsHoldingNothing`; the submission run inside the poller's
+wait, `flush_in_wait`, as before 0.5.7's fix, whose destructor finds the poller borrowed and
+breaks `NoCloseInBorrow`), and 5 witnesses (a
 notification, a look that finds the work, a notification that lands while the shard is awake,
 a timer fired on the way to park, the future's timer fired with the wake's read out). `ShardStop.tla` checks a shard that stops while other threads push to it: a pusher
 that sees the shard stopped drops what its inbox holds, and the stopping shard drains pass
@@ -490,11 +499,14 @@ atomic access. A submitter pushes its job (into the inbox's queue, checked in `i
 if the idle count says a thread waits, claims an idle slot and wakes its thread, else starts a
 thread while the pool has room. A thread with nothing to take counts itself idle, marks its
 slot idle and looks at the queue once more; at its keep-alive it frees its slot, leaves the
-thread count and looks once more, taking back a job no thread was started for. 9
-configurations: 3 that must pass (two submitters and two threads that may time out, with
-`RunOnce`, `Bounded`, `OneOwner` and `IdleCounted`, the idle count never below zero; liveness
-there and with one thread), 2 mutations that break `AllRan` (a thread that waits without the
-look after going idle, a leaving thread without its last look), and 4 witnesses (a wake, a look
+thread count and looks once more, taking back a job no thread was started for. Before it waits
+for its slot it submits what its jobs retired to kovan, so a waiting thread holds nothing back.
+10 configurations: 3 that must pass (two submitters and two threads that may time out, with
+`RunOnce`, `Bounded`, `OneOwner` and `IdleCounted`, the idle count never below zero, and
+`SleepsHoldingNothing`; liveness there and with one thread), 3 mutations (2 that break `AllRan`:
+a thread that waits without the look after going idle, a leaving thread without its last look;
+a thread that waits holding its batch, `no_flush`, breaks `SleepsHoldingNothing`), and 4
+witnesses (a wake, a look
 that finds a job, a time-out, a job taken back). The unit tests in `src/rt/blocking.rs` run a
 submit landing as the only thread goes idle (the first mutation fails it) and submitters on
 threads against threads that keep timing out.
@@ -2228,9 +2240,12 @@ again; the shard calls off a keeper that has not started, and stops and waits fo
 keeps, so one thread at most drains the port. A source's registration on another port waits
 while its handle has operations out (Windows cannot move it then) and is made again as the
 last one ends: the registration raises a flag and looks at the count again, the last
-completion lowers the count and looks at the flag. 13 configurations: 3 that must pass (one
-drainer and no failed registration, every packet delivered and the source registered,
-whether the shard runs again or not), 6 mutations (no keeper and no wait for the evictions
+completion lowers the count and looks at the flag. A shard that stops its keeper submits what it
+retired to kovan before it parks until the keeper is done. 14 configurations: 3 that must pass
+(one drainer, no failed registration and the parked shard holding nothing back,
+`SleepsHoldingNothing`; every packet delivered and the source registered, whether the shard runs
+again or not), 7 mutations (the shard parking holding its batch, `no_flush`, breaks
+`SleepsHoldingNothing`; no keeper and no wait for the evictions
 strand packets, `AllDelivered`; no wait for the keeper and a keeper that ignores being called
 off break `OneDrainer`; no look at the count after the flag breaks `Registers`; a bind failure
 that fails the registration breaks `NoFailure`), and 4 witnesses. With `Duplex` the operation out is a TCP
@@ -3082,8 +3097,11 @@ monitor sleeps while every worker is parked (`run` in `src/rt/handoff/monitor.rs
 worker wakes it (`Shard::begin_park` in `src/rt/shard/run.rs`): the monitor says it sleeps and
 looks at the parks again, a worker says it parks and looks for work again, and a worker whose park
 ends or that backs out of it rings a monitor that sleeps. Each side stores, fences, then looks at
-what the other stored. 7 configurations: 1 that must pass (a running worker is watched in the end,
-`Watched`); 5 mutations (the back-out ringing nobody, as before the fix: the monitor's looks fall
+what the other stored. Before it sleeps the monitor submits what its watch retired to kovan
+(`Bell::wait`). 8 configurations: 1 that must pass (a running worker is watched in the end,
+`Watched`, and the monitor asleep holds nothing back, `SleepsHoldingNothing`); 6 mutations (the
+monitor sleeping holding its batch, `no_flush`, breaks `SleepsHoldingNothing`; the back-out
+ringing nobody, as before the fix: the monitor's looks fall
 in the moment the worker said it parks, it sleeps, and a poll that blocks is never handed on; a
 park's end ringing nobody; the monitor sleeping on its first look; the monitor's second look
 answered before its store of `asleep` reaches memory, and the back-out's look at `asleep` answered
@@ -3705,7 +3723,14 @@ Each family below has GREEN configurations and a RED one per guard, listed in it
   the rest after a waker panics; `Waiter.tla`'s cancel no longer takes an owed mark back, as
   `Wait::cancel` never does.
 - **`tla/blocking`**: a blocking wait's park loop on a plain thread, and wasm32's error for a
-  wait that would park its only thread.
+  wait that would park its only thread. Before each park the thread submits what its polls
+  retired to kovan (`SleepsHoldingNothing`, mutation `no_flush`). The deadline wait under every
+  `blocking_recv_deadline` (`block_on_until`) answers None only past the deadline (`NeverEarly`,
+  mutation `early_timeout`) and only right after a poll that followed the last park
+  (`FinalPoll`, mutation `no_final_poll`); `lean/Nuclei/Deadline.lean` proves its decision after
+  a pending poll: a timeout never before the deadline (`timeout_not_early`), a park that lasts
+  more than nothing and ends at the deadline at the latest (`park_within`), a park before it
+  (`parks_before`). 9 configurations: 4 that must pass, 5 mutations.
 - **`tla/wheel`**: the timer wheel as a data structure, shrunk to two slots and two levels:
   placement, the advance and its cascade, the span's edge, and keys whose generation keeps a
   stale removal off the entry's next timer (the generation is unbounded here: its `u32` wrap is

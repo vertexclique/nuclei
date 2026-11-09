@@ -118,3 +118,4 @@ MD_park_no_own_shard  Detached    violated:WaitsEnd
 MD_home_not_moved     Detached    violated:NoStrandedBound
 MD_spawn_own          Detached    violated:SpawnRuns
 WD_own_wake           Detached    violated:NoOwnWakeInWait
+M_asleep_no_flush     Asleep      violated:SleepsHoldingNothing

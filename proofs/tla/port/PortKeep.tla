@@ -77,7 +77,8 @@ variables
     readIn = 0,           \* (Duplex) the task's read the kernel holds, on the old port
     readQueued = 0,       \* (Duplex) its packet on the old port, not dequeued
     readsDone = 0,        \* (Duplex) the task's reads that completed
-    same = FALSE;         \* the registration is with the shard whose port the handle is bound to
+    same = FALSE,         \* the registration is with the shard whose port the handle is bound to
+    sBatch = FALSE;       \* the shard's thread holds retired values not submitted to kovan
 
 define
     \* The source's operations not delivered: the port's count, and the source's.
@@ -155,6 +156,9 @@ end process;
 
 fair process shard = "shard"
 begin
+S_ran:
+    \* The shard's runs retire into its kovan batch (every one does, the worst case).
+    sBatch := TRUE;
 S_ready:
     \* What the port has ready now is delivered here.
     while queued + readQueued > 0 do
@@ -193,6 +197,9 @@ S_stop:
         kstate := "stopping";
         wakes := wakes + 1;
         stopped := TRUE;
+        \* `kovan::flush_pending()` before the shard parks until the keeper is done.
+        \* MUTATION no_flush: the shard waits holding its batch.
+        if Mutation # "no_flush" then sBatch := FALSE; end if;
     end if;
 S_wait:
     \* MUTATION no_wait: the shard drains its port while the keeper may.
@@ -346,6 +353,9 @@ OneDrainer == ~(running /\ kstate \in {"keeping", "stopping"})
 
 \* A registration never fails for operations that were still out.
 NoFailure == ~failed
+
+\* The shard parked until its keeper is done holds no retired value back.
+SleepsHoldingNothing == (pc["shard"] = "S_wait" /\ kstate = "stopping") => ~sBatch
 
 \* Every operation's packet is delivered, whether the shard runs again or
 \* not: from some point on none is left out.

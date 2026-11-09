@@ -247,6 +247,9 @@ open Nuclei.FairSemaphore
 
 -- The precise sleep's rounding: never early, on either wheel; at most a microsecond late; exact
 -- on the microsecond grid; the published time within a microsecond of the deadline.
+#print axioms Nuclei.Deadline.timeout_not_early
+#print axioms Nuclei.Deadline.park_within
+#print axioms Nuclei.Deadline.parks_before
 #print axioms Nuclei.Precise.never_early
 #print axioms Nuclei.Precise.never_early_on_the_tick
 #print axioms Nuclei.Precise.at_most_a_microsecond_late

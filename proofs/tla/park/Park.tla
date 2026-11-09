@@ -57,6 +57,16 @@
 (* notification, or any thread's, ended nothing (src/rt/shard/ring/       *)
 (* tests_cap.rs hung in CI). Abstract: the kernel takes every entry it is *)
 (* handed; where it takes not all, the code's wait only looks instead.    *)
+(*                                                                          *)
+(* The shard's tasks retire into the thread's kovan batch (a channel's     *)
+(* send or receive, a map's write). A wait that may sleep submits that     *)
+(* batch first (src/rt/park/mod.rs `before_sleep`, called at the start of *)
+(* `ShardRing::wait` and of `poll_io`'s poller arms in src/rt/shard.rs),   *)
+(* so a sleeping shard holds nothing back. What the submission frees runs  *)
+(* its destructors there, and a destructor that closes a source takes the *)
+(* shard's poller and sources: the submission comes before the wait        *)
+(* borrows them, so no destructor finds them borrowed (a borrowed          *)
+(* `RefCell` panics, twice in one drop aborts).                            *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -70,6 +80,8 @@ CONSTANTS
     FullQueue, \* TRUE: the shard's operations fill its ring's submission queue before it
                \* parks, so the wake's read waits behind them, outside the kernel
     NotifyFails, \* how many notifications' kernel calls fail, in all
+    Retires,   \* TRUE: the shard's runs retire into its kovan batch, and what that frees closes
+               \* a source
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The shard's thread number: no waker uses it.
@@ -99,7 +111,10 @@ variables
     futureWoken = FALSE, \* the future's signal says it was woken, so the loop polls it
     wakeIn = ~FullQueue, \* the wake's read is in the kernel, where a notification ends a wait
     failed = 0,        \* notifications whose kernel call failed so far
-    outFired = FALSE;  \* (record) the drive fired the future's timer while the wake's read was out
+    outFired = FALSE,  \* (record) the drive fired the future's timer while the wake's read was out
+    batch = FALSE,     \* the shard's thread holds retired values not submitted to kovan
+    borrowed = FALSE,  \* the wait borrows the shard's poller (and, on a readiness poller, its sources)
+    closedInBorrow = FALSE; \* (record) a destructor took the poller while the wait borrowed it
 
 define
     \* Every waker is done.
@@ -115,9 +130,11 @@ S_run:
     if inbox > 0 then
         inbox := inbox - 1;
         consumed := consumed + 1;
+        if Retires then batch := TRUE; end if;
         goto S_run;
     elsif local > 0 then
         local := local - 1;
+        if Retires then batch := TRUE; end if;
         goto S_run;
     elsif futureWoken then
         \* The future's signal says it was woken: the loop polls it, and it finishes.
@@ -174,18 +191,35 @@ S_check:
         parked := FALSE;
         goto S_run;
     end if;
+S_flush:
+    \* `before_sleep`: the batch submitted before the wait borrows the poller; what that frees
+    \* closes a source, which takes the poller.
+    \* MUTATION no_flush: the shard sleeps holding its batch.
+    \* MUTATION flush_in_wait: the submission runs inside the poller's wait (the poller
+    \* borrowed), as it did before 0.5.7's fix.
+    if batch /\ Mutation \notin {"no_flush", "flush_in_wait"} then
+        if borrowed then closedInBorrow := TRUE; end if;
+        batch := FALSE;
+    end if;
 S_submit:
-    \* The wait that may sleep hands the kernel every entry first, the wake's read among them.
+    \* The poller borrowed for its wait, which may sleep: it hands the kernel every entry first,
+    \* the wake's read among them.
     \* MUTATION no_submit_first: the enter hands the kernel only what the submission queue
     \* holds, so behind a full queue the wake's read stays out while the shard sleeps.
+    borrowed := TRUE;
     if Mutation # "no_submit_first" then
         wakeIn := TRUE;
+    end if;
+    if batch /\ Mutation = "flush_in_wait" then
+        closedInBorrow := TRUE;
+        batch := FALSE;
     end if;
 S_sleep:
     \* The poller's wait: until a notification the wake's read sees, the deadline of a timer
     \* still in the wheel, or (the model's end) until every waker is done and all the work ran.
     await (pending /\ wakeIn) \/ (timerArmed /\ timerDue) \/ (futureArmed /\ futureDue)
           \/ (WakersDone /\ AllRan /\ ~ProactorWake);
+    borrowed := FALSE;
     if pending /\ wakeIn then
         pending := FALSE;
         parked := FALSE;                    \* `end_park`
@@ -303,8 +337,15 @@ OneNotifyPerPark == notifies <= Total
 \* otherwise only an operation's completion could end the wait, and an idle peer sends none.
 SleepSeesWake == (pc[ShardT] = "S_sleep" /\ pending) => wakeIn
 
+\* A shard asleep holds no retired value back.
+SleepsHoldingNothing == pc[ShardT] = "S_sleep" => ~batch
+
+\* No destructor the submission runs takes the poller while the wait borrows it.
+NoCloseInBorrow == ~closedInBorrow
+
 \* All the safety properties together.
-Safe == ConsumedOnce /\ OneNotifyPerPark /\ SleepSeesWake
+Safe == ConsumedOnce /\ OneNotifyPerPark /\ SleepSeesWake /\ SleepsHoldingNothing
+        /\ NoCloseInBorrow
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)
