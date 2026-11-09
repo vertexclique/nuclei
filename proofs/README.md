@@ -2955,6 +2955,23 @@ the queue breaks `InOrder`); and 3 witnesses (a pass stopped at a push still wri
 direct arrival behind queued ones, a count below zero with a drainer). TLA+ is sequentially consistent: the count's Release and
 Acquire are what make a counted cell written for the consumer that read the count.
 
+## A FIFO's end on Apple systems
+
+`lean/Nuclei/FifoLook.lean` checks the timer a read side of a named FIFO gets on an Apple system
+(`src/io/source/read/fifo.rs`, issue #58), where kqueue never reports that the writer closed once
+the reader drained the FIFO, so a side that waits for its next edge also looks again on a timer:
+1 ms after it blocked, twice as long after each look that finds nothing, never more than 64 ms.
+It proves that every wait is at least 1 ms, so the side never spins (`wait_pos`), and at most
+64 ms (`wait_le`); that two looks in a row are 1 to 64 ms apart (`look_gap`); and that whenever
+the end comes, some look comes at or after it and no later than 64 ms after it
+(`end_found_within`). The model counts whole milliseconds from the moment the side blocked, a
+timer that fires at its deadline, and a look that sees what is there; an edge in between starts
+the waits again at 1 ms, which only brings looks sooner. The tests close the writer 100 ms after
+its write, once the reader drained the FIFO and waits, for a `File`
+(`fs::tests::a_fifo_read_to_its_end_sees_a_close_that_came_after_the_reader_drained_it`) and for
+a pipe receiver's reads and its own calls (`net::unix::pipe::tests`); on macOS each waited for
+good before the fix.
+
 ## A ring's overflow count
 
 `lean/Nuclei/Overflow.lean` checks how a ring's poller counts completion-queue overflows for

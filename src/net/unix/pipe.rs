@@ -151,6 +151,61 @@ mod tests {
         });
     }
 
+    /// A writer that writes, then closes only after the receiver drained the FIFO and waits:
+    /// on macOS kqueue never says that close (issue #58).
+    fn write_then_close_late(path: &std::path::Path) -> std::thread::JoinHandle<()> {
+        let mut w = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        std::thread::spawn(move || {
+            std::io::Write::write_all(&mut w, b"bytes").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(w);
+        })
+    }
+
+    #[test]
+    fn a_fifo_receiver_reads_to_an_end_that_came_after_it_drained_it() {
+        let path = fifo("late-close-read");
+        crate::block_on(async {
+            let mut rx = OpenOptions::new().open_receiver(&path).unwrap();
+            let writer = write_then_close_late(&path);
+            let mut got = Vec::new();
+            crate::time::timeout(std::time::Duration::from_secs(10), rx.read_to_end(&mut got))
+                .await
+                .expect("the receiver never saw the end")
+                .unwrap();
+            assert_eq!(got, b"bytes");
+            writer.join().unwrap();
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_fifo_receivers_own_reads_find_an_end_that_came_after_it_drained_it() {
+        let path = fifo("late-close-try");
+        crate::block_on(async {
+            let rx = OpenOptions::new().open_receiver(&path).unwrap();
+            let writer = write_then_close_late(&path);
+            let got = crate::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut got = Vec::new();
+                let mut buf = [0u8; 16];
+                loop {
+                    rx.readable().await.unwrap();
+                    match rx.try_read(&mut buf) {
+                        Ok(0) => return got,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(err) => panic!("{err}"),
+                    }
+                }
+            })
+            .await
+            .expect("the receiver's own reads never found the end");
+            assert_eq!(got, b"bytes");
+            writer.join().unwrap();
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_fifo_opens_by_path_and_is_checked() {
         let path = fifo("checked");

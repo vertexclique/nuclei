@@ -116,6 +116,10 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Handoff.four_is_five_reads
 #print axioms Nuclei.Handoff.ran_four_ticks
 #print axioms Nuclei.Handoff.began_after
+#print axioms Nuclei.FifoLook.wait_pos
+#print axioms Nuclei.FifoLook.wait_le
+#print axioms Nuclei.FifoLook.look_gap
+#print axioms Nuclei.FifoLook.end_found_within
 #print axioms Nuclei.Overflow.stutter
 #print axioms Nuclei.Overflow.at_most_seen
 #print axioms Nuclei.Overflow.counted_after_clear
