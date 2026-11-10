@@ -59,10 +59,10 @@ io-stats = []
 nuclei-macros = { version = "0.5.8", path = "nuclei-macros", optional = true }
 futures-io = "0.3"
 futures-core = { version = "0.3", default-features = false }
-kovan = "0.2.4"
-kovan-channel = "0.2.4"
-kovan-map = "0.2.4"
-kovan-queue = "0.2.4"
+kovan = "0.2.5"
+kovan-channel = "0.2.5"
+kovan-map = "0.2.5"
+kovan-queue = "0.2.5"
 log = "0.4"
 
 [target.'cfg(target_family = "unix")'.dependencies]
@@ -77,7 +77,7 @@ loom = "0.7"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 # tests/steady.rs reclaims what the test thread retired before it measures.
-kovan = "0.2.4"
+kovan = "0.2.5"
 proptest = "1"
 
 # `#[nuclei::main]` run as a program of its own.

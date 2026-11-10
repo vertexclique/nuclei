@@ -18,6 +18,17 @@
   `try_read`. An anonymous pipe, whose end kqueue does report, is left as it was; other systems
   are unchanged. The waits' bounds are proved in `proofs/lean/Nuclei/FifoLook.lean`; the tests
   close the writer 100 ms after its write, once the reader waits.
+- **Requires kovan 0.2.5, which orders a reader's reads before the free of what it read.** kovan
+  0.2.4's reclamation rested on memory orderings that Rust's memory model does not give: a retire's
+  scan could skip a thread's slot with nothing ordering that thread's reads of a value before the
+  value's free. Miri reports it as a data race between a read under a guard and the free, and
+  kovan's model of ARM's load buffering reads freed memory in two of the cases; on x86-64 the
+  hardware's own ordering kept 0.2.4 from it. kovan 0.2.5 fixes five such orderings (the leave's
+  tag, the protected load, the thread count a scan reads, the next pin's store after an escalated
+  load, and the fence of a pin answered by a helper), with no instruction added on x86-64's pin,
+  load and drop paths. Everything nuclei keeps in kovan (the channels, the maps, the queues, the
+  values behind `watch`) is read through those paths. No public API of nuclei or of kovan changed.
+  Tests: kovan's `tests/atom_reader_reclaim.rs`, which Miri runs over 16 seeds.
 
 ## 0.5.7
 
