@@ -335,6 +335,38 @@ fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
     });
 }
 
+/// The writer closes only after the reader drained the FIFO and waits: on macOS kqueue never
+/// says that close, and the read to the end waited for good (issue #58).
+#[cfg(unix)]
+#[test]
+fn a_fifo_read_to_its_end_sees_a_close_that_came_after_the_reader_drained_it() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let rt = runtime();
+    let tmp = Temp::new("fifo-late-close");
+    let path = tmp.file("pipe");
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a plain syscall with our own path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .unwrap();
+    let mut w = OpenOptions::new().write(true).open(&path).unwrap();
+    rt.block_on(async {
+        let mut reader = Handle::new(reader).unwrap();
+        let writer = std::thread::spawn(move || {
+            w.write_all(b"through the fifo").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            drop(w);
+        });
+        let got = within(read_to_end(&mut reader)).await.unwrap();
+        assert_eq!(got, b"through the fifo");
+        writer.join().unwrap();
+    });
+}
+
 mod allocate;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod cached;

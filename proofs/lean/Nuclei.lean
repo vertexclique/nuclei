@@ -7,6 +7,7 @@ import Nuclei.Deadline
 import Nuclei.FairSemaphore.Model
 import Nuclei.FairSemaphore.Invariant
 import Nuclei.FairSemaphore.Theorems
+import Nuclei.FifoLook
 import Nuclei.Files
 import Nuclei.Fill
 import Nuclei.Handoff

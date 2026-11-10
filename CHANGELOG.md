@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.8
+
+### Fixed
+
+- **A FIFO read to its end on macOS no longer waits for good** (issue #58). kqueue never reports
+  that a named FIFO's writer closed once its reader drained it: XNU's FIFO read filter fires only
+  while bytes are there and never sets `EV_EOF` (Go keeps FIFOs out of kqueue on darwin for it,
+  golang/go#24164). A read whose last call drained the FIFO before the writer closed waited for
+  an edge that never came; it showed as a rare hang of
+  `fs::tests::a_fifo_opened_as_a_file_is_watched_by_the_poller` and, with a writer that waits
+  before it closes, a hang every time. On Apple systems a read side of a named FIFO that waits
+  for its next edge now also looks again on a timer: 1 ms after it blocked, twice as long after
+  each look that finds nothing, up to 64 ms, and from 1 ms again once an edge brings bytes. Bytes
+  still come at the edge; the end is seen at most 64 ms after it came. This covers a `File` on a
+  FIFO, a pipe `Receiver` opened from one, and a caller's own reads through `readable` and
+  `try_read`. An anonymous pipe, whose end kqueue does report, is left as it was; other systems
+  are unchanged. The waits' bounds are proved in `proofs/lean/Nuclei/FifoLook.lean`; the tests
+  close the writer 100 ms after its write, once the reader waits.
+- **Requires kovan 0.2.5, which orders a reader's reads before the free of what it read.** kovan
+  0.2.4's reclamation rested on memory orderings that Rust's memory model does not give: a retire's
+  scan could skip a thread's slot with nothing ordering that thread's reads of a value before the
+  value's free. Miri reports it as a data race between a read under a guard and the free, and
+  kovan's model of ARM's load buffering reads freed memory in two of the cases; on x86-64 the
+  hardware's own ordering kept 0.2.4 from it. kovan 0.2.5 fixes five such orderings (the leave's
+  tag, the protected load, the thread count a scan reads, the next pin's store after an escalated
+  load, and the fence of a pin answered by a helper), with no instruction added on x86-64's pin,
+  load and drop paths. Everything nuclei keeps in kovan (the channels, the maps, the queues, the
+  values behind `watch`) is read through those paths. No public API of nuclei or of kovan changed.
+  Tests: kovan's `tests/atom_reader_reclaim.rs`, which Miri runs over 16 seeds.
+
 ## 0.5.7
 
 ### Added

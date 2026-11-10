@@ -49,6 +49,8 @@ mod calls;
 mod datagram;
 #[cfg(unix)]
 mod direct;
+#[cfg(target_vendor = "apple")]
+mod fifo;
 #[cfg(completion)]
 mod ops;
 
@@ -233,6 +235,10 @@ pub(super) struct ReadState {
     /// it may be ready.
     #[cfg(unix)]
     user_fd: bool,
+    /// On Apple systems, the side's looks at a named FIFO whose end kqueue never says (see
+    /// `fifo`).
+    #[cfg(target_vendor = "apple")]
+    fifo: fifo::FifoLook,
     /// The operation out is the caller's poll.
     #[cfg(ring)]
     polling: bool,
@@ -391,6 +397,34 @@ impl ReadState {
         Poll::Pending
     }
 
+    /// Before a task's poll of the side, on an Apple system: a named FIFO's look that came due
+    /// ends the side's wait for an edge, so the poll reads again as an edge would make it (see
+    /// `fifo`).
+    #[cfg(target_vendor = "apple")]
+    #[inline(always)]
+    pub(super) fn fifo_due(&mut self) {
+        if self.blocked && self.fifo.due() {
+            self.blocked = false;
+        }
+    }
+
+    /// After a task's poll of the side, on an Apple system, that left the task `waiting`: a named
+    /// FIFO's side that waits for an edge, which will not come for its end, arms its next look
+    /// with `waker` (see `fifo`).
+    #[cfg(target_vendor = "apple")]
+    #[inline(always)]
+    pub(super) fn fifo_hold(&mut self, io: Io<'_>, kind: Kind, waker: &Waker, waiting: bool) {
+        if !waiting || !self.blocked || !matches!(kind, Kind::Bytes | Kind::Fd) {
+            return;
+        }
+        let fd = match io.via {
+            Via::Fd(fd) => fd,
+            #[cfg(not(completion))]
+            Via::None(never, _) => match never {},
+        };
+        self.fifo.hold(fd, waker);
+    }
+
     /// On a readiness driver, whether a stream socket the pool has no buffer
     /// for may be read now, by a peek at one byte straight from it that takes
     /// nothing: its task's read goes straight into its own buffer
@@ -522,6 +556,8 @@ impl ReadState {
         if edge {
             self.blocked = false;
             self.edges = self.edges.wrapping_add(1);
+            #[cfg(target_vendor = "apple")]
+            self.fifo.settle();
             if self.user_fd {
                 after.wake(&mut self.waiters);
                 return;
