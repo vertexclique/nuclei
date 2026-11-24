@@ -322,7 +322,7 @@ pub(crate) fn with_room<T>(
     }
 }
 
-#[cfg(all(test, ring, target_os = "linux"))]
+#[cfg(all(test, ring, any(target_os = "linux", target_os = "android")))]
 mod tests_refused;
 
 #[cfg(test)]

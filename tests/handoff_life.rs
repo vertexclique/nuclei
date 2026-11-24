@@ -7,6 +7,10 @@
 //! stats count the handoff, and each wait has a deadline far past anything a working runtime
 //! needs.
 
+// Clippy asks for `const` on every thread-local of an Android build, those
+// already written `const { .. }` included (see the crate root).
+#![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
+
 use core::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

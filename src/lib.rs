@@ -75,6 +75,10 @@
 // A model-checking build (`--cfg loom`) compiles the loom models and leaves
 // the ordinary tests out, so the helpers only those tests use go unused.
 #![cfg_attr(all(loom, test), allow(dead_code, unused_imports))]
+// Clippy asks for `const` on every thread-local of an Android build, those
+// already written `const { .. }` included (its check reads the macro's
+// expansion, which Android's std does not shape like the others').
+#![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
 // No unwrap, expect or panic outside a documented contract, each marked
 // where it is; every unsafe block names what it rests on. Tests and the
 // model-checking build may assert.

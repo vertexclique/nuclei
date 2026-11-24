@@ -76,7 +76,7 @@ fn a_range_sync_reports_a_failed_write() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_failed_sync_fails_a_range_sync_too_without_a_call() {
     let rt = super::durable::one_blocking_thread_kept();
@@ -100,7 +100,7 @@ fn a_failed_sync_fails_a_range_sync_too_without_a_call() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_stream_gets_the_kernels_error_from_a_range_sync() {
     use std::os::fd::OwnedFd;

@@ -154,7 +154,12 @@ fn two_tasks_writing_at_once_each_get_their_own_answer() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+))]
 #[test]
 fn the_sync_flags_are_read_from_the_descriptor() {
     let rt = runtime();

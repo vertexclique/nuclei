@@ -51,7 +51,11 @@ pub(crate) fn alone_with(name: &str, vars: &[(&str, &std::ffi::OsStr)]) -> bool 
         .unwrap()
         .read_to_string(&mut out)
         .unwrap();
-    assert!(status.success(), "{name} failed in its own process:\n{out}");
+    // The status names the signal of a process a seccomp filter ended (`signal: 31 (SIGSYS)`).
+    assert!(
+        status.success(),
+        "{name} failed in its own process ({status}):\n{out}"
+    );
     assert!(
         out.contains("test result: ok. 1 passed"),
         "{name} did not run in its own process:\n{out}"
