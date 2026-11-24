@@ -2,9 +2,11 @@ name: Android
 
 # nuclei on Android. `lint` clippy-checks the crate for both Android targets and builds the arm64
 # test binaries without running them: GitHub's runners cannot run an arm64 Android emulator, so
-# arm64 is linted and linked here, not run. `emulator` runs the whole suite on an x86_64 Android
-# emulator (`android.sh`). A process started by `adb shell` does not carry the app seccomp filter,
-# so `the_runtime_makes_no_call_an_app_filter_traps` installs the filter's refusals itself.
+# arm64 is linted and linked here, not run. `emulator` runs, on an x86_64 Android emulator
+# (`android.sh`), the tests of the system call filter Android puts on an app: the io_uring probe's
+# and `the_runtime_makes_no_call_an_app_filter_traps`, which installs the filter's refusals itself
+# (a process started by `adb shell` does not carry the filter). The rest of the suite is built for
+# Android here and not run on it yet (`android.sh` says why).
 
 on: [push, pull_request]
 
@@ -35,9 +37,9 @@ jobs:
         run: .github/workflows/android.sh build aarch64-linux-android
 
   emulator:
-    name: x86_64 emulator (API 34)
+    name: the app filter tests on an x86_64 emulator (API 34)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -53,11 +55,11 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       # Built before the emulator starts, which then has the runner's cores to itself.
-      - name: build the x86_64 test binaries
-        run: .github/workflows/android.sh build x86_64-linux-android
+      - name: build the x86_64 test binary
+        run: .github/workflows/android.sh build x86_64-linux-android --lib
 
       # The action runs each `script` line in its own shell, so the work is one script.
-      - name: the suite on the emulator
+      - name: the app filter tests on the emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 34
