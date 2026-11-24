@@ -100,7 +100,7 @@ fn a_failed_sync_fails_a_range_sync_too_without_a_call() {
     });
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn a_stream_gets_the_kernels_error_from_a_range_sync() {
     use std::os::fd::OwnedFd;

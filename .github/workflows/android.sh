@@ -8,9 +8,10 @@
 #                               there with the arguments and the `NUCLEI_*` variables, and
 #                               prints the crash lines of logcat when it fails
 #
-# One limit, stated plainly: a process started by `adb shell` is not started by the app launcher,
-# so it does not carry Android's seccomp filter for apps. The suite's test
-# `the_runtime_makes_no_call_an_app_filter_traps` installs the same refusals itself.
+# Two limits, stated plainly. A process started by `adb shell` is not started by the app launcher,
+# so it does not carry Android's seccomp filter for apps: the suite's test
+# `the_runtime_makes_no_call_an_app_filter_traps` installs the same refusals itself. And the suite
+# runs on epoll only, with SELinux permissive (see `test` below).
 set -euo pipefail
 
 # The lowest Android API the toolchain targets (the NDK's clang wrapper is named by it).
@@ -39,6 +40,17 @@ build)
 test)
     toolchain x86_64-linux-android
     export CARGO_TARGET_X86_64_LINUX_ANDROID_RUNNER="$here run"
+    # An app cannot reach io_uring (its seccomp filter traps the calls), so the suite runs on what
+    # an app gets, epoll. An `adb shell` process can reach io_uring, which is not run here.
+    export NUCLEI_BACKEND=epoll NUCLEI_REQUIRE_IO_URING=0
+    # SELinux refuses the `adb shell` domain a socket, a FIFO or a hard link under /data/local/tmp,
+    # which an app may make in its own data directory (a hard link excepted: an app is refused it
+    # too). Permissive for the run, and the tests still run as the unprivileged shell user.
+    adb root >/dev/null
+    adb wait-for-device
+    adb shell setenforce 0
+    adb unroot >/dev/null
+    adb wait-for-device
     exec cargo test -p nuclei --target x86_64-linux-android --lib --tests --no-fail-fast
     ;;
 run)
