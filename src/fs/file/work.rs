@@ -356,9 +356,8 @@ impl FileIo {
     #[inline]
     pub(super) fn on_ring(&self) -> bool {
         #[cfg(test)]
-        if self.on_pool.load(core::sync::atomic::Ordering::Relaxed) {
-            return false;
-        }
+        return !self.on_pool.load(core::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
         true
     }
 

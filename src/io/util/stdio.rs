@@ -194,17 +194,26 @@ macro_rules! std_stream {
 
 std_stream!(
     /// The process's standard input: reads run on the blocking pool.
-    Stdin, stdin, Stdin, "standard input"
+    Stdin,
+    stdin,
+    Stdin,
+    "standard input"
 );
 std_stream!(
     /// The process's standard output: writes run on the blocking pool, one
     /// at a time; flush before the process exits to see the last one done.
-    Stdout, stdout, Stdout, "standard output"
+    Stdout,
+    stdout,
+    Stdout,
+    "standard output"
 );
 std_stream!(
     /// The process's standard error: writes run on the blocking pool, one at
     /// a time.
-    Stderr, stderr, Stderr, "standard error"
+    Stderr,
+    stderr,
+    Stderr,
+    "standard error"
 );
 
 impl AsyncRead for Stdin {
