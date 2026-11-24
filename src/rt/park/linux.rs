@@ -229,10 +229,11 @@ impl Poller {
         let capacity = self.events.capacity().min(max).max(1) as libc::c_int;
         // Made as a system call (see `io::sys::syscall`): `epoll_wait` where the architecture
         // has it, which the kernel serves with less than `epoll_pwait`, else `epoll_pwait` with
-        // no mask, which is the same wait.
-        #[cfg(target_arch = "x86_64")]
+        // no mask, which is the same wait. Android's system call filter for apps allows
+        // `epoll_wait` only on its 32-bit ABIs and ends the app that makes it elsewhere.
+        #[cfg(all(target_arch = "x86_64", not(target_os = "android")))]
         let call = libc::SYS_epoll_wait;
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(all(target_arch = "x86_64", not(target_os = "android"))))]
         let call = libc::SYS_epoll_pwait;
         // SAFETY: the buffer has room for `capacity` events; the kernel says
         // how many it wrote.
