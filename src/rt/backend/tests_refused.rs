@@ -7,6 +7,7 @@
 
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 use super::{Backend, IoBackend, decide, usable, usable_with};
 use crate::Handle;
@@ -14,7 +15,7 @@ use crate::rt::shard::ring::ShardRing;
 use crate::syscore::linux::iouring::ring::buf_ring::BufRing;
 use crate::syscore::linux::iouring::ring::{Ring, RingConfig};
 use crate::syscore::linux::probe::tests::{
-    found_or_skip, install, refuse_buffer_rings, without_buffer_rings,
+    answer_all, found_or_skip, install, refuse_buffer_rings, without_buffer_rings,
 };
 use crate::syscore::linux::probe::{Probe, probe};
 
@@ -218,4 +219,73 @@ fn a_kernel_expected_to_refuse_a_feature_gives_the_poller() {
         usable().expect_err("io_uring was found usable on a kernel expected to refuse a feature");
     assert!(why.contains(&refused), "{why}");
     default_runtime_runs_the_poller();
+}
+
+/// The calls Android's seccomp filter for apps answers with `SIGSYS`, which its crash handler
+/// turns into a crash (bionic `libc/seccomp/seccomp_policy.cpp`, from `SYSCALLS.TXT` and
+/// `SECCOMP_ALLOWLIST_APP.TXT`): `io_uring_setup`, `io_uring_enter`, `io_uring_register` and
+/// `openat2` are on no list, and `epoll_wait` is allowed only on the 32-bit ABIs (`epoll_pwait`
+/// is allowed everywhere). Elsewhere only the three io_uring calls, as there the runtime rightly
+/// makes `epoll_wait` and `openat2`; the test then shows the runtime comes up on epoll under a
+/// trapping filter.
+fn trapped_calls() -> Vec<libc::c_long> {
+    #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+    let mut calls = vec![
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+    ];
+    #[cfg(target_os = "android")]
+    {
+        calls.push(libc::SYS_openat2);
+        #[cfg(target_arch = "x86_64")]
+        calls.push(libc::SYS_epoll_wait);
+    }
+    calls
+}
+
+/// A multi-worker runtime on the default backend under a filter that traps the calls an Android
+/// app may not make: a TCP round trip, a timer, a task spawned from another thread and a file
+/// read all finish, and no call is trapped (a trap ends the process, which the parent reports as
+/// a death by `SIGSYS`).
+#[test]
+fn the_runtime_makes_no_call_an_app_filter_traps() {
+    if !crate::alone::alone_with(
+        "rt::backend::tests_refused::the_runtime_makes_no_call_an_app_filter_traps",
+        // Empty names no backend: the process must choose by itself.
+        &[
+            ("NUCLEI_BACKEND", "".as_ref()),
+            ("NUCLEI_REQUIRE_IO_URING", "0".as_ref()),
+        ],
+    ) {
+        return;
+    }
+    std::thread::spawn(|| {
+        if let Err(e) = install(answer_all(&trapped_calls(), libc::SECCOMP_RET_TRAP)) {
+            eprintln!("skipping: cannot install a seccomp filter here: {e}");
+            return;
+        }
+        let rt = crate::runtime::Builder::new()
+            .worker_threads(2)
+            .pin_workers(false)
+            .build()
+            .expect("a runtime starts under a filter that traps io_uring");
+        let path = std::env::temp_dir().join(format!("nuclei-trapped-{}", std::process::id()));
+        std::fs::write(&path, b"trapped").unwrap();
+        let handle = rt.handle();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sent.send(handle.spawn(async { 7u32 })).unwrap());
+        let from_elsewhere = received.recv().unwrap();
+        let read = path.clone();
+        let (seven, bytes) = rt.block_on(async move {
+            round_trip().await;
+            crate::time::sleep(Duration::from_millis(5)).await;
+            (from_elsewhere.await, crate::fs::read(read).await.unwrap())
+        });
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(seven, 7);
+        assert_eq!(bytes, b"trapped");
+    })
+    .join()
+    .expect("the filtered thread does not panic");
 }

@@ -32,6 +32,8 @@ proptest! {
                 prop_assert!(!bytes.contains(&0));
                 let base = core::mem::offset_of!(libc::sockaddr_un, sun_path);
                 prop_assert_eq!(addr.len as usize, base + bytes.len() + 1);
+                // `c_char` is `u8` on some targets (Android arm64) and `i8` on others.
+                #[allow(clippy::unnecessary_cast)]
                 let held: Vec<u8> = addr.raw.sun_path[..=bytes.len()].iter().map(|&c| c as u8).collect();
                 prop_assert_eq!(&held[..bytes.len()], &bytes[..]);
                 prop_assert_eq!(held[bytes.len()], 0);

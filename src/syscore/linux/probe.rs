@@ -25,11 +25,19 @@
 //! * A kill filter on the last thread of a process makes the kernel write a core dump, and the
 //!   child shares the whole address space of the program, so the dump would be a copy of it (and
 //!   a crash report under a core handler such as systemd-coredump) on every start. So the
-//!   child's first call lowers its own soft core limit to 1, which makes the kernel skip both
+//!   child's next call lowers its own soft core limit to 1, which makes the kernel skip both
 //!   piped and file dumps; limits belong to the process, so the parent keeps its own. The call is
 //!   best effort: if it fails, a dump may still be written. The cost is a filter that allows
 //!   `io_uring_setup` but kills `prlimit64`: the child then dies before the probe call, the
 //!   outcome is [`Unavailable::KilledBySeccomp`], and the runtime falls back to epoll.
+//! * A filter that answers with `SIGSYS` instead of a kill (Android's filter for apps, some
+//!   sandboxes) would run the program's own `SIGSYS` handler in the child, in the program's
+//!   memory, since the child shares the address space. The child has its own copy of the
+//!   handler table (no `CLONE_SIGHAND`), so its first action is to set `SIGSYS` to its default
+//!   action there, which leaves the program's dispositions untouched: a trap then ends the child
+//!   as a kill does. The call is best effort like the core limit: a filter that kills
+//!   `rt_sigaction` ends the child before the trial, which reads as
+//!   [`Unavailable::KilledBySeccomp`] and falls back to epoll.
 //!
 //! The child reports through a pipe, not through its exit status: a byte written to the pipe means
 //! the syscall was allowed, and only then does the parent build the real [`Ring`] in-process (the
@@ -56,6 +64,22 @@ use super::iouring::ring::{IoUringParams, Refusal, Ring, RingConfig, setup_param
 const PROBE_ENTRIES: u32 = 4;
 /// The child needs a few hundred bytes of stack; 64 KiB leaves ample room for the libc wrappers.
 const CHILD_STACK: usize = 64 * 1024;
+
+/// A zeroed kernel `sigaction`, larger than the struct on every architecture: the default
+/// action.
+const DEFAULT_ACTION: [usize; 8] = [0; 8];
+/// The size in bytes of the kernel's signal set, the fourth argument of `rt_sigaction`: 8, and 16
+/// on the MIPS architectures.
+const SIGSET_SIZE: libc::c_long = if cfg!(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6"
+)) {
+    16
+} else {
+    8
+};
 
 /// What the probe found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,13 +354,27 @@ struct ChildArgs {
     params: IoUringParams,
 }
 
-/// The child: a quiet core limit, one `io_uring_setup`, one byte on success, then gone. Raw
-/// syscalls only: it shares the parent's memory and thread state, so it must not allocate, lock,
-/// or call back into std.
+/// The child: the default `SIGSYS` action, a quiet core limit, one `io_uring_setup`, one byte on
+/// success, then gone. Raw syscalls only: it shares the parent's memory and thread state, so it
+/// must not allocate, lock, or call back into std.
 extern "C" fn child_main(arg: *mut c_void) -> libc::c_int {
     // SAFETY: `arg` is the `ChildArgs` the parent keeps alive and untouched until this process
     // ends (CLONE_VFORK).
     let args = unsafe { &mut *arg.cast::<ChildArgs>() };
+    // SAFETY: a raw `rt_sigaction` that reads `DEFAULT_ACTION` (all zero bits: the default
+    // action, no flags, no restorer, an empty mask in every kernel layout) and returns the old
+    // action nowhere. Raw, not `libc::sigaction`: on Android that symbol can be interposed by
+    // the runtime's signal chain, which keeps its own table in memory the child shares. A
+    // failure only means a trap may run the program's handler, so it is ignored.
+    unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigaction,
+            libc::SIGSYS as libc::c_long,
+            ptr::from_ref(&DEFAULT_ACTION),
+            ptr::null_mut::<c_void>(),
+            SIGSET_SIZE,
+        )
+    };
     // SAFETY: a raw `prlimit64` on this process (pid 0) that reads one `rlimit` and returns the
     // old limit nowhere. Its failure only means a dump may still be written, so it is ignored.
     unsafe {
@@ -411,7 +449,7 @@ impl Drop for Stack {
 }
 
 // The tests install seccomp filters with Linux's classic BPF constants.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 pub(crate) mod tests {
     use std::{env, fs, thread};
 
@@ -621,9 +659,12 @@ pub(crate) mod tests {
         assert_eq!(quiet.rlim_cur, now.rlim_max.min(1));
     }
 
-    const LD: u32 = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
-    const JEQ: u32 = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
-    const RET: u32 = libc::BPF_RET | libc::BPF_K;
+    // The classic BPF opcodes spelled out (`LD` is `BPF_LD | BPF_W | BPF_ABS`, `JEQ` is
+    // `BPF_JMP | BPF_JEQ | BPF_K`, `RET` is `BPF_RET | BPF_K`; `linux/bpf_common.h`), as the
+    // `libc` crate has no `BPF_*` constants for Android.
+    const LD: u32 = 0x20;
+    const JEQ: u32 = 0x15;
+    const RET: u32 = 0x06;
     /// Offset of the low word of a syscall's third argument in `seccomp_data`.
     const ARG2_LOW: u32 = if cfg!(target_endian = "little") {
         32
@@ -649,12 +690,20 @@ pub(crate) mod tests {
 
     /// A filter program that answers syscall `nr` with `action` and allows everything else.
     pub(crate) fn answer(nr: libc::c_long, action: u32) -> Vec<libc::sock_filter> {
-        vec![
-            insn(LD, 0, 0, 0),
-            insn(JEQ, 0, 1, nr as u32),
-            insn(RET, 0, 0, action),
-            insn(RET, 0, 0, libc::SECCOMP_RET_ALLOW),
-        ]
+        answer_all(&[nr], action)
+    }
+
+    /// A filter program that answers each syscall of `nrs` with `action` and allows everything
+    /// else.
+    pub(crate) fn answer_all(nrs: &[libc::c_long], action: u32) -> Vec<libc::sock_filter> {
+        let mut program = vec![insn(LD, 0, 0, 0)];
+        // A match jumps over the remaining comparisons to the answer.
+        for (i, &nr) in nrs.iter().enumerate() {
+            program.push(insn(JEQ, (nrs.len() - i) as u8, 0, nr as u32));
+        }
+        program.push(insn(RET, 0, 0, libc::SECCOMP_RET_ALLOW));
+        program.push(insn(RET, 0, 0, action));
+        program
     }
 
     /// A filter program that answers syscall `nr` with `action` only when the low word of its
@@ -788,6 +837,42 @@ pub(crate) mod tests {
             );
             assert_eq!(probe, Probe::Unavailable(want));
         }
+    }
+
+    /// A trapping filter (Android's for apps) must not run the program's own `SIGSYS` handler in
+    /// the child: the child shares the program's memory, so the handler would be seen here.
+    #[test]
+    fn a_trapped_call_ends_the_child_without_the_programs_handler() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static RAN: AtomicBool = AtomicBool::new(false);
+        extern "C" fn handler(_: libc::c_int) {
+            RAN.store(true, Ordering::SeqCst);
+        }
+        // SAFETY: plain data, all zeroes valid; the fields set below make it a valid action.
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = handler as extern "C" fn(libc::c_int) as usize;
+        // SAFETY: an empty mask in a live local.
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        // SAFETY: plain data, all zeroes valid; the kernel fills it.
+        let mut previous: libc::sigaction = unsafe { core::mem::zeroed() };
+        // SAFETY: `action` is valid and `previous` has room for the old one.
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGSYS, &raw const action, &raw mut previous) },
+            0
+        );
+        let found = probe_under(answer(libc::SYS_io_uring_setup, libc::SECCOMP_RET_TRAP));
+        // SAFETY: puts back the action read above.
+        unsafe { libc::sigaction(libc::SIGSYS, &raw const previous, ptr::null_mut()) };
+        let Some((probe, path, mode)) = found else {
+            return;
+        };
+        assert_eq!(mode, Some(2));
+        assert_eq!(path, Path::Child);
+        assert_eq!(probe, Probe::Unavailable(Unavailable::KilledBySeccomp));
+        assert!(
+            !RAN.load(Ordering::SeqCst),
+            "the program's SIGSYS handler ran in the probe child"
+        );
     }
 
     /// The child lowers its core limit before anything else, so a filter that kills that call

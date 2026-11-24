@@ -2,11 +2,11 @@
 //! counts around the window, after the writes before the call, and on the
 //! shard's ring together.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use super::durable::one_blocking_thread_kept;
 #[cfg(ring)]
 use super::durable::ring_calls;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use super::owned::hold_the_pool;
 use super::*;
 use crate::fs::file::MANY_AT_ONCE;

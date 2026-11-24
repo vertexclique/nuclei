@@ -2,6 +2,10 @@
 //! counts each thread's allocations, and a run of operations on a runtime
 //! with no workers (everything on this thread) must make none once warm.
 
+// Clippy asks for `const` on every thread-local of an Android build, those
+// already written `const { .. }` included (see the crate root).
+#![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

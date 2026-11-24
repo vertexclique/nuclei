@@ -1,0 +1,70 @@
+name: Android
+
+# nuclei on Android. `lint` clippy-checks the crate for both Android targets and builds the arm64
+# test binaries without running them: GitHub's runners cannot run an arm64 Android emulator, so
+# arm64 is linted and linked here, not run. `emulator` runs, on an x86_64 Android emulator
+# (`android.sh`), the tests of the system call filter Android puts on an app: the io_uring probe's
+# and `the_runtime_makes_no_call_an_app_filter_traps`, which installs the filter's refusals itself
+# (a process started by `adb shell` does not carry the filter). The rest of the suite is built for
+# Android here and not run on it yet (`android.sh` says why).
+
+on: [push, pull_request]
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: clippy and the arm64 build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - name: clippy for Android
+        run: |
+          for target in aarch64-linux-android x86_64-linux-android; do
+            cargo clippy -p nuclei -p nuclei-macros --target "$target" --lib --tests --all-features -- -D warnings
+          done
+
+      - name: build the arm64 test binaries, not run
+        run: .github/workflows/android.sh build aarch64-linux-android
+
+  emulator:
+    name: the app filter tests on an x86_64 emulator (API 34)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - name: KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Built before the emulator starts, which then has the runner's cores to itself.
+      - name: build the x86_64 test binary
+        run: .github/workflows/android.sh build x86_64-linux-android --lib
+
+      # The action runs each `script` line in its own shell, so the work is one script.
+      - name: the app filter tests on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: default
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: .github/workflows/android.sh test

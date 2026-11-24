@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.9
+
+### Fixed
+
+- **An Android app on x86-64 no longer ends at its runtime's first wait.** Android's system call
+  filter for apps allows `epoll_wait` only on its 32-bit ABIs and answers it elsewhere with
+  `SIGSYS`, which ends the app (logcat: "seccomp prevented call to disallowed x86_64 system call
+  232"). The poller made `epoll_wait` as a system call of its own on x86-64, past Bionic, whose
+  `epoll_wait` is an `epoll_pwait`. It ended an app on the x86-64 emulator and on an x86-64
+  device; arm64, which has no `epoll_wait`, was not affected. On Android the poller now waits with
+  `epoll_pwait` on every architecture. Linux is unchanged. A new workflow runs a runtime under
+  the filter's refusals on an x86-64 Android emulator, and lints and builds the suite for arm64
+  Android; the whole suite is not run on Android yet.
+- **A seccomp filter that traps no longer runs the program's `SIGSYS` handler in the io_uring
+  probe's child.** With a filter active, the probe makes its one `io_uring_setup` in a short-lived
+  child that shares the program's memory. A filter that answers the call with `SIGSYS` instead of
+  a kill (Android's filter for apps, some sandboxes) ran the program's own handler in that child,
+  and a handler that returned left the probe with a wrong answer. The child now sets `SIGSYS` to
+  its default action for itself before the call, so a trap ends it as a kill does and the runtime
+  runs on epoll. The program's own handlers are untouched.
+
 ## 0.5.8
 
 ### Fixed

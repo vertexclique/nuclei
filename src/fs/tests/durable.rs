@@ -23,7 +23,7 @@ fn pend_flagged<F: Future + Unpin>(fut: &mut F, what: &str) -> Arc<Flag> {
 /// to another thread, so a call made from a task's poll always finds the
 /// worker's ring (handed off, the poll's thread runs no shard, and its calls
 /// go to the blocking pool, as they must).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn one_blocking_thread_kept() -> Runtime {
     Builder::new()
         .worker_threads(1)
@@ -139,7 +139,7 @@ fn a_sync_reports_a_failed_write() {
 /// A sync the kernel fails (procfs has no sync) is reported, and every later
 /// sync of the handle fails with its error, without a call: not on the
 /// ring, not on the pool (whose one thread is held).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_failed_sync_fails_every_later_one() {
     let rt = one_blocking_thread_kept();
